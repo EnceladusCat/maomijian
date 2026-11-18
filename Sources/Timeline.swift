@@ -45,10 +45,33 @@ private struct Needle: View {
     }.allowsHitTesting(false)
   }
 }
+private final class AlignmentState: ObservableObject {
+  @Published private(set) var frame: Int?
+  func show(_ value: Int?) { if frame != value { frame = value } }
+}
+private struct AlignmentLine: View {
+  @ObservedObject var alignment: AlignmentState
+  let first: Double, per: Double, inset: Double, width: Double
+
+  var body: some View {
+    GeometryReader { geometry in
+      if let frame = alignment.frame {
+        let x = (Double(frame) - first) * per
+        if x >= 0 && x <= width {
+          Path { p in
+            p.move(to: CGPoint(x: inset + x, y: 0))
+            p.addLine(to: CGPoint(x: inset + x, y: geometry.size.height))
+          }.stroke(UI.color(.audio), lineWidth: 2)
+        }
+      }
+    }.allowsHitTesting(false).accessibilityHidden(true)
+  }
+}
 struct Timeline: View {
   @ObservedObject var e: Editor
   @ObservedObject var waveforms: WaveformStore
   @State private var groupOffset: CGFloat = 0
+  @StateObject private var alignment = AlignmentState()
   @State private var zoom = 1.0
   @State private var first = 0.0
   @State private var laneFrames = [String: CGRect]()
@@ -158,7 +181,7 @@ struct Timeline: View {
                         selection: selected, first: left, per: per,
                         groupOffset: groupOffset
                       ),
-                      groupOffset: $groupOffset)
+                      showAlignment: alignment.show, groupOffset: $groupOffset)
                     ForEach(
                       laneJoins.filter { $0.active || Double(min($0.before.length, $0.after.length)) * per >= 15 }
                     ) { join in
@@ -231,6 +254,7 @@ struct Timeline: View {
             }.allowsHitTesting(false)
           }.coordinateSpace(name: marqueeSpace)
             .onPreferenceChange(MarqueeBounds<String>.self) { laneFrames = $0 }
+            .overlay { AlignmentLine(alignment: alignment, first: left, per: per, inset: head, width: width) }
         }
         if limit > 0.5 {
           HStack {

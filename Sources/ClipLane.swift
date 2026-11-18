@@ -22,12 +22,14 @@ struct ClipLane: NSViewRepresentable {
       width: max(2, Double(clip.length) * per), height: rowHeight(clip.kind) - 5)
   }
   let editor: Editor, layout: Layout
+  let showAlignment: (Int?) -> Void
   @Binding var groupOffset: CGFloat
 
   func makeNSView(context: Context) -> Surface { Surface() }
   func updateNSView(_ view: Surface, context: Context) {
     view.editor = editor
     view.groupMove = { groupOffset = $0 }
+    view.showAlignment = showAlignment
     if view.layoutData != layout {
       view.layoutData = layout
       view.needsDisplay = true
@@ -38,8 +40,10 @@ struct ClipLane: NSViewRepresentable {
     weak var editor: Editor?
     var layoutData: Layout?
     var groupMove: ((CGFloat) -> Void)?
+    var showAlignment: ((Int?) -> Void)?
     private var pressed: Clip?, origin: CGFloat = 0, delta: CGFloat = 0, edge = 0
-    private var modified = false
+    private var snap: TimelineSnap?
+    private var movesSelection = false
     private var blankPress = false
     private var symbols: [Kind: NSImage] = [:]
     private static let groupIcon = NSImage(systemSymbolName: "link", accessibilityDescription: nil)?
@@ -180,11 +184,13 @@ struct ClipLane: NSViewRepresentable {
       let point = convert(event.locationInWindow, from: nil)
       origin = point.x
       pressed = nil
+      snap = nil
+      movesSelection = false
       delta = 0
       edge = 0
       blankPress = false
       let flags = event.modifierFlags.intersection([.command, .shift])
-      modified = !flags.isEmpty
+      let modified = !flags.isEmpty
       guard let c = d.pieces.last(where: { rect($0.clip, d).contains(point) })?.clip else {
         blankPress = true
         e.libraryFocus = false
@@ -203,18 +209,31 @@ struct ClipLane: NSViewRepresentable {
         let right = left + Double(c.length) * d.per
         if abs(point.x - left) < 5 { edge = -1 } else if abs(point.x - right) < 5 { edge = 1 }
       }
+      guard !modified else { return }
+      let moving = edge == 0 ? e.selectedClips : [c]
+      movesSelection = edge == 0 && moving.count > 1
+      let ids = Set(moving.map(\.id))
+      var targets = [0, e.transport.frame]
+      for other in e.p.clips where !ids.contains(other.id) { targets += [other.start, other.end] }
+      var anchors = edge == 0 ? [c.start, c.end] : [edge < 0 ? c.start : c.end]
+      if movesSelection {
+        for outer in [moving.map(\.start).min(), moving.map(\.end).max()].compactMap({ $0 })
+        where !anchors.contains(outer) { anchors.append(outer) }
+      }
+      snap = TimelineSnap(anchors: anchors, targets: targets, limits: e.dragRange(for: c, edge: edge))
     }
     override func mouseDragged(with event: NSEvent) {
       if blankPress {
         editor?.timelineMarquee.update(event)
         return
       }
-      guard !modified, pressed != nil, let e = editor, let d = layoutData else { return }
-      delta = convert(event.locationInWindow, from: nil).x - origin
-      if e.selectedIDs.count > 1 {
-        delta = Double(e.groupDelta(Int((delta / d.per).rounded()))) * d.per
-        groupMove?(delta)
-      }
+      guard let snap, let d = layoutData else { return }
+      let dx = convert(event.locationInWindow, from: nil).x - origin
+      guard abs(dx) >= 2 || delta != 0 else { return }
+      let placement = snap.placement(for: dx / d.per, per: d.per)
+      delta = Double(placement.shift) * d.per
+      if movesSelection { groupMove?(delta) }
+      showAlignment?(placement.guide)
       needsDisplay = true
     }
     override func mouseUp(with event: NSEvent) {
@@ -230,30 +249,22 @@ struct ClipLane: NSViewRepresentable {
       }
       defer {
         pressed = nil
+        snap = nil
         delta = 0
         edge = 0
-        groupMove?(0)
+        if movesSelection { groupMove?(0) }
+        movesSelection = false
+        showAlignment?(nil)
         needsDisplay = true
       }
-      guard !modified, let c = pressed, let d = layoutData, let e = editor else { return }
+      guard let snap, let c = pressed, let d = layoutData, let e = editor else { return }
       let dx = convert(event.locationInWindow, from: nil).x - origin
       if abs(dx) < 2 {
         e.selected = c.id
         e.seek(bound(Int((d.first + origin / d.per).rounded()), c.start, c.end - 1))
         return
       }
-      var shift = Int((dx / d.per).rounded())
-      if edge == 0 && c.kind == .video {
-        let desired = c.start + shift
-        let others = e.p.clips.filter { $0.kind == .video && !e.selectedIDs.contains($0.id) }
-        let snaps = others.flatMap { [$0.end, $0.start - c.length] }.filter { $0 >= 0 }
-        if let snap = snaps.min(by: { abs($0 - desired) < abs($1 - desired) }),
-          abs(snap - desired) <= min(15, max(1, Int(6 / d.per)))
-        {
-          shift = snap - c.start
-        }
-      }
-      e.move(c, by: shift, edge: edge)
+      e.move(c, by: snap.placement(for: dx / d.per, per: d.per).shift, edge: edge)
     }
   }
 }

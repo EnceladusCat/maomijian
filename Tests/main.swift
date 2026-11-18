@@ -621,3 +621,66 @@ precondition(joinedGroup.transitionEffect(internalCut) == ClipEdgeEffect(style: 
 precondition(joinedGroup.transitionEffect(headOfGroup)?.style == .dissolve)
 precondition(joinedGroup.transitionEffect(tailOfGroup)?.style == .dissolve)
 print("Passed grouped transition pixels, outer-edge application, movement and direct seam replacement.")
+
+var layeredSeam = twoScenes
+let cutFrame = 60
+let outgoingGroup = UUID(), incomingGroup = UUID()
+layeredSeam.clips[0].groupID = outgoingGroup
+layeredSeam.clips[1].groupID = incomingGroup
+var upperBefore = Clip.annotation(.rectangle, at: 0)
+upperBefore.length = cutFrame
+upperBefore.groupID = outgoingGroup
+upperBefore.color = "#FFFFFF"
+var upperAfter = Clip.annotation(.ellipse, at: cutFrame)
+upperAfter.length = 60
+upperAfter.groupID = incomingGroup
+upperAfter.color = "#FFE046"
+layeredSeam.clips += [upperBefore, upperAfter]
+try layeredSeam.updateTransition(internalCut, frames: 24, style: .glitch)
+let seamShot = layeredSeam.joins[0]
+let beforeScene = bitmap(240, 160)!, afterScene = bitmap(240, 160)!
+let painter = FramePainter(layeredSeam, size)
+painter.paint(beforeScene, frame: cutFrame - 1, active: [seamShot.before, upperBefore]) { _ in Picture(image: image) }
+painter.paint(afterScene, frame: cutFrame, active: [seamShot.after, upperAfter]) { _ in Picture(image: alternateImage) }
+let beforePixels = beforeScene.makeImage()!, afterPixels = afterScene.makeImage()!
+for frame in seamShot.range.dropFirst().dropLast() {
+  let expected = bitmap(240, 160)!, scratch = bitmap(240, 160)!
+  let progress = Double(frame - seamShot.range.lowerBound) / Double(seamShot.range.count - 1)
+  TransitionEffects.draw(.glitch, before: beforePixels, after: afterPixels, progress: progress,
+    in: expected, scratch: scratch, canvas: CGRect(origin: .zero, size: size))
+  let visible = layeredSeam.clips.filter { clip in
+    (layeredSeam.videoVisibility[clip.id] ?? (clip.start..<clip.end)).contains(frame)
+  }
+  let actual = transitionPixels(layeredSeam, frame: frame, parts: visible)
+  let reference = Array(UnsafeBufferPointer(start: expected.data!.assumingMemoryBound(to: UInt8.self), count: actual.count))
+  precondition(actual == reference, "Grouped layers and their media differ at transition frame \(frame)")
+}
+
+var endProject = Project()
+var lowerAtEnd = outgoingVideo
+lowerAtEnd.groupID = outgoingGroup
+lowerAtEnd.endEffect = ClipEdgeEffect(style: .dissolve, frames: 24)
+var upperIndependent = upperBefore
+upperIndependent.id = UUID()
+upperIndependent.groupID = nil
+upperIndependent.x = 0.20
+endProject.clips = [lowerAtEnd, upperBefore, upperIndependent]
+let endPixels = transitionPixels(endProject, frame: cutFrame - 1, parts: endProject.clips)
+precondition(endPixels == transitionPixels(endProject, frame: cutFrame - 1, parts: [upperIndependent]))
+var lowerAtStart = lowerAtEnd
+lowerAtStart.endEffect = nil
+lowerAtStart.startEffect = ClipEdgeEffect(style: .dissolve, frames: 24)
+endProject.clips[0] = lowerAtStart
+let startPixels = transitionPixels(endProject, frame: 0, parts: endProject.clips)
+precondition(startPixels == transitionPixels(endProject, frame: 0, parts: [upperIndependent]))
+
+let dragSnap = TimelineSnap(anchors: [20, 45], targets: [0, 58, 89, 58], limits: -20...100)
+precondition(dragSnap.placement(for: 11.5, per: 2).shift == 13)
+precondition(dragSnap.placement(for: 11.5, per: 2).guide == 58)
+precondition(dragSnap.placement(for: 20, per: 2).guide == nil)
+precondition(dragSnap.placement(for: -50, per: 2).shift == -20)
+let trimSnap = TimelineSnap(anchors: [40], targets: [43, 44, 45], limits: -5...3)
+precondition(trimSnap.placement(for: 5.5, per: 2).guide == 43)
+let groupedSnap = TimelineSnap(anchors: [40, 65, 20, 95], targets: [105], limits: -20...100)
+precondition(groupedSnap.placement(for: 9, per: 2).guide == 105)
+print("Passed grouped upper/lower transition frames and move and trim alignment.")

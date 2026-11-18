@@ -8,6 +8,50 @@ func tc(_ f: Int) -> String {
   let n = max(0, f)
   return String(format: "%02d:%02d:%02d", n / 1800, n / 30 % 60, n % 30)
 }
+
+struct TimelineSnap {
+  let anchors: [Int]
+  let limits: ClosedRange<Int>
+  private let targets: [Int]
+
+  init(anchors: [Int], targets: [Int], limits: ClosedRange<Int>) {
+    self.anchors = anchors
+    self.targets = Set(targets).sorted()
+    self.limits = limits
+  }
+
+  func placement(for requested: Double, per: Double) -> (shift: Int, guide: Int?) {
+    let low = Double(limits.lowerBound), high = Double(limits.upperBound)
+    let shift = Int(bound(requested, low, high).rounded())
+    var closest: (shift: Int, guide: Int)?
+    var distance = min(15, 6 / per)
+    for anchor in anchors {
+      let desired = Double(anchor) + requested
+      let index = insertionIndex(Double(anchor) + bound(requested, low, high))
+      for i in [index - 1, index] where targets.indices.contains(i) {
+        let target = targets[i]
+        let offset = target - anchor
+        let gap = abs(Double(target) - desired)
+        if limits.contains(offset) && gap <= distance && (closest == nil || gap < distance) {
+          closest = (offset, target)
+          distance = gap
+        }
+      }
+    }
+    if let closest { return (closest.shift, closest.guide) }
+    return (shift, nil)
+  }
+
+  private func insertionIndex(_ wanted: Double) -> Int {
+    var low = 0, high = targets.count
+    while low < high {
+      let mid = (low + high) / 2
+      if Double(targets[mid]) < wanted { low = mid + 1 } else { high = mid }
+    }
+    return low
+  }
+}
+
 enum EditError: LocalizedError {
   case message(String)
   var errorDescription: String? {

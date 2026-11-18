@@ -680,12 +680,6 @@ final class Editor: ObservableObject {
       change { $0 = next }
     } catch { self.error = error.localizedDescription }
   }
-  func groupDelta(_ requested: Int) -> Int {
-    let clips = selectedClips
-    return bound(
-      requested, -(clips.map(\.start).min() ?? 0), maxFrames - (clips.map(\.end).max() ?? maxFrames)
-    )
-  }
   func detach() {
     guard var c = clip, c.kind == .video, c.volume > 0, p.asset(c.asset)?.audio == true else {
       return
@@ -784,9 +778,24 @@ final class Editor: ObservableObject {
     auditionEnd = range.upperBound
     play()
   }
+  func dragRange(for c: Clip, edge: Int) -> ClosedRange<Int> {
+    if edge == 0 {
+      let moving = selectedIDs.count > 1 && selectedIDs.contains(c.id) ? selectedClips : [c]
+      return -(moving.map(\.start).min() ?? c.start)...(maxFrames - (moving.map(\.end).max() ?? c.end))
+    }
+    let asset = p.asset(c.asset)
+    let timedSource = c.kind.isMedia && asset?.isStill != true
+    if edge < 0 {
+      let available = timedSource ? Int(floor(c.sourceIn / c.effectiveRate + 1e-8)) : c.start
+      return -min(c.start, available)...(c.length - 1)
+    }
+    let length = timedSource ? c.maximumLength(assetFrames: asset?.frames ?? maxFrames) : maxFrames - c.start
+    return (1 - c.length)...(length - c.length)
+  }
   func move(_ c: Clip, by delta: Int, edge: Int) {
+    let range = dragRange(for: c, edge: edge)
+    let shift = bound(delta, range.lowerBound, range.upperBound)
     if edge == 0, selectedIDs.count > 1, selectedIDs.contains(c.id) {
-      let shift = groupDelta(delta)
       let ids = Set(selectedIDs)
       change { project in
         for index in project.clips.indices where ids.contains(project.clips[index].id) {
@@ -797,23 +806,19 @@ final class Editor: ObservableObject {
     }
     let asset = p.asset(c.asset)
     let timedSource = c.kind.isMedia && asset?.isStill != true
-    let maxLen = asset?.frames ?? maxFrames
     edit(c.id) { v in
       if edge < 0 {
-        let available = timedSource ? Int(floor(c.sourceIn / c.effectiveRate + 1e-8)) : c.start
-        let d = bound(delta, -min(c.start, available), c.length - 1)
-        v.start = c.start + d
-        v.length = c.length - d
-        if c.kind == .timer { v.timerPhase = (c.timerPhase ?? 0) + d }
-        if timedSource { v.setSource(c.sourceFrame(at: c.start + d), c.sourceEnd) }
+        v.start = c.start + shift
+        v.length = c.length - shift
+        if c.kind == .timer { v.timerPhase = (c.timerPhase ?? 0) + shift }
+        if timedSource { v.setSource(c.sourceFrame(at: c.start + shift), c.sourceEnd) }
       } else if edge > 0 {
-        let maxLength = timedSource ? c.maximumLength(assetFrames: maxLen) : maxFrames - c.start
-        v.length = bound(c.length + delta, 1, maxLength)
+        v.length = c.length + shift
         if timedSource {
           v.setSource(c.sourceIn, c.sourceIn + Double(v.length) * c.effectiveRate)
         }
       } else {
-        v.start = bound(c.start + delta, 0, maxFrames - c.length)
+        v.start = c.start + shift
       }
     }
   }

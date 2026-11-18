@@ -274,6 +274,8 @@ final class FramePainter {
   let project: Project
   private let preview: Bool
   private let motionPreview: FramePainter?
+  private let groupedArtwork: [UUID: [Clip]]
+  private let clipOrder: [UUID: Int]
   private var artworks = [UUID: (text: String, image: CGImage)]()
   private var textLayouts = [UUID: (text: String, appearance: TextAppearance, color: String, layout: FixedText)]()
   private let filteredStills: NSCache<NSUUID, CGImage> = {
@@ -286,6 +288,13 @@ final class FramePainter {
     self.project = project
     self.size = size
     self.preview = preview
+    var artworkByGroup: [UUID: [Clip]] = [:]
+    for clip in project.clips where !clip.kind.isMedia {
+      if let group = clip.groupID { artworkByGroup[group, default: []].append(clip) }
+    }
+    groupedArtwork = artworkByGroup
+    clipOrder = artworkByGroup.isEmpty ? [:] : Dictionary(
+      uniqueKeysWithValues: project.clips.enumerated().map { ($0.element.id, $0.offset) })
     let scale = 480 / min(size.width, size.height)
     if preview, scale < 1 {
       motionPreview = FramePainter(
@@ -381,6 +390,21 @@ final class FramePainter {
     paint(g, frame: frame, active: active, sourceForCanvas: { id, _ in source(id) })
   }
 
+  private func holdingArtwork(
+    _ parts: [Clip], of video: Clip, at cut: Int, side: ClipEnd
+  ) -> [Clip] {
+    guard let group = video.groupID, let artwork = groupedArtwork[group] else { return parts }
+    let held = artwork.filter {
+      side == .head ? $0.start == cut : $0.end == cut
+    }
+    guard !held.isEmpty else { return parts }
+    let present = Set(parts.map(\.id))
+    // Retain the authored layer order when a transition borrows a group's edge frame.
+    return (parts + held.filter { !present.contains($0.id) }).sorted {
+      clipOrder[$0.id, default: Int.max] < clipOrder[$1.id, default: Int.max]
+    }
+  }
+
   func paint(
     _ g: CGContext, frame: Int, active: [Clip], sourceForCanvas source: (UUID, CGSize) -> Picture?
   ) {
@@ -388,19 +412,23 @@ final class FramePainter {
     if let incoming = videos.last(where: { c in
       c.from != nil && c.blend > 0 && frame >= c.blendStart && frame < c.blendStart + c.blend
         && videos.contains(where: { $0.id == c.from })
-    }) {
+    }), let previous = videos.first(where: { $0.id == incoming.from }) {
       let progress = bound(
         Double(frame - incoming.blendStart) / Double(max(1, incoming.blend - 1)), 0, 1)
       let cut = incoming.start + (incoming.fixedCutOffset ?? 0)
-      let outgoing = active.filter { part in
+      var outgoing = active.filter { part in
         part.kind == .video ? part.id != incoming.id : part.start < cut
       }
-      let entering = active.filter { part in
+      var entering = active.filter { part in
         part.kind == .video
           ? part.id != incoming.from
           : (incoming.fixedCutOffset != nil
             ? part.end > cut
             : part.start >= cut || part.end > cut + incoming.blend)
+      }
+      if incoming.fixedCutOffset != nil {
+        if frame >= cut { outgoing = holdingArtwork(outgoing, of: previous, at: cut, side: .tail) }
+        else { entering = holdingArtwork(entering, of: incoming, at: cut, side: .head) }
       }
       paintTransition(
         incoming.transitionStyle, at: frame, progress: progress, outgoing: outgoing,
@@ -412,7 +440,13 @@ final class FramePainter {
         guard let span = clip.transitionRange(at: side), span.contains(frame),
           let look = clip.effect(at: side)?.style
         else { continue }
-        let other = active.filter { $0.id != clip.id }
+        let other = active.filter { part in
+          if part.id == clip.id { return false }
+          guard let group = clip.groupID, part.groupID == group, !part.kind.isMedia else {
+            return true
+          }
+          return side == .head ? part.start < clip.start : part.end > clip.end
+        }
         let progress = Double(frame - span.lowerBound) / Double(max(1, span.count - 1))
         paintTransition(
           look, at: frame, progress: progress,
@@ -598,7 +632,8 @@ final class FramePainter {
     for c in active.filter({ $0.kind.isArt && !$0.kind.isRegion && $0.kind != .caption })
       + active.filter({ $0.kind == .caption })
     {
-      let m = c.motionOffset(at: frame, size: size)
+      let sample = bound(frame, c.start, c.end - 1)
+      let m = c.motionOffset(at: sample, size: size)
       g.saveGState()
       g.translateBy(x: c.x * W + m.x, y: c.y * H + m.y)
       g.rotate(by: c.angle * .pi / 180)
@@ -606,8 +641,8 @@ final class FramePainter {
       g.scaleBy(x: 1, y: -1)
       let unit = min(W, H) / 1080
       if (c.kind == .text || c.kind == .timer), let appearance = c.textAppearance, appearance.usesFixedSize {
-        layout(for: c, appearance: appearance, at: frame).draw(appearance, unit: unit, in: g)
-      } else if let image = image(for: c, at: frame) {
+        layout(for: c, appearance: appearance, at: sample).draw(appearance, unit: unit, in: g)
+      } else if let image = image(for: c, at: sample) {
         if let shadow = c.textAppearance?.shadow, shadow.enabled && shadow.opacity > 0 {
           setTextShadow(shadow, unit: unit, in: g)
         }
@@ -620,7 +655,7 @@ final class FramePainter {
     let lenses = active.filter { $0.kind == .zoom }
     if !lenses.isEmpty {
       g.flush()
-      let patches = lenses.compactMap { lensPatch(for: $0, at: frame, in: g) }
+      let patches = lenses.compactMap { lensPatch(for: $0, at: bound(frame, $0.start, $0.end - 1), in: g) }
       for patch in patches {
         let clip = patch.clip
         let box = patch.box
