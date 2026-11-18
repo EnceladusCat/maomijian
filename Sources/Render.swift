@@ -239,14 +239,15 @@ final class FramePainter {
     artworks[c.id] = (text, result)
     return result
   }
-  private func footage(_ picture: Picture, clip: Clip, look: FootageFilter, amount: Double)
-    -> CGImage
-  {
-    guard amount > 0, look == .neon || look == .vhs || look == .prism else { return picture.image }
+  private func footage(_ picture: Picture, clip: Clip, filters: [ClipFilter]) -> CGImage {
+    let styles = filters.filter { $0.amount > 0 && $0.look != .camera }
+    guard !styles.isEmpty else { return picture.image }
     func filtered() -> CGImage {
-      look == .prism
-        ? ChromaticRadial.shift(picture.image, amount: amount)
-        : FootageLook.image(picture.image, look: look, amount: amount)
+      styles.reduce(picture.image) { image, filter in
+        filter.look == .prism
+          ? ChromaticRadial.shift(image, amount: filter.amount)
+          : FootageLook.image(image, look: filter.look, amount: filter.amount)
+      }
     }
     guard picture.still else { return filtered() }
     let key = clip.id as NSUUID
@@ -458,9 +459,8 @@ final class FramePainter {
       guard let p = source(c.id, size) else { continue }
       g.saveGState()
       let m = c.motionOffset(at: frame, size: size)
-      let look = c.footageFilter ?? .none
-      let amount = c.filterAmount ?? 1
-      let im = footage(p, clip: c, look: look, amount: amount)
+      let filters = c.filters
+      let im = footage(p, clip: c, filters: filters)
       let src = CGRect(x: 0, y: 0, width: im.width, height: im.height)
       let oriented = src.applying(p.transform)
       let layout = VisualGeometry(clip: c, canvas: size, aspect: oriented.width / oriented.height)
@@ -477,9 +477,11 @@ final class FramePainter {
       g.scaleBy(x: 1, y: -1)
       g.draw(im, in: src)
       g.restoreGState()
-      FootageLook.drawOverlay(
-        look, amount: amount, in: g, rect: layout.visible,
-        frame: max(0, frame - c.start))
+      for filter in filters {
+        FootageLook.drawOverlay(
+          filter.look, amount: filter.amount, in: g, rect: layout.visible,
+          frame: max(0, frame - c.start))
+      }
       if let border = c.visualBorder, border.style != .none {
         let line = min(
           border.width * min(W, H) / 1080, min(layout.visible.width, layout.visible.height))

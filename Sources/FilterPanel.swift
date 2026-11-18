@@ -13,28 +13,70 @@ struct FilterPanel: View {
           Text("在时间线上选择图片或视频。").foregroundStyle(UI.muted).font(.caption)
         }
         ForEach(FootageFilter.allCases.filter { $0 != .none }, id: \.self) { filter in
-          let active = !clips.isEmpty && clips.allSatisfy { $0.footageFilter == filter }
           Button {
-            editor.applyFilter(filter)
+            editor.addFilter(filter)
           } label: {
             HStack(spacing: 9) {
               FilterSwatch(filter: filter).frame(width: 54, height: 35)
               Text(filter.rawValue).font(.system(size: 12, weight: .medium))
                 .fixedSize(horizontal: false, vertical: true)
               Spacer(minLength: 0)
-              if active { Image(systemName: "checkmark").font(.caption).foregroundStyle(UI.accent) }
+              Image(systemName: "plus").font(.caption).foregroundStyle(UI.accent).accessibilityHidden(true)
             }.padding(5).frame(maxWidth: .infinity, alignment: .leading)
-              .background(
-                active ? UI.accent.opacity(0.18) : UI.well,
-                in: RoundedRectangle(cornerRadius: 5)
-              )
+              .background(UI.well, in: RoundedRectangle(cornerRadius: 5))
               .contentShape(Rectangle())
-          }.buttonStyle(.plain).disabled(clips.isEmpty)
+          }.buttonStyle(.plain).disabled(clips.isEmpty).help("添加滤镜")
         }
-        if clips.contains(where: { ($0.footageFilter ?? .none) != .none }) {
-          Button("移除滤镜") { editor.applyFilter(.none) }
+        if let clip = clips.first, clips.count == 1, !clip.filters.isEmpty {
+          Divider()
+          FilterStackRows(editor: editor, clip: clip)
+        }
+        if clips.contains(where: { !$0.filters.isEmpty }) {
+          Button("清空滤镜") { editor.editSelectedFilters { $0.removeAll() } }
         }
       }.padding(12)
+    }
+  }
+}
+
+struct FilterStackRows: View {
+  let editor: Editor
+  let clip: Clip
+
+  var body: some View {
+    let filters = clip.filters
+    SectionName(name: "滤镜堆叠")
+    ForEach(Array(filters.enumerated()), id: \.offset) { index, filter in
+      VStack(spacing: 4) {
+        HStack(spacing: 5) {
+          Text(filter.look.rawValue).font(.caption.weight(.medium)).lineLimit(1)
+          Spacer(minLength: 0)
+          Tool(symbol: "chevron.up", label: "上移滤镜 \(index + 1)") { move(index, by: -1) }
+            .disabled(index == 0)
+          Tool(symbol: "chevron.down", label: "下移滤镜 \(index + 1)") { move(index, by: 1) }
+            .disabled(index == filters.count - 1)
+          Tool(symbol: "xmark", label: "移除滤镜 \(index + 1)") {
+            edit(index) { $0.remove(at: index) }
+          }
+        }
+        NumberRow(label: "强度", value: filter.amount * 100, range: 0...100, unit: "%") { value in
+          edit(index) { $0[index].amount = value / 100 }
+        }
+      }.padding(7).background(UI.well, in: RoundedRectangle(cornerRadius: 5))
+    }
+  }
+
+  private func edit(_ index: Int, _ body: (inout [ClipFilter]) -> Void) {
+    editor.edit(clip.id) {
+      var filters = $0.filters
+      guard filters.indices.contains(index) else { return }
+      body(&filters)
+      if filters != $0.filters { $0.filters = filters }
+    }
+  }
+  private func move(_ index: Int, by delta: Int) {
+    edit(index) { filters in
+      if filters.indices.contains(index + delta) { filters.swapAt(index, index + delta) }
     }
   }
 }

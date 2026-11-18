@@ -6,6 +6,8 @@ struct ClipLane: NSViewRepresentable {
   struct Piece: Equatable {
     let clip: Clip
     let name: String
+    let hasAudio: Bool
+    let waveform: AudioWaveform?
   }
   struct Layout: Equatable {
     let pieces: [Piece]
@@ -13,10 +15,11 @@ struct ClipLane: NSViewRepresentable {
     let first: Double, per: Double
     let groupOffset: CGFloat
   }
+  static func rowHeight(_ kind: Kind) -> CGFloat { kind.isMedia ? 37 : 30 }
   static func clipBox(_ clip: Clip, first: Double, per: Double) -> CGRect {
     CGRect(
       x: (Double(clip.start) - first) * per, y: 2.5,
-      width: max(2, Double(clip.length) * per), height: 25)
+      width: max(2, Double(clip.length) * per), height: rowHeight(clip.kind) - 5)
   }
   let editor: Editor, layout: Layout
   @Binding var groupOffset: CGFloat
@@ -57,12 +60,13 @@ struct ClipLane: NSViewRepresentable {
       let shift = primary ? delta : (layout.selection.contains(c.id) ? layout.groupOffset : 0)
       if !primary || edge <= 0 { left += shift }
       if !primary || edge >= 0 { right += shift }
-      return CGRect(x: left, y: 2.5, width: max(2, right - left), height: 25)
+      return CGRect(x: left, y: 2.5, width: max(2, right - left), height: rowHeight(c.kind) - 5)
     }
     override func draw(_ dirtyRect: NSRect) {
       guard let data = layoutData else { return }
       for p in data.pieces {
-        let box = rect(p.clip, data).intersection(bounds)
+        let full = rect(p.clip, data)
+        let box = full.intersection(bounds)
         guard !box.isNull, box.intersects(dirtyRect) else { continue }
         let selected = data.selection.contains(p.clip.id)
         let path = NSBezierPath(roundedRect: box.insetBy(dx: 0.5, dy: 0.5), xRadius: 4, yRadius: 4)
@@ -72,6 +76,9 @@ struct ClipLane: NSViewRepresentable {
         (selected ? NSColor.white : col.withAlphaComponent(0.7)).setStroke()
         path.lineWidth = selected ? 1.5 : 1
         path.stroke()
+        if let wave = p.waveform {
+          drawWaveform(wave, clip: p.clip, full: full, visible: box, layout: data)
+        }
         if box.width > 28 {
           let k = p.clip.kind
           if symbols[k] == nil {
@@ -84,8 +91,9 @@ struct ClipLane: NSViewRepresentable {
             in: NSRect(x: box.minX + 6, y: 9, width: 13, height: 12), from: .zero,
             operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
           if box.width > 48 {
-            (p.name as NSString).draw(
-              in: NSRect(x: box.minX + 23, y: 8, width: box.width - 28, height: 15),
+            let title = p.hasAudio && k == .video ? p.name + " · 含音频" : p.name
+            (title as NSString).draw(
+              in: NSRect(x: box.minX + 23, y: 7, width: box.width - 28, height: 15),
               withAttributes: Self.label)
           }
         }
@@ -98,6 +106,28 @@ struct ClipLane: NSViewRepresentable {
           }
         }
       }
+    }
+    private func drawWaveform(
+      _ wave: AudioWaveform, clip: Clip, full: CGRect, visible: CGRect, layout: Layout
+    ) {
+      let left = max(full.minX + 3, visible.minX)
+      let right = min(full.maxX - 3, visible.maxX)
+      guard right > left else { return }
+      let sourceLeft = pressed?.id == clip.id && edge != 0
+        ? (Double(clip.start) - layout.first) * layout.per : full.minX
+      let rate = clip.effectiveRate / layout.per
+      let center = full.maxY - 8
+      let bars = NSBezierPath()
+      for x in stride(from: left, to: right, by: 2) {
+        let start = clip.sourceIn + (x - sourceLeft) * rate
+        let peak = wave.peak(from: start, to: start + 2 * rate)
+        let height = max(0.5, sqrt(peak) * 7)
+        bars.move(to: CGPoint(x: x, y: center - height))
+        bars.line(to: CGPoint(x: x, y: center + height))
+      }
+      NSColor(UI.color(.audio)).withAlphaComponent(clip.volume == 0 ? 0.27 : 0.82).setStroke()
+      bars.lineWidth = 1
+      bars.stroke()
     }
     override func setFrameSize(_ newSize: NSSize) {
       super.setFrameSize(newSize)
@@ -116,7 +146,8 @@ struct ClipLane: NSViewRepresentable {
         button.setAccessibilityRole(.button)
         button.setAccessibilityParent(self)
         button.setAccessibilityFrame(window.convertToScreen(convert(box, to: nil)))
-        button.setAccessibilityLabel(p.name + "  " + tc(p.clip.start) + " – " + tc(p.clip.end))
+        let audio = p.hasAudio ? (p.clip.volume == 0 ? "，已静音" : "，含音频") : ""
+        button.setAccessibilityLabel(p.name + "  " + tc(p.clip.start) + " – " + tc(p.clip.end) + audio)
         button.setAccessibilityValue(d.selection.contains(p.clip.id) ? "已选" : "")
         button.select = { [weak editor] in
           editor?.selected = p.clip.id

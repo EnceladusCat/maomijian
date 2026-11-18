@@ -305,7 +305,12 @@ struct Library: View {
         }.frame(width: 50, height: 32).clipped().cornerRadius(4)
         VStack(alignment: .leading, spacing: 2) {
           Text(m.name).lineLimit(1)
-          Text(tc(m.frames)).font(.caption.monospacedDigit()).foregroundStyle(UI.muted)
+          HStack(spacing: 5) {
+            Text(tc(m.frames)).monospacedDigit()
+            if m.video && m.audio {
+              Image(systemName: "speaker.wave.2").help("含音频").accessibilityLabel("含音频")
+            }
+          }.font(.caption).foregroundStyle(UI.muted)
         }
         Spacer(minLength: 0)
       }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
@@ -397,7 +402,7 @@ struct Workspace: View {
           Preview(e: e, t: e.transport).frame(maxWidth: .infinity)
           InspectorHost(editor: e).frame(width: geo.size.width < 1080 ? 206 : 235)
         }.frame(maxHeight: .infinity)
-        Timeline(e: e).frame(height: bound(geo.size.height * 0.35, 215, 360))
+        Timeline(e: e, waveforms: e.waveforms).frame(height: bound(geo.size.height * 0.35, 215, 360))
         EditorStatus(state: e.previewStatus)
       }.background(UI.deep).foregroundStyle(Color.white).preferredColorScheme(.dark)
         .overlay {

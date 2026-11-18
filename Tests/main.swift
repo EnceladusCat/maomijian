@@ -364,9 +364,23 @@ for look: FootageFilter in [.camera, .vhs, .neon, .prism] {
   var filtered = footage
   filtered.footageFilter = look
   precondition(paintFixture([filtered], at: 0) != boxOnly, "Filter \(look) did not affect pixels")
+  var migrated = filtered
+  migrated.filters = filtered.filters
+  precondition(paintFixture([filtered], at: 0) == paintFixture([migrated], at: 0))
   filtered.filterAmount = 0
   precondition(paintFixture([filtered], at: 0) == boxOnly)
 }
+var layered = footage
+layered.filters = [ClipFilter(look: .vhs, amount: 0.65), ClipFilter(look: .neon, amount: 0.85)]
+var reordered = layered
+reordered.filters.reverse()
+precondition(paintFixture([layered], at: 0) != paintFixture([reordered], at: 0))
+var bypassed = layered
+bypassed.filters = bypassed.filters.map { ClipFilter(look: $0.look, amount: 0) }
+precondition(paintFixture([bypassed], at: 0) == boxOnly)
+let layeredRoundTrip = try JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(layered))
+precondition(layeredRoundTrip.filters == layered.filters && layeredRoundTrip.footageFilter == nil)
+print("Passed ordered filter rendering, legacy pixel parity, zero intensity and persistence.")
 print(
   "Passed still persistence, crop/rotation and background pixels, glyph outlines, timer phase and four filters."
 )

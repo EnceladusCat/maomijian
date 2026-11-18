@@ -357,7 +357,7 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
   var sources = [UUID: SourceMap]()
   var stills = [UUID: URL]()
   var checkedStills = Set<UUID>()
-  var assets = [UUID: AVURLAsset]()
+  var assets = [UUID: (asset: AVURLAsset, video: AVAssetTrack?, audio: AVAssetTrack?)]()
   var pools = [AVMediaType: [(AVMutableCompositionTrack, Int)]]()
   var volumes = [CMPersistentTrackID: AVMutableAudioMixInputParameters]()
   for c in p.clips.sorted(by: { $0.start < $1.start }) where c.kind.isMedia {
@@ -373,19 +373,26 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
       stills[c.id] = url
       continue
     }
-    let src =
-      assets[media.id]
-      ?? AVURLAsset(
+    if assets[media.id] == nil {
+      let asset = AVURLAsset(
         url: URL(fileURLWithPath: media.path),
         options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-    assets[media.id] = src
-    var types = [AVMediaType]()
-    if c.kind == .video { types.append(.video) }
-    if media.audio && c.volume > 0 { types.append(.audio) }
-    for type in types {
-      guard let original = src.tracks(withMediaType: type).first else {
+      assets[media.id] = (
+        asset, asset.tracks(withMediaType: .video).first, asset.tracks(withMediaType: .audio).first)
+    }
+    guard let source = assets[media.id] else { continue }
+    var tracks: [(AVMediaType, AVAssetTrack)] = []
+    if c.kind == .video {
+      guard let video = source.video else {
         throw EditError.message("无法读取「\(media.name)」的轨道。")
       }
+      tracks.append((.video, video))
+    }
+    if c.volume > 0 {
+      if let audio = source.audio { tracks.append((.audio, audio)) }
+      else if c.kind == .audio { throw EditError.message("无法读取「\(media.name)」的音轨。") }
+    }
+    for (type, original) in tracks {
       let span = type == .video ? visibleVideo[c.id] ?? (c.start..<c.end) : (c.start..<c.end)
       let desired = CMTimeRange(
         start: sourceTime(c.sourceFrame(at: span.lowerBound)),
@@ -418,7 +425,7 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
         let inputRange: CMTimeRange
         if c.pitch != 0 {
           let file = try PitchedAudio.make(
-            src, track: original, range: range, semitones: c.pitch, cancelled: cancelled)
+            source.asset, track: original, range: range, semitones: c.pitch, cancelled: cancelled)
           pitchFiles.append(file)
           let pitchedAsset = file.readable
           guard let t = pitchedAsset.tracks(withMediaType: .audio).first else {

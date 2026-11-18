@@ -47,6 +47,7 @@ private struct Needle: View {
 }
 struct Timeline: View {
   @ObservedObject var e: Editor
+  @ObservedObject var waveforms: WaveformStore
   @State private var groupOffset: CGFloat = 0
   @State private var zoom = 1.0
   @State private var first = 0.0
@@ -139,7 +140,13 @@ struct Timeline: View {
                     ClipLane(
                       editor: e,
                       layout: .init(
-                        pieces: lane.clips.map { .init(clip: $0, name: e.p.name($0)) },
+                        pieces: lane.clips.map {
+                          let media = e.p.asset($0.asset)
+                          let wave = $0.asset.flatMap { waveforms.values[$0] }
+                          return .init(
+                            clip: $0, name: e.p.name($0),
+                            hasAudio: media?.audio == true || wave != nil, waveform: wave)
+                        },
                         selection: Set(e.selectedIDs), first: left, per: per,
                         groupOffset: groupOffset
                       ),
@@ -179,10 +186,12 @@ struct Timeline: View {
                           first: left, per: per, joins: Set(laneJoins.map(\.id)), clips: ids)
                       }
                     }
-                }.frame(height: 30).padding(.trailing, 12)
+                }.frame(height: ClipLane.rowHeight(lane.k)).padding(.trailing, 12)
               }
               MarqueeBlank(selection: e.timelineMarquee) { e.selected = nil }
-                .frame(height: max(0, viewport.size.height - CGFloat(lanes.count) * 31))
+                .frame(height: max(0, viewport.size.height - lanes.reduce(0) {
+                  $0 + ClipLane.rowHeight($1.k) + 1
+                }))
                 .padding(.leading, head).padding(.trailing, 12)
             }
           }.overlay {

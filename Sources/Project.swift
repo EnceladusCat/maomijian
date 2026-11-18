@@ -154,6 +154,11 @@ enum FootageFilter: String, Codable, CaseIterable {
   case neon = "TikTok 式霓虹"
   case prism = "色差放射"
 }
+struct ClipFilter: Codable, Equatable {
+  var look: FootageFilter
+  var amount = 1.0
+  var valid: Bool { look != .none && (0...1).contains(amount) }
+}
 struct SourceCrop: Codable, Equatable {
   var left = 0.0, top = 0.0, right = 0.0, bottom = 0.0
   var rect: CGRect { CGRect(x: left, y: top, width: 1 - left - right, height: 1 - top - bottom) }
@@ -247,10 +252,23 @@ struct Clip: Identifiable, Codable, Equatable {
   var visualBorder: VisualBorder?
   var footageFilter: FootageFilter?
   var filterAmount: Double?
+  var filterStack: [ClipFilter]?
   var textAppearance: TextAppearance?
   var timerSettings: TimerSettings?
   var timerPhase: Int?
   var displayScale: Double { visualScale ?? 1 }
+  var filters: [ClipFilter] {
+    get {
+      if let filterStack { return filterStack }
+      guard let footageFilter, footageFilter != .none else { return [] }
+      return [ClipFilter(look: footageFilter, amount: filterAmount ?? 1)]
+    }
+    set {
+      filterStack = newValue.isEmpty ? nil : newValue
+      footageFilter = nil
+      filterAmount = nil
+    }
+  }
   func displayedText(at frame: Int) -> String {
     kind == .timer
       ? (timerSettings ?? TimerSettings()).display(frames: frame - start + (timerPhase ?? 0)) : text
@@ -521,6 +539,7 @@ struct Project: Codable, Equatable {
         (0...maxFrames).contains(c.entryFrames), (0...maxFrames).contains(c.exitFrames),
         (0...300).contains(c.entranceFrames), (1...300).contains(c.motionFrames),
         (0.05...8).contains(c.displayScale), (0...1).contains(c.filterAmount ?? 1),
+        c.filters.allSatisfy(\.valid),
         c.sourceCrop?.valid != false, c.visualBorder?.valid != false,
         c.textAppearance?.valid != false, c.timerSettings?.valid != false,
         (-maxFrames...2 * maxFrames).contains(c.timerPhase ?? 0),

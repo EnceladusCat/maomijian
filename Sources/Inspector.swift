@@ -189,12 +189,9 @@ struct Inspector: View {
       colorControl("边框颜色", border.color) { color in e.edit(c.id) { $0.visualBorder?.color = color }
       }
     }
-    if let filter = c.footageFilter, filter != .none {
+    if !c.filters.isEmpty {
       Divider()
-      Text(filter.rawValue).font(.caption).foregroundStyle(UI.muted)
-      NumberRow(label: "滤镜强度", value: (c.filterAmount ?? 1) * 100, range: 0...100, unit: "%") { v in
-        e.edit(c.id) { $0.filterAmount = v / 100 }
-      }
+      FilterStackRows(editor: e, clip: c)
     }
   }
 

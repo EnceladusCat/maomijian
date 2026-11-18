@@ -198,6 +198,7 @@ final class Editor: ObservableObject {
   @Published var exportShort = 1080
   private var exportSettings = ExportSettings()
   @Published var thumbnails = [UUID: NSImage]()
+  let waveforms = WaveformStore()
   let transport = Transport(), player = AVPlayer()
   let liveCanvas = LiveCanvasPreview()
   private var baseline = Project(), undoStack = [Project](), redoStack = [Project](),
@@ -322,8 +323,21 @@ final class Editor: ObservableObject {
     redoStack.removeAll()
     install(next, keepingCanvasFrame: keepingCanvasFrame)
   }
-  private func install(_ next: Project, keepingCanvasFrame: Bool = false) {
+  private func install(_ project: Project, keepingCanvasFrame: Bool = false) {
     pause()
+    var next = project
+    let previous = p.assets == next.assets ? [:] : Dictionary(
+      uniqueKeysWithValues: p.assets.map { ($0.id, $0) })
+    if !previous.isEmpty {
+      for index in next.assets.indices {
+        let asset = next.assets[index]
+        if !asset.audio, previous[asset.id]?.path == asset.path,
+          waveforms.values[asset.id] != nil
+        {
+          next.assets[index].audio = true
+        }
+      }
+    }
     p = next
     let valid = Set(next.clips.map(\.id))
     let assets = Set(next.assets.map(\.id))
@@ -332,6 +346,9 @@ final class Editor: ObservableObject {
     if !libraryIDs.allSatisfy(assets.contains) { libraryIDs.removeAll { !assets.contains($0) } }
     if transport.frame > p.duration { transport.frame = p.duration }
     rebuild(keepingCanvasFrame: keepingCanvasFrame)
+    if !previous.isEmpty {
+      for asset in next.assets where previous[asset.id] != asset { loadWaveform(asset) }
+    }
   }
   func undo() {
     guard let back = undoStack.popLast() else { return }
@@ -471,12 +488,19 @@ final class Editor: ObservableObject {
     if !(c.start..<c.end).contains(transport.frame) { seek(c.start) }
     cropID = c.id
   }
-  func applyFilter(_ look: FootageFilter) {
+  func addFilter(_ look: FootageFilter) {
+    guard look != .none else { return }
+    editSelectedFilters { $0.append(ClipFilter(look: look)) }
+  }
+
+  func editSelectedFilters(_ edit: (inout [ClipFilter]) -> Void) {
     let ids = Set(selectedIDs)
     change { project in
       for i in project.clips.indices
       where ids.contains(project.clips[i].id) && project.clips[i].kind == .video {
-        project.clips[i].footageFilter = look == .none ? nil : look
+        var filters = project.clips[i].filters
+        edit(&filters)
+        if filters != project.clips[i].filters { project.clips[i].filters = filters }
       }
     }
     if let clip = selectedClips.first(where: { $0.kind == .video }),
@@ -521,6 +545,7 @@ final class Editor: ObservableObject {
       for asset in assets where project.asset(asset.id) == nil { project.assets.append(asset) }
       project.clips += clips
     }
+    assets.forEach { loadWaveform($0) }
     selectedIDs = clips.map(\.id)
     timelineAnchor = selectedIDs.first
     libraryFocus = false
@@ -805,8 +830,20 @@ final class Editor: ObservableObject {
       }
     }
   }
-  func loadThumb(_ m: Media) {
-    guard m.video else { return }
+  private func loadWaveform(_ media: Media, refresh: Bool = false) {
+    waveforms.load(media, refresh: refresh) { [weak self] in
+      guard let self, let index = self.p.assets.firstIndex(where: {
+        $0.id == media.id && $0.path == media.path && !$0.audio
+      }) else { return }
+      self.p.assets[index].audio = true
+      if let previous = self.baseline.assets.firstIndex(where: {
+        $0.id == media.id && $0.path == media.path
+      }) { self.baseline.assets[previous].audio = true }
+    }
+  }
+  func loadThumb(_ m: Media, refresh: Bool = false) {
+    loadWaveform(m, refresh: refresh)
+    guard m.video, refresh || thumbnails[m.id] == nil else { return }
     DispatchQueue.global(qos: .utility).async {
       let url = URL(fileURLWithPath: m.path)
       let dimensions: CGSize?
@@ -852,8 +889,9 @@ final class Editor: ObservableObject {
           for r in results {
             switch r {
             case .success(var m):
-              if let known = p.assets.first(where: { $0.path == m.path }) {
-                m = known
+              if let index = p.assets.firstIndex(where: { $0.path == m.path }) {
+                if m.audio { p.assets[index].audio = true }
+                m = p.assets[index]
               } else {
                 p.assets.append(m)
               }
@@ -871,7 +909,7 @@ final class Editor: ObservableObject {
           self.selected = id
           self.seek(start ?? 0)
         }
-        self.p.assets.filter { self.thumbnails[$0.id] == nil }.forEach { self.loadThumb($0) }
+        self.p.assets.forEach { self.loadThumb($0) }
         if !errors.isEmpty { self.error = errors.joined(separator: "\n") }
       }
     }
@@ -892,7 +930,7 @@ final class Editor: ObservableObject {
       change { p in
         if let i = p.assets.firstIndex(where: { $0.id == m.id }) { p.assets[i] = replacement }
       }
-      loadThumb(replacement)
+      loadThumb(replacement, refresh: true)
     } catch { self.error = error.localizedDescription }
   }
   func subtitleImport() {
@@ -964,6 +1002,7 @@ final class Editor: ObservableObject {
     undoStack = []
     redoStack = []
     thumbnails = [:]
+    waveforms.reset()
     mediaSizes = [:]
     cropID = nil
     libraryIDs = []
