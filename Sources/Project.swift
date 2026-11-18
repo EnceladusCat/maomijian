@@ -153,6 +153,25 @@ enum TransitionTarget: Hashable {
     return sides.map { .edge(EdgeTarget(clipID: clip.id, end: $0)) }
   }
 
+  static func cardTargets(for clips: [Clip]) -> [Self] {
+    let videos = clips.filter { $0.kind == .video && $0.length >= 2 }
+    let groups = Dictionary(grouping: videos.filter { $0.groupID != nil }, by: \.groupID)
+    let outerEdges = groups.compactMapValues { members -> (head: UUID, tail: UUID)? in
+      guard members.count > 1, let first = members.min(by: { $0.start < $1.start }),
+        let last = members.max(by: { $0.end < $1.end })
+      else { return nil }
+      return (first.id, last.id)
+    }
+    return videos.flatMap { clip -> [Self] in
+      guard let ends = outerEdges[clip.groupID] else { return Self.ends(of: clip) }
+      if ends.head == clip.id && ends.tail == clip.id { return Self.ends(of: clip) }
+      return ClipEnd.allCases.compactMap { side in
+        let id = side == .head ? ends.head : ends.tail
+        return id == clip.id ? .edge(EdgeTarget(clipID: id, end: side)) : nil
+      }
+    }
+  }
+
   static func at(
     x: Double, first: Double, per: Double, clips: [Clip], joins: [Project.Join]
   ) -> [Self] {

@@ -595,3 +595,29 @@ let giantProject = try JSONDecoder().decode(Project.self, from: JSONEncoder().en
 precondition(giantProject == groups)
 precondition(textPixels(headline).count == 240 * 160 * 4)
 print("Passed group persistence and splitting, fixed large text, and custom shadow pixels.")
+
+var joinedGroup = twoScenes
+let internalCut = TransitionTarget.join(enteringVideo.id)
+try joinedGroup.updateTransition(internalCut, frames: 19, style: .slide)
+let seamBefore = joinedGroup.transitionEffect(internalCut)
+let beforeGrouping = (51..<70).map { transitionPixels(joinedGroup, frame: $0, parts: joinedGroup.clips) }
+joinedGroup.group([outgoingVideo.id, enteringVideo.id])
+let afterGrouping = (51..<70).map { transitionPixels(joinedGroup, frame: $0, parts: joinedGroup.clips) }
+precondition(beforeGrouping == afterGrouping, "Grouping must not change the existing transition pixels")
+let headOfGroup = TransitionTarget.edge(EdgeTarget(clipID: outgoingVideo.id, end: .head))
+let tailOfGroup = TransitionTarget.edge(EdgeTarget(clipID: enteringVideo.id, end: .tail))
+let cardTargets = TransitionTarget.cardTargets(for: joinedGroup.clips)
+precondition(cardTargets == [headOfGroup, tailOfGroup])
+try joinedGroup.placeTransition(.dissolve, on: cardTargets)
+precondition(joinedGroup.transitionEffect(internalCut) == seamBefore)
+precondition(joinedGroup.transitionEffect(headOfGroup)?.style == .dissolve)
+precondition(joinedGroup.transitionEffect(tailOfGroup)?.style == .dissolve)
+let internalPixels = transitionPixels(joinedGroup, frame: 60, parts: joinedGroup.clips)
+for i in joinedGroup.clips.indices { joinedGroup.clips[i].start += 23 }
+precondition(joinedGroup.joins.first?.frame == 83 && joinedGroup.transitionEffect(internalCut) == seamBefore)
+precondition(transitionPixels(joinedGroup, frame: 83, parts: joinedGroup.clips) == internalPixels)
+try joinedGroup.placeTransition(.flip, on: [internalCut])
+precondition(joinedGroup.transitionEffect(internalCut) == ClipEdgeEffect(style: .flip, frames: 19))
+precondition(joinedGroup.transitionEffect(headOfGroup)?.style == .dissolve)
+precondition(joinedGroup.transitionEffect(tailOfGroup)?.style == .dissolve)
+print("Passed grouped transition pixels, outer-edge application, movement and direct seam replacement.")

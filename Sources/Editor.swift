@@ -747,7 +747,7 @@ final class Editor: ObservableObject {
       placeTransition(style, on: [target])
       return
     }
-    let targets = selectedClips.filter { $0.kind == .video }.flatMap { TransitionTarget.ends(of: $0) }
+    let targets = TransitionTarget.cardTargets(for: selectedClips)
     guard !targets.isEmpty else {
       status = "把效果拖到时间线上的视频或图片"
       return

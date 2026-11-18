@@ -71,6 +71,8 @@ struct Timeline: View {
       let left = min(first, limit)
       let joins = e.p.joins
       let lanes = tracks(e.p, joins: joins)
+      let selected = Set(e.selectedIDs)
+      let movedLeft = left - groupOffset / per
       VStack(spacing: 0) {
         HStack(spacing: 9) {
           Text("时间线").font(.headline)
@@ -153,36 +155,43 @@ struct Timeline: View {
                             clip: $0, name: e.p.name($0),
                             hasAudio: media?.audio == true || wave != nil, waveform: wave)
                         },
-                        selection: Set(e.selectedIDs), first: left, per: per,
+                        selection: selected, first: left, per: per,
                         groupOffset: groupOffset
                       ),
                       groupOffset: $groupOffset)
                     ForEach(
-                      laneJoins.filter { j in
-                        Double(j.range.upperBound) >= left && Double(j.range.lowerBound) <= left + seen
-                          && (j.active || Double(min(j.before.length, j.after.length)) * per >= 15)
-                      }
+                      laneJoins.filter { $0.active || Double(min($0.before.length, $0.after.length)) * per >= 15 }
                     ) { join in
-                      TransitionMarker(
-                        editor: e, target: .join(join.id),
-                        effect: join.active ? ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend) : nil,
-                        range: join.active ? join.range : nil, anchor: join.frame,
-                        title: "接缝转场 " + tc(join.frame), first: left, per: per, width: width)
+                      let beforeMoves = selected.contains(join.before.id)
+                      let afterMoves = selected.contains(join.after.id)
+                      let origin = beforeMoves && afterMoves ? movedLeft : left
+                      if (groupOffset == 0 || beforeMoves == afterMoves)
+                        && Double(join.range.upperBound) >= origin
+                        && Double(join.range.lowerBound) <= origin + seen
+                      {
+                        TransitionMarker(
+                          editor: e, target: .join(join.id),
+                          effect: join.active ? ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend) : nil,
+                          range: join.active ? join.range : nil, anchor: join.frame,
+                          title: "接缝转场 " + tc(join.frame), first: origin, per: per, width: width)
+                      }
                     }
                     if lane.k == .video {
                       ForEach(
                         lane.clips.filter {
-                          ($0.startEffect != nil || $0.endEffect != nil)
-                            && Double($0.end) >= left && Double($0.start) <= left + seen
+                          let origin = selected.contains($0.id) ? movedLeft : left
+                          return ($0.startEffect != nil || $0.endEffect != nil)
+                            && Double($0.end) >= origin && Double($0.start) <= origin + seen
                         }
                       ) { clip in
+                        let origin = selected.contains(clip.id) ? movedLeft : left
                         ForEach(ClipEnd.allCases, id: \.self) { side in
                           if let effect = clip.effect(at: side), let range = clip.transitionRange(at: side) {
                             TransitionMarker(
                               editor: e, target: .edge(EdgeTarget(clipID: clip.id, end: side)),
                               effect: effect, range: range, anchor: side == .head ? clip.start : clip.end,
                               title: side.rawValue + "转场 " + e.p.name(clip),
-                              first: left, per: per, width: width)
+                              first: origin, per: per, width: width)
                           }
                         }
                       }
