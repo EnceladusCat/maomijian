@@ -119,6 +119,8 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     edit.addItem(.separator())
     add(edit, "在播放头分割", #selector(split), "b", target: self)
     add(edit, "批量切割…", #selector(batchCut), "b", shift: true, target: self)
+    add(edit, "编组", #selector(groupClips), "g", target: self)
+    add(edit, "取消编组", #selector(ungroupClips), "g", shift: true, target: self)
     let win = menu("窗口")
     add(win, "最小化", #selector(NSWindow.performMiniaturize(_:)), "m")
     add(win, "缩放", #selector(NSWindow.performZoom(_:)))
@@ -143,6 +145,8 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   }
   @objc func split() { e.split() }
   @objc func batchCut() { e.batchCut() }
+  @objc func groupClips() { e.groupSelection() }
+  @objc func ungroupClips() { e.ungroupSelection() }
 }
 do {
   let args = CommandLine.arguments

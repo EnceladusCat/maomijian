@@ -6,7 +6,11 @@ struct NumberRow: View {
   var mixed = false
   let done: (Double) -> Void
   var body: some View { NumericControl(row: self).frame(height: 21) }
-  var formatted: String { mixed ? "" : String(format: "%.*f", precision, value) }
+  var formatted: String { mixed ? "" : format(value) }
+  func format(_ number: Double) -> String {
+    range.upperBound.isInfinite && number >= 1e8 ? String(number)
+      : String(format: "%.*f", precision, number)
+  }
 }
 private struct NumericControl: NSViewRepresentable {
   let row: NumberRow
@@ -63,7 +67,7 @@ private struct NumericControl: NSViewRepresentable {
         return
       }
       let value = bound(number, row.range.lowerBound, row.range.upperBound)
-      field.stringValue = String(format: "%.*f", row.precision, value)
+      field.stringValue = row.format(value)
       if row.mixed || abs(row.value - value) > 1e-8 { row.done(value) }
     }
   }
@@ -216,8 +220,13 @@ struct Inspector: View {
     ) {
       textBinding(c, \.font).wrappedValue = fonts[$0]
     }.frame(height: 21)
-    NumberRow(label: "字号", value: appearance.size, range: 8...240, unit: "px") {
-      textBinding(c, \.size).wrappedValue = $0
+    NumberRow(label: "字号", value: appearance.size, range: 8...Double.infinity, unit: "px") { value in
+      e.edit(c.id) { clip in
+        var next = clip.textAppearance ?? TextAppearance()
+        next.size = value
+        next.fixedSize = true
+        clip.textAppearance = next
+      }
     }
     Toggle("粗体", isOn: textBinding(c, \.bold))
     Picker("描边", selection: textBinding(c, \.outline.style)) {
@@ -230,6 +239,9 @@ struct Inspector: View {
       colorControl("描边颜色", appearance.outline.color) {
         textBinding(c, \.outline.color).wrappedValue = $0
       }
+    }
+    TextShadowControls(value: appearance.shadow ?? TextShadow()) {
+      textBinding(c, \.shadow).wrappedValue = $0
     }
   }
 
@@ -442,7 +454,10 @@ struct Inspector: View {
               } else if let target = e.selectedTransition, let effect = e.p.transitionEffect(target) {
                 TransitionProperties(editor: e, target: target, effect: effect)
               } else if e.selectedIDs.count > 1 {
-                Text("已选 \(e.selectedIDs.count) 个片段").font(.headline)
+                Text(e.isWholeGroupSelected ? "素材组 · \(e.selectedIDs.count) 个片段" : "已选 \(e.selectedIDs.count) 个片段")
+                  .font(.headline)
+                if e.canGroup { Button("编组", action: e.groupSelection) }
+                if e.canUngroup { Button("取消编组", action: e.ungroupSelection) }
                 mediaTiming(e.selectedClips)
                 Button("在播放头分割所选片段", action: e.split)
                 Button("删除所选片段", action: e.remove)
@@ -457,6 +472,34 @@ struct Inspector: View {
         }.frame(maxWidth: .infinity, alignment: .leading).padding(14)
       }
     }.background(UI.panel)
+  }
+}
+
+struct TextShadowControls: View {
+  let value: TextShadow
+  let apply: (TextShadow) -> Void
+  private func editing<T>(_ key: WritableKeyPath<TextShadow, T>, _ updated: T) {
+    var next = value
+    next[keyPath: key] = updated
+    apply(next)
+  }
+  var body: some View {
+    Toggle("文字阴影", isOn: Binding(get: { value.enabled }, set: { editing(\.enabled, $0) }))
+    if value.enabled {
+      ProjectColorPicker(title: "阴影颜色", hex: value.color) { editing(\.color, $0) }
+      NumberRow(label: "阴影不透明度", value: value.opacity * 100, range: 0...100, unit: "%") {
+        editing(\.opacity, $0 / 100)
+      }
+      NumberRow(label: "阴影模糊", value: value.blur, range: 0...240, unit: "px", precision: 1) {
+        editing(\.blur, $0)
+      }
+      NumberRow(label: "阴影水平偏移", value: value.x, range: -2160...2160, unit: "px", precision: 1) {
+        editing(\.x, $0)
+      }
+      NumberRow(label: "阴影垂直偏移", value: value.y, range: -2160...2160, unit: "px", precision: 1) {
+        editing(\.y, $0)
+      }
+    }
   }
 }
 

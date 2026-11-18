@@ -114,6 +114,7 @@ let sr = RegionShape.square.fit(lens.region, in: size)
 precondition(abs(sr.width * size.width - sr.height * size.height) < 0.001)
 precondition(SlidePhase(0.2).travel == 0 && SlidePhase(0.2).blur > 0.8)
 precondition(SlidePhase(0.55).travel > 0.28 && SlidePhase(0.55).travel < 0.6)
+precondition(SlidePhase(0.55).overlap > 0.4)
 precondition(SlidePhase(1).travel == 1 && SlidePhase(1).blur == 0)
 let out = Clip(kind: .video, start: 0, length: 70)
 var inc = Clip(kind: .video, start: 40, length: 90)
@@ -148,6 +149,9 @@ precondition(
   early != original && rgbAt(early, 48, 50) != rgbAt(original, 48, 50),
   "The outline must blur before travel")
 precondition(rgbAt(middle, 226, 75)[0] > 210 && rgbAt(middle, 16, 75) != rgbAt(middle, 226, 75))
+let seamColors = [85, 100, 115, 130, 145, 160].map { rgbAt(middle, $0, 120)[0] }
+precondition(Set(seamColors).count >= 5, "Moving shots should feather over a broad band")
+precondition([16, 88, 125, 170, 226].allSatisfy { middle[(120 * 240 + $0) * 4 + 3] == 255 })
 precondition(rgbAt(final, 16, 75) == rgbAt(final, 220, 75) && rgbAt(final, 16, 75)[0] > 210)
 print("Passed circle/square geometry, lens border colors and full-frame blur-before-slide checks.")
 
@@ -536,3 +540,58 @@ try shortTransition.placeTransition(.dissolve, on: TransitionTarget.ends(of: tin
 precondition(shortTransition.clips[0].startEffect?.frames == 2)
 precondition(shortTransition.clips[0].endEffect?.frames == 2)
 print("Passed direct transition placement, fixed timing, resizing, replacement and short clips.")
+
+var groups = Project()
+let groupText = Clip.annotation(.text, at: 0)
+let groupTimer = Clip.annotation(.timer, at: 30)
+let otherArt = Clip.annotation(.rectangle, at: 180)
+groups.clips = [groupText, groupTimer, otherArt]
+groups.group([groupText.id, groupTimer.id])
+let savedGroup = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(groups)).checked()
+precondition(savedGroup == groups && groups.clips[0].groupID != nil && groups.clips[2].groupID == nil)
+precondition(groups.expandingGroups([groupTimer.id]) == [groupText.id, groupTimer.id])
+let groupPart = groups.cut(groupTimer.id, at: 60)!
+precondition(Set(groups.expandingGroups([groupText.id])) == [groupText.id, groupTimer.id, groupPart])
+groups.group([groupText.id, otherArt.id])
+precondition(groups.expandingGroups([otherArt.id]).count == 4)
+groups.ungroup([groupPart])
+precondition(groups.clips.allSatisfy { $0.groupID == nil })
+groups = savedGroup
+groups.clips.removeAll { $0.id == groupTimer.id }
+groups.clearSingletonGroups()
+precondition(groups.clips.allSatisfy { $0.groupID == nil })
+
+var headline = Clip.annotation(.text, at: 0)
+headline.text = "H"
+var headlineStyle = TextAppearance(size: 240, fixedSize: true, shadow: TextShadow(enabled: false))
+headline.textAppearance = headlineStyle
+func textPixels(_ clip: Clip) -> [UInt8] {
+  let g = bitmap(240, 160)!
+  FramePainter(Project(), size).paint(g, frame: 0, active: [clip]) { _ in nil }
+  return Array(UnsafeBufferPointer(start: g.data!.assumingMemoryBound(to: UInt8.self), count: 240 * 160 * 4))
+}
+func whiteRows(_ pixels: [UInt8]) -> Int {
+  (0..<160).filter { y in (0..<240).contains { x in pixels[(y * 240 + x) * 4] > 235 } }.count
+}
+let normalRows = whiteRows(textPixels(headline))
+headlineStyle.size = 720
+headline.textAppearance = headlineStyle
+let large = textPixels(headline)
+precondition(normalRows > 15 && whiteRows(large) > 2 * normalRows, "Large text shrank into its old box")
+headlineStyle.shadow = TextShadow(color: "#FF0000", opacity: 1, blur: 0, x: 235, y: 85)
+headline.textAppearance = headlineStyle
+let shadowed = textPixels(headline)
+let shadowDots = (0..<240 * 160).filter {
+  shadowed[$0 * 4 + 2] > 200 && shadowed[$0 * 4] < 20
+}
+precondition(!shadowDots.isEmpty && shadowDots.map { $0 % 240 }.max()! > 170)
+headlineStyle.shadow?.enabled = false
+headline.textAppearance = headlineStyle
+precondition(textPixels(headline) == large)
+headlineStyle.size = 1e25
+headline.textAppearance = headlineStyle
+groups.clips = [headline]
+let giantProject = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(groups)).checked()
+precondition(giantProject == groups)
+precondition(textPixels(headline).count == 240 * 160 * 4)
+print("Passed group persistence and splitting, fixed large text, and custom shadow pixels.")

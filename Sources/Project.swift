@@ -208,11 +208,25 @@ struct VisualBorder: Codable, Equatable {
   var color = "#FFFFFF"
   var valid: Bool { (1...64).contains(width) }
 }
+struct TextShadow: Codable, Equatable {
+  var enabled = true
+  var color = "#000000"
+  var opacity = 0.8
+  var blur = 5.0
+  var x = 0.0, y = 2.0
+  var valid: Bool {
+    (0...1).contains(opacity) && (0...240).contains(blur)
+      && (-2160...2160).contains(x) && (-2160...2160).contains(y)
+  }
+}
 struct TextAppearance: Codable, Equatable {
   var font = "", bold = true
   var size = 52.0
   var outline = VisualBorder(width: 3, color: "#10141D")
-  var valid: Bool { (8...240).contains(size) && outline.valid }
+  var fixedSize: Bool?
+  var shadow: TextShadow?
+  var usesFixedSize: Bool { fixedSize == true || size > 240 }
+  var valid: Bool { size.isFinite && size >= 8 && outline.valid && shadow?.valid != false }
 }
 enum TimerDirection: String, Codable, CaseIterable {
   case up = "正计时"
@@ -272,6 +286,7 @@ struct VisualGeometry {
 }
 struct Clip: Identifiable, Codable, Equatable {
   var id = UUID()
+  var groupID: UUID?
   var kind: Kind
   var asset: UUID? = nil
   var start: Int
@@ -553,6 +568,28 @@ struct Project: Codable, Equatable {
     if c.kind.isMedia { return asset(c.asset)?.name ?? c.kind.title }
     return c.text.isEmpty ? c.kind.title : c.text
   }
+  func expandingGroups(_ ids: [UUID]) -> [UUID] {
+    let selected = Set(ids)
+    let groups = Set(clips.lazy.filter { selected.contains($0.id) }.compactMap(\.groupID))
+    guard !groups.isEmpty else { return ids }
+    let members = clips.filter { !selected.contains($0.id) && $0.groupID.map(groups.contains) == true }
+    return members.map(\.id) + ids
+  }
+  mutating func group(_ ids: [UUID]) {
+    let members = Set(expandingGroups(ids))
+    guard clips.lazy.filter({ members.contains($0.id) }).prefix(2).count == 2 else { return }
+    let groupID = UUID()
+    for i in clips.indices where members.contains(clips[i].id) { clips[i].groupID = groupID }
+  }
+  mutating func ungroup(_ ids: [UUID]) {
+    let members = Set(expandingGroups(ids))
+    for i in clips.indices where members.contains(clips[i].id) { clips[i].groupID = nil }
+  }
+  mutating func clearSingletonGroups() {
+    var seen = Set<UUID>(), shared = Set<UUID>()
+    for id in clips.compactMap(\.groupID) where !seen.insert(id).inserted { shared.insert(id) }
+    for i in clips.indices where clips[i].groupID.map(shared.contains) == false { clips[i].groupID = nil }
+  }
   func checked() throws -> Project {
     guard version == 1, Set(assets.map(\.id)).count == assets.count,
       Set(clips.map(\.id)).count == clips.count
@@ -620,6 +657,7 @@ struct Project: Codable, Equatable {
       if clips[i].start >= end { clips[i].start -= end - start }
       if let id = clips[i].from, !remaining.contains(id) { clips[i].from = nil }
     }
+    clearSingletonGroups()
   }
   static func read(from url: URL) throws -> Project {
     var p = try JSONDecoder().decode(Project.self, from: Data(contentsOf: url))

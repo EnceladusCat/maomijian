@@ -110,13 +110,27 @@ final class Editor: ObservableObject {
       deselectTransition()
       libraryFocus = false
       timelineAnchor = newValue
-      let ids = newValue.map { [$0] } ?? []
+      let ids = newValue.map { p.expandingGroups([$0]) } ?? []
       if selectedIDs != ids { selectedIDs = ids }
     }
   }
   var selectedClips: [Clip] {
     let ids = Set(selectedIDs)
     return p.clips.filter { ids.contains($0.id) }
+  }
+  var isWholeGroupSelected: Bool {
+    guard let id = selectedClips.first?.groupID else { return false }
+    return selectedClips.allSatisfy { $0.groupID == id }
+  }
+  var canGroup: Bool { !libraryFocus && selectedIDs.count > 1 && !isWholeGroupSelected }
+  var canUngroup: Bool { !libraryFocus && selectedClips.contains { $0.groupID != nil } }
+  func groupSelection() {
+    guard canGroup else { return }
+    change { $0.group(selectedIDs) }
+  }
+  func ungroupSelection() {
+    guard canUngroup else { return }
+    change { $0.ungroup(selectedIDs) }
   }
   private func selection(
     _ id: UUID, in order: [UUID], current: [UUID],
@@ -140,8 +154,15 @@ final class Editor: ObservableObject {
     let order =
       timelineAnchor.map(lane.contains) == true
       ? lane : p.clips.sorted { $0.start < $1.start }.map(\.id)
-    let next = selection(
-      id, in: order, current: selectedIDs, anchor: &timelineAnchor, modifiers: modifiers)
+    let next: [UUID]
+    if modifiers.contains(.command), !modifiers.contains(.shift), selectedIDs.contains(id) {
+      let members = Set(p.expandingGroups([id]))
+      next = selectedIDs.filter { !members.contains($0) }
+      timelineAnchor = id
+    } else {
+      next = p.expandingGroups(selection(
+        id, in: order, current: selectedIDs, anchor: &timelineAnchor, modifiers: modifiers))
+    }
     if selectedIDs != next { selectedIDs = next }
   }
   func pickAsset(_ id: UUID, modifiers: NSEvent.ModifierFlags) {
@@ -154,6 +175,7 @@ final class Editor: ObservableObject {
   let libraryMarquee = MarqueeSelection()
   func pickMarquee(_ hits: [UUID], modifiers: NSEvent.ModifierFlags, inLibrary: Bool) {
     deselectTransition()
+    let hits = inLibrary ? hits : p.expandingGroups(hits)
     let current = inLibrary ? libraryIDs : selectedIDs
     let existing = Set(current)
     let next: [UUID]
@@ -346,7 +368,8 @@ final class Editor: ObservableObject {
     let valid = Set(next.clips.map(\.id))
     let assets = Set(next.assets.map(\.id))
     if let cropID, !valid.contains(cropID) { self.cropID = nil }
-    if !selectedIDs.allSatisfy(valid.contains) { selectedIDs.removeAll { !valid.contains($0) } }
+    let selection = next.expandingGroups(selectedIDs.filter(valid.contains))
+    if selectedIDs != selection { selectedIDs = selection }
     if !libraryIDs.allSatisfy(assets.contains) { libraryIDs.removeAll { !assets.contains($0) } }
     if transport.frame > p.duration { transport.frame = p.duration }
     rebuild(keepingCanvasFrame: keepingCanvasFrame)
@@ -591,7 +614,7 @@ final class Editor: ObservableObject {
         do {
           let edited = try snapshot.applying(plan)
           self.change { $0 = edited.project }
-          self.selectedIDs = edited.selected
+          self.selectedIDs = self.p.expandingGroups(edited.selected)
           self.timelineAnchor = edited.selected.first
           self.libraryFocus = false
           cancel()
@@ -608,7 +631,7 @@ final class Editor: ObservableObject {
     }
     var pieces: [UUID] = selectedIDs.filter { !ids.contains($0) }
     change { project in pieces += ids.compactMap { project.cut($0, at: f) } }
-    selectedIDs = pieces
+    selectedIDs = p.expandingGroups(pieces)
     timelineAnchor = pieces.last
   }
   func remove() {
@@ -620,6 +643,7 @@ final class Editor: ObservableObject {
     guard !ids.isEmpty else { return }
     change {
       $0.clips.removeAll { ids.contains($0.id) }
+      $0.clearSingletonGroups()
       for i in $0.clips.indices where $0.clips[i].from.map(ids.contains) == true {
         $0.clips[i].from = nil
       }

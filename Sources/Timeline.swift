@@ -78,6 +78,9 @@ struct Timeline: View {
           Tool(symbol: "scissors", label: "在播放头分割（⌘B）", act: e.split).disabled(e.clip == nil)
           Tool(symbol: "square.split.2x2", label: "批量切割（⇧⌘B）", act: e.batchCut)
             .disabled(!e.canBatchCut)
+          Tool(symbol: "link", label: "编组（⌘G）", act: e.groupSelection).disabled(!e.canGroup)
+          Tool(symbol: "rectangle.on.rectangle.slash", label: "取消编组（⇧⌘G）", act: e.ungroupSelection)
+            .disabled(!e.canUngroup)
           Tool(
             symbol: "trash", label: e.selectedTransition == nil ? "删除所选片段" : "移除所选转场",
             act: e.remove

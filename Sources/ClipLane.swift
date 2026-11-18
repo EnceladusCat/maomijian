@@ -42,6 +42,8 @@ struct ClipLane: NSViewRepresentable {
     private var modified = false
     private var blankPress = false
     private var symbols: [Kind: NSImage] = [:]
+    private static let groupIcon = NSImage(systemSymbolName: "link", accessibilityDescription: nil)?
+      .withSymbolConfiguration(.init(paletteColors: [NSColor(UI.accent)]))
     private static let label: [NSAttributedString.Key: Any] = {
       let style = NSMutableParagraphStyle()
       style.lineBreakMode = .byTruncatingTail
@@ -90,14 +92,21 @@ struct ClipLane: NSViewRepresentable {
           symbols[k]?.draw(
             in: NSRect(x: box.minX + 6, y: 9, width: 13, height: 12), from: .zero,
             operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-          if box.width > 48 {
+          let grouped = p.clip.groupID != nil
+          let labelX = grouped ? 38.0 : 23.0
+          if grouped {
+            Self.groupIcon?.draw(
+              in: CGRect(x: box.minX + 22, y: 9, width: 12, height: 12),
+              from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+          }
+          if box.width > labelX + 25 {
             let title = p.hasAudio && k == .video ? p.name + " · 含音频" : p.name
             (title as NSString).draw(
-              in: NSRect(x: box.minX + 23, y: 7, width: box.width - 28, height: 15),
+              in: NSRect(x: box.minX + labelX, y: 7, width: box.width - labelX - 5, height: 15),
               withAttributes: Self.label)
           }
         }
-        if selected && box.width > 18 {
+        if selected && data.selection.count == 1 && box.width > 18 {
           NSColor.white.setFill()
           for x in [box.minX + 3, box.maxX - 5] {
             NSBezierPath(
@@ -147,7 +156,8 @@ struct ClipLane: NSViewRepresentable {
         button.setAccessibilityParent(self)
         button.setAccessibilityFrame(window.convertToScreen(convert(box, to: nil)))
         let audio = p.hasAudio ? (p.clip.volume == 0 ? "，已静音" : "，含音频") : ""
-        button.setAccessibilityLabel(p.name + "  " + tc(p.clip.start) + " – " + tc(p.clip.end) + audio)
+        let group = p.clip.groupID == nil ? "" : "，已编组"
+        button.setAccessibilityLabel(p.name + "  " + tc(p.clip.start) + " – " + tc(p.clip.end) + audio + group)
         button.setAccessibilityValue(d.selection.contains(p.clip.id) ? "已选" : "")
         button.select = { [weak editor] in
           editor?.selected = p.clip.id
