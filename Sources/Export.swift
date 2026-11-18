@@ -3,7 +3,7 @@ import Foundation
 
 enum ExportCodec: String, CaseIterable {
   case h264 = "H.264"
-  case hevc = "HEVC"
+  case hevc = "HEVC (H.265)"
   var format: AVVideoCodecType { self == .hevc ? .hevc : .h264 }
 }
 enum ExportQuality: String, CaseIterable {
@@ -20,8 +20,8 @@ enum ExportQuality: String, CaseIterable {
 }
 struct ExportSettings: Equatable {
   var short = 1080
-  var codec = ExportCodec.h264
-  var quality = ExportQuality.high
+  var codec = ExportCodec.hevc
+  var quality = ExportQuality.balanced
   var customMbps: Double?
   static let bitrateRange = 0.5...120.0
   static let audioBitrate = 256_000
