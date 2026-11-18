@@ -16,13 +16,8 @@ final class ShelfState: ObservableObject {
     get { tabs.value }
     set { if tabs.value != newValue { tabs.send(newValue) } }
   }
-  @Published var transitionSection = TransitionSection.blur
-  @Published var targetJoinID: UUID?
-  @Published var transitionFrames = 15
-  @Published var transitionStyle = TransitionLook.slide
-  @Published var dropJoin: UUID?
-  @Published var targetEdge: EdgeTarget?
-  @Published var dropEdge: EdgeTarget?
+  @Published var transitionSection = TransitionSection.effects
+  @Published var dropTargets: [TransitionTarget] = []
 }
 final class PanelUpdates: ObservableObject {
   private var subscriptions = Set<AnyCancellable>()
@@ -66,8 +61,9 @@ final class PanelUpdates: ObservableObject {
     }
     if tab == .transitions {
       editor.$selectedIDs.dropFirst().sink { [weak editor] _ in
-        if editor?.shelf.transitionSection != .blur { changed() }
+        if editor?.shelf.transitionSection == .slide { changed() }
       }.store(in: &subscriptions)
+      editor.$selectedTransition.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
     }
     editor.shelf.tabs.sink { [weak self] next in
       if let self, next == tab, self.stale {
@@ -93,6 +89,8 @@ final class Editor: ObservableObject {
   }
   var toolTab: ToolTab { shelf.toolTab }
   var dropBands: [DropBand] = []
+  @Published private(set) var selectedTransition: TransitionTarget?
+  private(set) var lastTransitionStyle = TransitionLook.dissolve
   @Published var drawShape = RegionShape.rectangle
   @Published var regionTool: Kind?
   @Published var cropID: UUID?
@@ -109,6 +107,7 @@ final class Editor: ObservableObject {
   var selected: UUID? {
     get { selectedIDs.last }
     set {
+      deselectTransition()
       libraryFocus = false
       timelineAnchor = newValue
       let ids = newValue.map { [$0] } ?? []
@@ -136,6 +135,7 @@ final class Editor: ObservableObject {
     return [id]
   }
   func pickClip(_ id: UUID, lane: [UUID], modifiers: NSEvent.ModifierFlags) {
+    deselectTransition()
     libraryFocus = false
     let order =
       timelineAnchor.map(lane.contains) == true
@@ -145,6 +145,7 @@ final class Editor: ObservableObject {
     if selectedIDs != next { selectedIDs = next }
   }
   func pickAsset(_ id: UUID, modifiers: NSEvent.ModifierFlags) {
+    deselectTransition()
     libraryFocus = true
     libraryIDs = selection(
       id, in: p.assets.map(\.id), current: libraryIDs, anchor: &libraryAnchor, modifiers: modifiers)
@@ -152,6 +153,7 @@ final class Editor: ObservableObject {
   let timelineMarquee = MarqueeSelection()
   let libraryMarquee = MarqueeSelection()
   func pickMarquee(_ hits: [UUID], modifiers: NSEvent.ModifierFlags, inLibrary: Bool) {
+    deselectTransition()
     let current = inLibrary ? libraryIDs : selectedIDs
     let existing = Set(current)
     let next: [UUID]
@@ -173,6 +175,7 @@ final class Editor: ObservableObject {
     }
   }
   func selectAllItems() {
+    deselectTransition()
     if libraryFocus && toolTab == .media {
       libraryIDs = p.assets.map(\.id)
       libraryAnchor = libraryIDs.first
@@ -339,6 +342,7 @@ final class Editor: ObservableObject {
       }
     }
     p = next
+    if let target = selectedTransition, next.transitionEffect(target) == nil { deselectTransition() }
     let valid = Set(next.clips.map(\.id))
     let assets = Set(next.assets.map(\.id))
     if let cropID, !valid.contains(cropID) { self.cropID = nil }
@@ -608,6 +612,10 @@ final class Editor: ObservableObject {
     timelineAnchor = pieces.last
   }
   func remove() {
+    if let selectedTransition {
+      editTransition(selectedTransition, frames: 0)
+      return
+    }
     let ids = Set(selectedIDs)
     guard !ids.isEmpty else { return }
     change {
@@ -680,97 +688,68 @@ final class Editor: ObservableObject {
     change { $0.clips.append(c) }
     selected = c.id
   }
-  func chooseJoin(_ join: Project.Join) {
+  func deselectTransition() {
+    if selectedTransition != nil { selectedTransition = nil }
+  }
+  func selectTransition(_ target: TransitionTarget) {
     pause()
     regionTool = nil
+    if !selectedIDs.isEmpty { selected = nil }
+    libraryFocus = false
+    if selectedTransition != target { selectedTransition = target }
+    shelf.transitionSection = .effects
     shelf.toolTab = .transitions
-    shelf.transitionSection = .blur
-    shelf.targetEdge = nil
-    shelf.targetJoinID = join.id
-    if join.active {
-      shelf.transitionFrames = join.after.blend
-      shelf.transitionStyle = join.after.transitionStyle
-    }
   }
   func openTab(_ tab: ToolTab) {
     guard toolTab != tab else { return }
     if tab != .media { libraryMarquee.cancel() }
     libraryFocus = tab == .media
     if regionTool != nil { regionTool = nil }
-    if tab == .transitions {
-      let joins = p.joins
-      if let j = joins.first(where: { $0.id == selected }) ?? joins.first(where: {
-        $0.id == shelf.targetJoinID
-      }) ?? joins.min(by: { abs($0.frame - transport.frame) < abs($1.frame - transport.frame) }) {
-        if shelf.targetJoinID != j.id { shelf.targetJoinID = j.id }
-        if j.active {
-          if shelf.transitionFrames != j.after.blend { shelf.transitionFrames = j.after.blend }
-          if shelf.transitionStyle != j.after.transitionStyle {
-            shelf.transitionStyle = j.after.transitionStyle
-          }
-        }
-      }
-    }
     shelf.toolTab = tab
   }
-  var edgeTarget: EdgeTarget? {
-    if let target = shelf.targetEdge,
-      p.clips.contains(where: { $0.id == target.clipID && $0.kind == .video })
-    {
-      return target
-    }
-    if let c = clip, c.kind == .video { return EdgeTarget(clipID: c.id, end: .head) }
-    return p.clips.first(where: { $0.kind == .video }).map { EdgeTarget(clipID: $0.id, end: .head) }
-  }
-  func chooseEdge(_ target: EdgeTarget) {
-    guard let c = p.clips.first(where: { $0.id == target.clipID && $0.kind == .video }) else {
-      return
-    }
-    pause()
-    regionTool = nil
-    shelf.targetEdge = target
-    shelf.transitionSection = .edge
-    if let effect = c.effect(at: target.end) {
-      shelf.transitionFrames = effect.frames
-      shelf.transitionStyle = effect.style
-    }
-    shelf.toolTab = .transitions
-  }
-  func edgeTransition(_ target: EdgeTarget, frames: Int, style: TransitionLook? = nil) {
+
+  func placeTransition(_ style: TransitionLook, on targets: [TransitionTarget]) {
+    guard let first = targets.first else { return }
     var next = p
     do {
-      try next.setEdgeEffect(target, frames: frames, style: style)
+      try next.placeTransition(style, on: targets)
       change { $0 = next }
-      chooseEdge(target)
-      selected = target.clipID
+      lastTransitionStyle = style
+      selectTransition(first)
     } catch { self.error = error.localizedDescription }
   }
-  func previewEdge(_ target: EdgeTarget) {
-    guard let c = p.clips.first(where: { $0.id == target.clipID }),
-      let range = c.transitionRange(at: target.end)
-    else { return }
-    previewTransition(max(0, range.lowerBound - 7)..<min(p.duration, range.upperBound + 9))
-  }
   func applyTransitionCard(_ style: TransitionLook) {
-    if shelf.transitionSection == .edge {
-      if let edgeTarget {
-        edgeTransition(edgeTarget, frames: shelf.transitionFrames, style: style)
-      } else {
-        status = "请选择图片或视频片段的首端或末端"
-      }
+    if let target = selectedTransition {
+      placeTransition(style, on: [target])
       return
     }
-    let joins = p.joins
-    guard let j = joins.first(where: { $0.id == shelf.targetJoinID }) ?? joins.first else {
-      status = "先将两个视频首尾相接，或用 ⌘B 分割视频"
+    let targets = selectedClips.filter { $0.kind == .video }.flatMap { TransitionTarget.ends(of: $0) }
+    guard !targets.isEmpty else {
+      status = "把效果拖到时间线上的视频或图片"
       return
     }
-    transition(j.id, frames: shelf.transitionFrames, style: style)
+    placeTransition(style, on: targets)
   }
-  func previewJoin(_ id: UUID) {
-    guard let j = p.joins.first(where: { $0.id == id }), j.active else { return }
-    previewTransition(
-      max(j.before.start, j.range.lowerBound - 7)..<min(j.after.end, j.range.upperBound + 9))
+  func editTransition(_ target: TransitionTarget, frames: Int) {
+    var next = p
+    do {
+      try next.updateTransition(target, frames: frames)
+      change { $0 = next }
+      if frames > 0 { selectTransition(target) }
+    } catch { self.error = error.localizedDescription }
+  }
+  func previewTransition(_ target: TransitionTarget) {
+    switch target {
+    case .join(let id):
+      guard let join = p.joins.first(where: { $0.id == id && $0.active }) else { return }
+      previewTransition(
+        max(join.before.start, join.range.lowerBound - 7)..<min(join.after.end, join.range.upperBound + 9))
+    case .edge(let edge):
+      guard let clip = p.clips.first(where: { $0.id == edge.clipID }),
+        let range = clip.transitionRange(at: edge.end)
+      else { return }
+      previewTransition(max(0, range.lowerBound - 7)..<min(p.duration, range.upperBound + 9))
+    }
   }
   private func previewTransition(_ range: Range<Int>) {
     if busy {
@@ -780,22 +759,6 @@ final class Editor: ObservableObject {
     seek(range.lowerBound)
     auditionEnd = range.upperBound
     play()
-  }
-  func transition(_ id: UUID, frames: Int, style: TransitionLook? = nil) {
-    var next = p
-    do {
-      shelf.targetJoinID = id
-      try next.setTransition(id, frames: frames, style: style)
-      change { $0 = next }
-      if frames > 0, let updated = p.clips.first(where: { $0.id == id }) {
-        if shelf.transitionStyle != updated.transitionStyle {
-          shelf.transitionStyle = updated.transitionStyle
-        }
-        if shelf.transitionFrames != updated.blend { shelf.transitionFrames = updated.blend }
-      }
-      selected = id
-
-    } catch { self.error = error.localizedDescription }
   }
   func move(_ c: Clip, by delta: Int, edge: Int) {
     if edge == 0, selectedIDs.count > 1, selectedIDs.contains(c.id) {
@@ -1008,12 +971,8 @@ final class Editor: ObservableObject {
     libraryIDs = []
     libraryAnchor = nil
     selected = nil
-    let firstJoin = next.joins.first
-    shelf.targetJoinID = firstJoin?.id
-    shelf.targetEdge = nil
-    shelf.dropEdge = nil
-    shelf.transitionFrames = firstJoin?.active == true ? firstJoin!.after.blend : 15
-    shelf.transitionStyle = firstJoin?.active == true ? firstJoin!.after.transitionStyle : .slide
+    shelf.dropTargets = []
+    lastTransitionStyle = .dissolve
     url = file
     baseline = next
     transport.frame = 0

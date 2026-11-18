@@ -78,7 +78,10 @@ struct Timeline: View {
           Tool(symbol: "scissors", label: "在播放头分割（⌘B）", act: e.split).disabled(e.clip == nil)
           Tool(symbol: "square.split.2x2", label: "批量切割（⇧⌘B）", act: e.batchCut)
             .disabled(!e.canBatchCut)
-          Tool(symbol: "trash", label: "删除所选片段", act: e.remove).disabled(e.clip == nil)
+          Tool(
+            symbol: "trash", label: e.selectedTransition == nil ? "删除所选片段" : "移除所选转场",
+            act: e.remove
+          ).disabled(e.clip == nil && e.selectedTransition == nil)
           Tool(
             symbol: "arrow.right.and.line.vertical.and.arrow.left", label: "删除所选时段并合拢所有轨道（⇧Delete）",
             act: e.ripple
@@ -131,7 +134,7 @@ struct Timeline: View {
             VStack(spacing: 1) {
               ForEach(lanes) { lane in
                 let ids = Set(lane.clips.map(\.id))
-                let laneJoins = lane.k == .video ? joins.filter { ids.contains($0.after.id) } : []
+                let laneJoins = lane.k == .video ? joins.filter { ids.contains($0.after.id) && ids.contains($0.before.id) } : []
                 HStack(spacing: 0) {
                   label(lane.title + (lane.index == 0 ? "" : " \(lane.index+1)"), lane.k)
                     .background(MarqueeBlank(selection: e.timelineMarquee) { e.selected = nil })
@@ -153,29 +156,35 @@ struct Timeline: View {
                       groupOffset: $groupOffset)
                     ForEach(
                       laneJoins.filter { j in
-                        Double(j.frame) >= left && Double(j.frame) <= left + seen
-                          && (j.active || e.selected == j.id
-                            || Double(min(j.before.length, j.after.length)) * per >= 15)
+                        Double(j.range.upperBound) >= left && Double(j.range.lowerBound) <= left + seen
+                          && (j.active || Double(min(j.before.length, j.after.length)) * per >= 15)
                       }
-                    ) { j in
-                      GateMarker(
-                        titles: e.p.name(j.before) + " → " + e.p.name(j.after), e: e, join: j,
-                        first: left, per: per, width: width, shelf: e.shelf
-                      ).equatable()
+                    ) { join in
+                      TransitionMarker(
+                        editor: e, target: .join(join.id),
+                        effect: join.active ? ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend) : nil,
+                        range: join.active ? join.range : nil, anchor: join.frame,
+                        title: "接缝转场 " + tc(join.frame), first: left, per: per, width: width)
                     }
                     if lane.k == .video {
                       ForEach(
                         lane.clips.filter {
-                          ($0.id == e.selected || $0.startEffect != nil || $0.endEffect != nil)
+                          ($0.startEffect != nil || $0.endEffect != nil)
                             && Double($0.end) >= left && Double($0.start) <= left + seen
                         }
                       ) { clip in
                         ForEach(ClipEnd.allCases, id: \.self) { side in
-                          EdgeMarker(
-                            editor: e, shelf: e.shelf, clip: clip, side: side,
-                            first: left, per: per, width: width)
+                          if let effect = clip.effect(at: side), let range = clip.transitionRange(at: side) {
+                            TransitionMarker(
+                              editor: e, target: .edge(EdgeTarget(clipID: clip.id, end: side)),
+                              effect: effect, range: range, anchor: side == .head ? clip.start : clip.end,
+                              title: side.rawValue + "转场 " + e.p.name(clip),
+                              first: left, per: per, width: width)
+                          }
                         }
                       }
+                      TransitionDropHighlight(
+                        shelf: e.shelf, joins: laneJoins, clips: lane.clips, first: left, per: per, width: width)
                     }
                     Needle(t: e.transport, first: left, per: per)
                   }.clipped()
@@ -183,7 +192,8 @@ struct Timeline: View {
                     .background {
                       if lane.k == .video {
                         DropBandReader(
-                          first: left, per: per, joins: Set(laneJoins.map(\.id)), clips: ids)
+                          first: left, per: per, joins: laneJoins, clips: lane.clips,
+                          viewport: viewport.frame(in: .named(DropBandKey.coordinateSpace)))
                       }
                     }
                 }.frame(height: ClipLane.rowHeight(lane.k)).padding(.trailing, 12)

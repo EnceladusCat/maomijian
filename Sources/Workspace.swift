@@ -405,6 +405,7 @@ struct Workspace: View {
         Timeline(e: e, waveforms: e.waveforms).frame(height: bound(geo.size.height * 0.35, 215, 360))
         EditorStatus(state: e.previewStatus)
       }.background(UI.deep).foregroundStyle(Color.white).preferredColorScheme(.dark)
+        .coordinateSpace(name: DropBandKey.coordinateSpace)
         .overlay {
           if over {
             RoundedRectangle(cornerRadius: 7).strokeBorder(UI.accent, lineWidth: 3)

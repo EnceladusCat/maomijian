@@ -143,6 +143,40 @@ struct EdgeTarget: Hashable {
   let clipID: UUID
   let end: ClipEnd
 }
+enum TransitionTarget: Hashable {
+  case join(UUID)
+  case edge(EdgeTarget)
+
+  static func ends(of clip: Clip) -> [Self] {
+    if clip.length < 2 { return [] }
+    let sides: [ClipEnd] = clip.length >= 4 ? [.head, .tail] : [.head]
+    return sides.map { .edge(EdgeTarget(clipID: clip.id, end: $0)) }
+  }
+
+  static func at(
+    x: Double, first: Double, per: Double, clips: [Clip], joins: [Project.Join]
+  ) -> [Self] {
+    let frame = first + x / per
+    if let join = joins.min(by: { abs(Double($0.frame) - frame) < abs(Double($1.frame) - frame) }),
+      abs(Double(join.frame) - frame) * per <= min(16, Double(min(join.before.length, join.after.length)) * per / 5)
+    {
+      return [.join(join.id)]
+    }
+    guard let clip = clips.last(where: { Double($0.start) <= frame && frame <= Double($0.end) }),
+      clip.length >= 2
+    else { return [] }
+    let offset = (frame - Double(clip.start)) * per
+    let width = Double(clip.length) * per
+    let edgeWidth = min(52, width * 0.27)
+    if offset <= edgeWidth || (clip.length < 4 && offset <= width / 2) {
+      return [.edge(EdgeTarget(clipID: clip.id, end: .head))]
+    }
+    if width - offset <= edgeWidth || clip.length < 4 {
+      return [.edge(EdgeTarget(clipID: clip.id, end: .tail))]
+    }
+    return ends(of: clip)
+  }
+}
 struct ClipEdgeEffect: Codable, Equatable {
   let style: TransitionLook
   let frames: Int
@@ -617,7 +651,7 @@ struct Project: Codable, Equatable {
     enc.outputFormatting = [.prettyPrinted, .sortedKeys]
     try enc.encode(copy).write(to: url, options: .atomic)
   }
-  struct Join: Identifiable {
+  struct Join: Identifiable, Equatable {
     let before: Clip, after: Clip
     var id: UUID { after.id }
     var active: Bool {
@@ -696,14 +730,85 @@ struct Project: Codable, Equatable {
     }
     return spans
   }
+  func transitionEffect(_ target: TransitionTarget) -> ClipEdgeEffect? {
+    switch target {
+    case .join(let id):
+      guard let join = joins.first(where: { $0.id == id && $0.active }) else { return nil }
+      return ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend)
+    case .edge(let edge):
+      return clips.first(where: { $0.id == edge.clipID })?.effect(at: edge.end)
+    }
+  }
+  func transitionFrameLimit(_ target: TransitionTarget) -> Int {
+    switch target {
+    case .join(let id):
+      let links = joins
+      guard let join = links.first(where: { $0.id == id }) else { return 0 }
+      let previous = links.first { $0.id == join.before.id }?.frame ?? join.before.start
+      let next = links.first { $0.before.id == id }?.frame ?? join.after.end
+      return min(90, join.frame - previous, next - join.frame)
+    case .edge(let edge):
+      guard let c = clips.first(where: { $0.id == edge.clipID && $0.kind == .video }),
+        c.length >= 2
+      else { return 0 }
+      let other = c.effect(at: edge.end == .head ? .tail : .head)
+      if other != nil && c.length < 4 { return 0 }
+      return min(90, c.length - min(c.length - 2, other?.frames ?? 0))
+    }
+  }
+  mutating func updateTransition(
+    _ target: TransitionTarget, frames: Int, style: TransitionLook? = nil
+  ) throws {
+    switch target {
+    case .join(let id): try setTransition(id, frames: frames, style: style)
+    case .edge(let edge): try setEdgeEffect(edge, frames: frames, style: style)
+    }
+  }
+  mutating func placeTransition(_ style: TransitionLook, on targets: [TransitionTarget]) throws {
+    var next = self
+    let selected = Set(targets)
+    for case .edge(let edge) in targets where edge.end == .head {
+      let tail = TransitionTarget.edge(EdgeTarget(clipID: edge.clipID, end: .tail))
+      if selected.contains(tail) {
+        try next.updateTransition(.edge(edge), frames: 0)
+        try next.updateTransition(tail, frames: 0)
+      }
+    }
+    for target in targets {
+      let originalFrames = transitionEffect(target)?.frames ?? 15
+      var duration = originalFrames
+      switch target {
+      case .join(let id):
+        if let join = next.joins.first(where: { $0.id == id }),
+          join.before.end == join.frame, join.after.start == join.frame
+        {
+          try next.setEdgeEffect(EdgeTarget(clipID: join.before.id, end: .tail), frames: 0, style: nil)
+          try next.setEdgeEffect(EdgeTarget(clipID: join.after.id, end: .head), frames: 0, style: nil)
+        }
+      case .edge(let edge):
+        if let c = next.clips.first(where: { $0.id == edge.clipID }) {
+          let opposite = TransitionTarget.edge(
+            EdgeTarget(clipID: edge.clipID, end: edge.end == .head ? .tail : .head))
+          if selected.contains(opposite) { duration = min(originalFrames, c.length / 2) }
+          if let join = next.joins.first(where: {
+            $0.active && ($0.before.end == $0.frame && $0.after.start == $0.frame)
+              && (edge.end == .head ? $0.after.id == c.id : $0.before.id == c.id)
+          }) {
+            try next.setTransition(join.id, frames: 0)
+          }
+        }
+      }
+      try next.updateTransition(target, frames: duration, style: style)
+    }
+    self = next
+  }
   mutating func setEdgeEffect(_ target: EdgeTarget, frames: Int, style: TransitionLook?) throws {
     guard let index = clips.firstIndex(where: { $0.id == target.clipID }),
       clips[index].kind == .video
     else { throw EditError.message("请选择图片或视频片段的首端或末端。") }
     let c = clips[index]
-    let other = c.effect(at: target.end == .head ? .tail : .head)
-    let available = c.length - (other == nil ? 0 : min(c.length - 2, other!.frames))
-    if frames > 0 && (c.length < 2 || (other != nil && c.length < 4)) {
+    let available = transitionFrameLimit(.edge(target))
+    if frames > 0 && available < 2 {
       throw EditError.message("片段太短，请先延长片段或移除另一端的转场。")
     }
     let next =
@@ -711,7 +816,7 @@ struct Project: Codable, Equatable {
       ? nil
       : ClipEdgeEffect(
         style: style ?? c.effect(at: target.end)?.style ?? .slide,
-        frames: bound(frames, 2, min(90, available)))
+        frames: bound(frames, 2, available))
     if target.end == .head {
       clips[index].startEffect = next
     } else {
@@ -724,11 +829,7 @@ struct Project: Codable, Equatable {
       let i = clips.firstIndex(where: { $0.id == id })
     else { throw EditError.message("请先让两个视频片段首尾相接。") }
     let cut = join.frame
-    let links = joins
-    let previous = links.first { $0.id == join.before.id }?.frame ?? join.before.start
-    let next = links.first { $0.before.id == id }?.frame ?? join.after.end
-    let available = min(cut - previous, next - cut)
-    let n = frames == 0 ? 0 : min(90, max(2, frames), available)
+    let n = frames == 0 ? 0 : min(max(2, frames), transitionFrameLimit(.join(id)))
     guard frames == 0 || n >= 2 else { throw EditError.message("这两个片段没有足够长度添加转场。") }
     // Keep the authored media and all other tracks fixed. Retain the cut location
     // when disabling a legacy overlap so the existing edit becomes a hard cut.

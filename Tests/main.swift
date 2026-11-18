@@ -492,3 +492,47 @@ do {
 print(
   "Passed both clip ends, retimed source partitions, 600 cuts, capped and equal divisions, per-part shifts and rejection."
 )
+
+var placements = Project()
+let clipA = Clip(kind: .video, start: 0, length: 60)
+let clipB = Clip(kind: .video, start: 60, length: 60)
+let isolated = Clip(kind: .video, start: 150, length: 42)
+placements.clips = [clipA, clipB, isolated]
+func placedAt(_ point: Double) -> [TransitionTarget] {
+  TransitionTarget.at(x: point, first: 0, per: 2, clips: placements.clips, joins: placements.joins)
+}
+let seam = TransitionTarget.join(clipB.id)
+let head = TransitionTarget.edge(EdgeTarget(clipID: isolated.id, end: .head))
+let tail = TransitionTarget.edge(EdgeTarget(clipID: isolated.id, end: .tail))
+precondition(placedAt(121) == [seam] && placedAt(133) == [seam])
+precondition(placedAt(138) == [.edge(EdgeTarget(clipID: clipB.id, end: .head))])
+precondition(placedAt(299).isEmpty && placedAt(260).isEmpty)
+precondition(placedAt(308) == [head])
+precondition(placedAt(342) == [head, tail])
+precondition(placedAt(376) == [tail])
+let lengthBefore = placements.duration
+try placements.placeTransition(.fire, on: placedAt(342))
+precondition(placements.transitionEffect(head)?.style == .fire)
+precondition(placements.transitionEffect(tail)?.frames == 15)
+try placements.placeTransition(.comparison, on: placedAt(121))
+try placements.updateTransition(seam, frames: 27)
+precondition(placements.transitionEffect(seam)?.frames == 27)
+try placements.placeTransition(.dissolve, on: [seam])
+precondition(placements.transitionEffect(seam) == ClipEdgeEffect(style: .dissolve, frames: 27))
+let incomingHead = TransitionTarget.edge(EdgeTarget(clipID: clipB.id, end: .head))
+try placements.placeTransition(.glitch, on: [incomingHead])
+precondition(placements.transitionEffect(seam) == nil)
+precondition(placements.transitionEffect(incomingHead)?.style == .glitch)
+try placements.placeTransition(.warp, on: [seam])
+precondition(placements.transitionEffect(incomingHead) == nil)
+try placements.updateTransition(seam, frames: 0)
+precondition(placements.transitionEffect(seam) == nil && placements.duration == lengthBefore)
+precondition(placements.clips.map(\.start) == [0, 60, 150])
+precondition(placements.clips.map(\.length) == [60, 60, 42])
+let tiny = Clip(kind: .video, start: 0, length: 4)
+var shortTransition = Project()
+shortTransition.clips = [tiny]
+try shortTransition.placeTransition(.dissolve, on: TransitionTarget.ends(of: tiny))
+precondition(shortTransition.clips[0].startEffect?.frames == 2)
+precondition(shortTransition.clips[0].endEffect?.frames == 2)
+print("Passed direct transition placement, fixed timing, resizing, replacement and short clips.")

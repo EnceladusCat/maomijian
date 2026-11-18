@@ -439,6 +439,8 @@ struct Inspector: View {
                 Text(tool.title).font(.headline)
                 shapePicker($e.drawShape)
                 Text("选择形状后，在画布上拖出范围。").font(.caption).foregroundStyle(UI.muted)
+              } else if let target = e.selectedTransition, let effect = e.p.transitionEffect(target) {
+                TransitionProperties(editor: e, target: target, effect: effect)
               } else if e.selectedIDs.count > 1 {
                 Text("已选 \(e.selectedIDs.count) 个片段").font(.headline)
                 mediaTiming(e.selectedClips)

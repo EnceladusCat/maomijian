@@ -174,117 +174,91 @@ private final class ToolButton: NSButton {
   }
 }
 struct DropBand: Equatable {
-  let rect: CGRect, first: Double, per: Double, joins: Set<UUID>, clips: Set<UUID>
+  let rect: CGRect
+  let originX: Double, first: Double, per: Double
+  let joins: [Project.Join]
+  let clips: [Clip]
 }
 struct DropBandKey: PreferenceKey {
+  static let coordinateSpace = "TransitionDropWorkspace"
   static var defaultValue: [DropBand] { [] }
   static func reduce(value: inout [DropBand], nextValue: () -> [DropBand]) { value += nextValue() }
 }
 struct DropBandReader: View {
-  let first: Double, per: Double, joins: Set<UUID>, clips: Set<UUID>
+  let first: Double, per: Double
+  let joins: [Project.Join]
+  let clips: [Clip]
+  let viewport: CGRect
+
   var body: some View {
     GeometryReader { geo in
+      let band = geo.frame(in: .named(DropBandKey.coordinateSpace))
+      let visible = band.intersection(viewport)
       Color.clear.preference(
         key: DropBandKey.self,
-        value: [
-          DropBand(rect: geo.frame(in: .global), first: first, per: per, joins: joins, clips: clips)
+        value: visible.isEmpty ? [] : [
+          DropBand(rect: visible, originX: band.minX, first: first, per: per, joins: joins, clips: clips)
         ])
     }
   }
 }
+
 private struct TransitionCardDrag: NSViewRepresentable {
   let e: Editor
   let look: TransitionLook
   func makeNSView(context: Context) -> Surface {
-    let v = Surface()
-    v.card = self
-    return v
+    let view = Surface()
+    view.card = self
+    return view
   }
   func updateNSView(_ view: Surface, context: Context) { view.card = self }
+
   final class Surface: NSView {
-    var card: TransitionCardDrag?, start = CGPoint.zero, dragged = false
+    var card: TransitionCardDrag?
+    private var start = CGPoint.zero
+    private var dragging = false
     override var isFlipped: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func resetCursorRects() {
       super.resetCursorRects()
       addCursorRect(bounds, cursor: .openHand)
     }
+
     override func mouseDown(with event: NSEvent) {
       start = event.locationInWindow
-      dragged = false
+      dragging = false
     }
-    private enum Destination {
-      case join(Project.Join)
-      case edge(EdgeTarget)
-    }
-    private func target(_ event: NSEvent) -> Destination? {
-      guard let card else { return nil }
-      guard let content = window?.contentView else { return nil }
+    private func targets(_ event: NSEvent) -> [TransitionTarget] {
+      guard let card, let content = window?.contentView else { return [] }
       let point = content.convert(event.locationInWindow, from: nil)
-      let global = CGPoint(
+      let workspace = CGPoint(
         x: point.x, y: content.isFlipped ? point.y : content.bounds.height - point.y)
-      guard let band = card.e.dropBands.first(where: { $0.rect.contains(global) }) else {
-        return nil
-      }
-      let frame = band.first + (global.x - band.rect.minX) / band.per
-      if card.e.shelf.transitionSection == .edge {
-        let ends = card.e.p.clips.filter { band.clips.contains($0.id) }.flatMap { c in
-          // Use the marker's inside offset to distinguish two ends at the same cut.
-          let inset = min(8 / band.per, Double(c.length) * 0.24)
-          return [
-            (EdgeTarget(clipID: c.id, end: .head), Double(c.start) + inset),
-            (EdgeTarget(clipID: c.id, end: .tail), Double(c.end) - inset),
-          ]
-        }
-        guard let nearest = ends.min(by: { abs($0.1 - frame) < abs($1.1 - frame) }),
-          abs(nearest.1 - frame) * band.per <= 29
-        else { return nil }
-        return .edge(nearest.0)
-      }
-      let near = card.e.p.joins.filter { band.joins.contains($0.id) }.min {
-        abs(Double($0.frame) - frame) < abs(Double($1.frame) - frame)
-      }
-      guard let near, abs(Double(near.frame) - frame) * band.per <= 38 else { return nil }
-      return .join(near)
+      guard let band = card.e.dropBands.first(where: { $0.rect.contains(workspace) }) else { return [] }
+      return TransitionTarget.at(
+        x: workspace.x - band.originX, first: band.first, per: band.per, clips: band.clips, joins: band.joins)
     }
     override func mouseDragged(with event: NSEvent) {
       guard let card else { return }
-      if !dragged {
+      if !dragging {
         guard hypot(event.locationInWindow.x - start.x, event.locationInWindow.y - start.y) >= 3
         else { return }
-        dragged = true
+        dragging = true
         NSCursor.closedHand.push()
       }
-      var join: UUID?
-      var edge: EdgeTarget?
-      switch target(event) {
-      case .join(let value): join = value.id
-      case .edge(let value): edge = value
-      case nil: break
-      }
-      if card.e.shelf.dropJoin != join { card.e.shelf.dropJoin = join }
-      if card.e.shelf.dropEdge != edge { card.e.shelf.dropEdge = edge }
+      let next = targets(event)
+      if card.e.shelf.dropTargets != next { card.e.shelf.dropTargets = next }
     }
     override func mouseUp(with event: NSEvent) {
       guard let card else { return }
-      guard dragged else {
+      guard dragging else {
         card.e.applyTransitionCard(card.look)
         return
       }
-      dragged = false
+      dragging = false
       NSCursor.pop()
-      card.e.shelf.dropJoin = nil
-      card.e.shelf.dropEdge = nil
-      let frames = card.e.shelf.transitionFrames
-      switch target(event) {
-      case .join(let join):
-        card.e.chooseJoin(join)
-        card.e.shelf.transitionFrames = frames
-        card.e.transition(join.id, frames: frames, style: card.look)
-      case .edge(let edge):
-        card.e.edgeTransition(edge, frames: frames, style: card.look)
-      case nil: break
-      }
+      let next = targets(event)
+      card.e.shelf.dropTargets = []
+      card.e.placeTransition(card.look, on: next)
     }
   }
 }
@@ -369,58 +343,29 @@ private struct TransitionSwatch: View {
       true)
   }
 }
-enum TransitionSection { case blur, edge, slide }
+enum TransitionSection { case effects, slide }
 struct TransitionPanel: View {
   @ObservedObject var shelf: ShelfState
   let e: Editor
   @ObservedObject var updates: PanelUpdates
-  private func pair(_ j: Project.Join) -> String { e.p.name(j.before) + " → " + e.p.name(j.after) }
+
   var body: some View {
-    let joins = shelf.transitionSection == .blur ? e.p.joins : []
-    let chosen = joins.first { $0.id == shelf.targetJoinID } ?? joins.first
-    let edge = shelf.transitionSection == .edge ? e.edgeTarget : nil
-    let current =
-      edge.flatMap { target in
-        e.p.clips.first(where: { $0.id == target.clipID })?.effect(at: target.end)?.style
-      } ?? (chosen?.active == true ? chosen?.after.transitionStyle : nil)
     VStack(alignment: .leading, spacing: 0) {
-      VStack(alignment: .leading, spacing: 8) {
-        Text("转场效果").font(.headline)
-        Picker(
-          "效果类型",
-          selection: Binding(
-            get: { shelf.transitionSection },
-            set: { section in
-              if section == .edge, let target = e.edgeTarget {
-                e.chooseEdge(target)
-              } else if section == .blur {
-                let candidates = e.p.joins
-                if let join = candidates.first(where: { $0.id == shelf.targetJoinID })
-                  ?? candidates.first
-                {
-                  e.chooseJoin(join)
-                } else {
-                  shelf.transitionSection = .blur
-                }
-              } else {
-                shelf.transitionSection = section
-              }
-            })
-        ) {
-          Text("接缝").tag(TransitionSection.blur)
-          Text("首尾").tag(TransitionSection.edge)
-          Text("滑入").tag(TransitionSection.slide)
-        }.pickerStyle(.segmented).labelsHidden()
-        if shelf.transitionSection == .blur { targetSettings(choices: joins, chosen: chosen) }
-        if shelf.transitionSection == .edge { edgeSettings }
-      }.padding(12)
+      Picker("效果类型", selection: $shelf.transitionSection) {
+        Text("转场").tag(TransitionSection.effects)
+        Text("滑入").tag(TransitionSection.slide)
+      }.pickerStyle(.segmented).labelsHidden().padding(12)
       Divider()
       ScrollView {
         if shelf.transitionSection == .slide {
           VStack(alignment: .leading, spacing: 8) { SlideEntrancePanel(e: e, updates: updates) }
             .frame(maxWidth: .infinity, alignment: .leading).padding(12)
         } else {
+          let current = e.selectedTransition.flatMap { e.p.transitionEffect($0)?.style }
           VStack(alignment: .leading, spacing: 5) {
+            Text("把效果拖到素材首端、末端或接缝。拖到素材中间可在两端添加。")
+              .font(.caption).foregroundStyle(UI.muted).fixedSize(horizontal: false, vertical: true)
+              .padding(.bottom, 5)
             ForEach(TransitionLook.allCases, id: \.self) { look in
               card(look, active: current == look)
             }
@@ -430,87 +375,20 @@ struct TransitionPanel: View {
     }
   }
 
-  @ViewBuilder private func targetSettings(choices: [Project.Join], chosen: Project.Join?)
-    -> some View
-  {
-    if let join = chosen {
-      MenuField(
-        title: "片段接缝", choices: choices.map { tc($0.frame) + "  " + pair($0) },
-        selectedIndex: choices.firstIndex { $0.id == join.id } ?? 0
-      ) { index in e.chooseJoin(choices[index]) }.frame(height: 21)
-      Picker("转场时长", selection: $shelf.transitionFrames) {
-        let values = Array(Set([9, 15, 30, shelf.transitionFrames])).sorted()
-        ForEach(values, id: \.self) { v in
-          Text(String(format: "%.2g 秒", Double(v) / 30)).tag(v)
-        }
-      }.labelsHidden().pickerStyle(.segmented)
-      if join.active {
-        HStack(spacing: 6) {
-          Button("播放", action: { e.previewJoin(join.id) }).accessibilityLabel("播放转场")
-          Button("更新时长", action: { e.transition(join.id, frames: shelf.transitionFrames) })
-            .disabled(shelf.transitionFrames == join.after.blend)
-          Spacer(minLength: 0)
-          Button("移除", action: { e.transition(join.id, frames: 0) }).accessibilityLabel("移除转场")
-        }.controlSize(.small)
-      }
-    } else {
-      Text("先将两个视频首尾相接，或在时间线上分割。")
-        .font(.caption).foregroundStyle(UI.muted).fixedSize(horizontal: false, vertical: true)
-    }
-  }
-
-  @ViewBuilder private var edgeSettings: some View {
-    let choices = e.p.clips.filter { $0.kind == .video }.sorted { $0.start < $1.start }
-    if let target = e.edgeTarget, let c = choices.first(where: { $0.id == target.clipID }) {
-      MenuField(
-        title: "素材", choices: choices.map { tc($0.start) + "  " + e.p.name($0) },
-        selectedIndex: choices.firstIndex { $0.id == c.id } ?? 0
-      ) { index in
-        e.chooseEdge(EdgeTarget(clipID: choices[index].id, end: target.end))
-      }.frame(height: 21)
-      Picker(
-        "素材首尾",
-        selection: Binding(
-          get: { target.end },
-          set: { side in
-            e.chooseEdge(EdgeTarget(clipID: target.clipID, end: side))
-          })
-      ) {
-        ForEach(ClipEnd.allCases, id: \.self) { Text($0.rawValue).tag($0) }
-      }.pickerStyle(.segmented).labelsHidden()
-      Picker("首尾转场时长", selection: $shelf.transitionFrames) {
-        ForEach(Array(Set([9, 15, 30, shelf.transitionFrames])).sorted(), id: \.self) { frames in
-          Text(String(format: "%.2g 秒", Double(frames) / 30)).tag(frames)
-        }
-      }.labelsHidden().pickerStyle(.segmented)
-      if let effect = c.effect(at: target.end) {
-        HStack(spacing: 5) {
-          Button("播放") { e.previewEdge(target) }.accessibilityLabel("播放首尾转场")
-          Button("更新时长") { e.edgeTransition(target, frames: shelf.transitionFrames) }
-            .disabled(shelf.transitionFrames == effect.frames)
-          Spacer(minLength: 0)
-          Button("移除") { e.edgeTransition(target, frames: 0) }.accessibilityLabel("移除首尾转场")
-        }.controlSize(.small)
-      }
-    } else {
-      Text("先选择图片或视频片段。").font(.caption).foregroundStyle(UI.muted)
-    }
-  }
-
   private func card(_ look: TransitionLook, active: Bool) -> some View {
-    return HStack(spacing: 7) {
+    HStack(spacing: 7) {
       TransitionSwatch(look: look)
       Text(look.rawValue).font(.system(size: 12, weight: .semibold))
         .fixedSize(horizontal: false, vertical: true)
       Spacer(minLength: 0)
-      Image(systemName: active ? "checkmark" : "hand.draw").font(.system(size: 10))
+      Image(systemName: active ? "checkmark" : "line.3.horizontal").font(.system(size: 10))
         .foregroundStyle(active ? UI.accent : UI.muted)
     }.padding(5).background(
       active ? UI.accent.opacity(0.16) : UI.deep,
       in: RoundedRectangle(cornerRadius: 5)
     )
     .contentShape(Rectangle()).overlay { TransitionCardDrag(e: e, look: look) }
-    .help(shelf.transitionSection == .edge ? "点按应用到当前首端或末端。" : "点按应用到当前接缝，也可拖到时间线接缝。")
+    .help("拖到时间线，或点按应用到选中的素材或转场")
     .accessibilityElement(children: .ignore).accessibilityLabel(look.rawValue + "效果卡")
     .accessibilityAddTraits(.isButton).accessibilityAction { e.applyTransitionCard(look) }
   }
