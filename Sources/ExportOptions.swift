@@ -50,14 +50,17 @@ final class ExportOptions: ObservableObject {
     }
   }
 }
-struct ExportAccessory: View {
+struct ExportSettingsView: View {
   @ObservedObject var options: ExportOptions
+  let cancel: () -> Void
+  let proceed: () -> Void
   var body: some View {
     let settings = options.settings
     let project = options.project
     let estimated = options.sampledBytes ?? settings.estimatedBytes(for: project)
     let displayed = ByteCountFormatter.string(fromByteCount: estimated, countStyle: .file)
     VStack(alignment: .leading, spacing: 9) {
+      Text("导出 MP4").font(.headline).padding(.bottom, 5)
       HStack(spacing: 14) {
         Picker(
           "分辨率",
@@ -123,6 +126,13 @@ struct ExportAccessory: View {
               : "依据时间线上的三段试编码推算，实际大小随画面变化。"
       )
       .font(.caption).foregroundStyle(UI.muted).fixedSize(horizontal: false, vertical: true)
-    }.padding(12).background(UI.panel)
+      Divider().padding(.top, 3)
+      HStack {
+        Spacer()
+        Button("取消", action: cancel).keyboardShortcut(.cancelAction)
+        Button("选择保存位置…", action: proceed).keyboardShortcut(.defaultAction)
+      }
+    }.padding(16).frame(width: 466).background(UI.panel)
+      .foregroundStyle(.white).preferredColorScheme(.dark)
   }
 }

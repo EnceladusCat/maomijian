@@ -42,7 +42,7 @@ struct MediaHandles: View {
               var updated = clip
               updated.x = bound(clip.x + value.translation.width / canvas.width, -4, 5)
               updated.y = bound(clip.y + value.translation.height / canvas.height, -4, 5)
-              draft = updated
+              update(updated)
             }.onEnded { _ in commit() })
       ForEach(0..<(cropping ? 8 : 4), id: \.self) { index in
         let point = index < 4 ? corners(box)[index] : edgePoints(box)[index - 4]
@@ -78,12 +78,13 @@ struct MediaHandles: View {
                 updated.angle = (clip.angle + Double(end - begin) * 180 / Double.pi)
                   .truncatingRemainder(
                     dividingBy: 360)
-                draft = updated
+                update(updated)
               }.onEnded { _ in commit() }
           ).help("拖动旋转素材").accessibilityLabel("旋转手柄")
       }
     }.frame(width: canvas.width, height: canvas.height)
-      .onChange(of: cropping) { _ in draft = nil }
+      .onChange(of: cropping) { _ in clearDraft() }
+      .onDisappear(perform: clearDraft)
   }
 
   private func corners(_ r: CGRect) -> [CGPoint] {
@@ -123,7 +124,7 @@ struct MediaHandles: View {
     updated.visualScale = scale
     updated.x = bound(clip.x + shift.x / canvas.width, -4, 5)
     updated.y = bound(clip.y + shift.y / canvas.height, -4, 5)
-    draft = updated
+    update(updated)
   }
   private func resizeCrop(index: Int, translation: CGSize) {
     let full = VisualGeometry(clip: clip, canvas: canvas, aspect: aspect).full
@@ -142,18 +143,18 @@ struct MediaHandles: View {
     }
     var updated = clip
     updated.sourceCrop = crop
-    draft = updated
+    update(updated)
+  }
+  private func update(_ clip: Clip) {
+    draft = clip
+    editor.previewCanvas(clip)
+  }
+  private func clearDraft() {
+    draft = nil
+    if editor.liveCanvas.activeID == clip.id { editor.liveCanvas.clear() }
   }
   private func commit() {
-    if let draft {
-      editor.edit(clip.id) { target in
-        target.x = draft.x
-        target.y = draft.y
-        target.angle = draft.angle
-        target.visualScale = draft.visualScale
-        target.sourceCrop = draft.sourceCrop
-      }
-    }
+    if let draft { editor.commitCanvas(draft) }
     draft = nil
   }
 }

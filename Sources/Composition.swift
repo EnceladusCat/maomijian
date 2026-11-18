@@ -8,19 +8,32 @@ struct SourceMap {
   let track: CMPersistentTrackID
   let transform: CGAffineTransform
 }
+final class PreviewPlayback {
+  private let lock = NSLock()
+  private var playing = false
+
+  var isPlaying: Bool { lock.withLock { playing } }
+  func setPlaying(_ value: Bool) { lock.withLock { playing = value } }
+}
+
 final class Slice: NSObject, AVVideoCompositionInstructionProtocol {
   let timeRange: CMTimeRange
   let enablePostProcessing = false, containsTweening = true
   let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
   let requiredSourceTrackIDs: [NSValue]?
   let preview: Bool
+  let playback: PreviewPlayback?
+  let canvasFrames: CanvasFrames?
   let stills: [UUID: URL]
   let painter: FramePainter, clips: [Clip], sources: [UUID: SourceMap]
   init(
     _ range: CMTimeRange, _ clips: [Clip], _ sources: [UUID: SourceMap],
-    _ clock: CMPersistentTrackID, _ painter: FramePainter, preview: Bool, stills: [UUID: URL]
+    _ clock: CMPersistentTrackID, _ painter: FramePainter, preview: Bool,
+    playback: PreviewPlayback?, canvasFrames: CanvasFrames?, stills: [UUID: URL]
   ) {
     self.preview = preview
+    self.playback = playback
+    self.canvasFrames = canvasFrames
     self.stills = stills
     timeRange = range
     self.clips = clips
@@ -76,7 +89,21 @@ private final class PreviewScaler {
   }
 }
 final class Compositor: NSObject, AVVideoCompositing {
+  private final class Requests {
+    let cancellation = Progress(totalUnitCount: 0)
+    let pending = DispatchGroup()
+  }
+
   private let scaler = PreviewScaler()
+  private let lock = NSLock()
+  private var requests = Requests()
+  private let workers: OperationQueue = {
+    let queue = OperationQueue()
+    queue.name = "framecut.compositor"
+    queue.qualityOfService = .userInitiated
+    queue.maxConcurrentOperationCount = 3
+    return queue
+  }()
   let sourcePixelBufferAttributes: [String: Any]? = [
     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
   ]
@@ -84,7 +111,43 @@ final class Compositor: NSObject, AVVideoCompositing {
     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
   ]
   func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {}
+
   func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+    lock.lock()
+    let batch = requests
+    batch.pending.enter()
+    lock.unlock()
+    let render = { [self] in
+      defer { batch.pending.leave() }
+      if batch.cancellation.isCancelled {
+        request.finishCancelledRequest()
+      } else {
+        self.render(request, cancellation: batch.cancellation)
+      }
+    }
+    if let slice = request.videoCompositionInstruction as? Slice,
+      slice.preview && slice.playback?.isPlaying != true
+    {
+      // Exact paused seeks use the current request immediately. Playback and
+      // export can keep multiple independent frames in flight.
+      render()
+    } else {
+      workers.addOperation(render)
+    }
+  }
+
+  func cancelAllPendingVideoCompositionRequests() {
+    lock.lock()
+    let previous = requests
+    requests = Requests()
+    lock.unlock()
+    previous.cancellation.cancel()
+    previous.pending.wait()
+  }
+
+  private func render(
+    _ request: AVAsynchronousVideoCompositionRequest, cancellation: Progress
+  ) {
     #if FRAME_BENCH
       let start = CFAbsoluteTimeGetCurrent()
       defer {
@@ -114,9 +177,10 @@ final class Compositor: NSObject, AVVideoCompositing {
       g.scaleBy(
         x: CGFloat(CVPixelBufferGetWidth(out)) / s.painter.size.width,
         y: CGFloat(CVPixelBufferGetHeight(out)) / s.painter.size.height)
-      s.painter.paint(
-        g, frame: Int((request.compositionTime.seconds * 30).rounded()), active: s.clips
-      ) { id, canvas in
+      let frame = Int((request.compositionTime.seconds * 30).rounded())
+      let captures = s.playback?.isPlaying == false ? s.canvasFrames : nil
+      var pictures = [UUID: Picture]()
+      func picture(_ id: UUID, canvas: CGSize) -> Picture? {
         if let url = s.stills[id], let im = StillImages.image(url, limit: s.preview ? 2160 : 4096) {
           return Picture(image: im, still: true)
         }
@@ -154,9 +218,18 @@ final class Compositor: NSObject, AVVideoCompositing {
         else { return nil }
         return Picture(image: im, transform: m.transform)
       }
+      s.painter.paint(g, frame: frame, active: s.clips) { id, canvas in
+        let result = picture(id, canvas: canvas)
+        if let result, captures != nil { pictures[id] = result }
+        return result
+      }
       g.flush()
       CVPixelBufferUnlockBaseAddress(out, [])
-      request.finish(withComposedVideoFrame: out)
+      if cancellation.isCancelled { request.finishCancelledRequest() }
+      else {
+        captures?.store(CanvasFrame(number: frame, painter: s.painter, clips: s.clips, pictures: pictures))
+        request.finish(withComposedVideoFrame: out)
+      }
     }
   }
 }
@@ -169,6 +242,7 @@ struct MediaGraph {
 private var audioLeaseKey: UInt8 = 0
 struct Composition {
   let graph: MediaGraph, video: AVMutableVideoComposition
+  var canvasFrames: CanvasFrames? = nil
   var asset: AVMutableComposition { graph.asset }
   var audio: AVMutableAudioMix { graph.audio }
   func retainAudio(on object: AnyObject) {
@@ -184,6 +258,26 @@ struct Composition {
     i.audioTimePitchAlgorithm = .spectral
     retainAudio(on: i)
     return i
+  }
+
+  func canvasFrame(at frame: Int) -> CanvasFrame? {
+    guard let canvasFrames else { return nil }
+    if let recent = canvasFrames.frame(frame) { return recent }
+    // The current frame may have been composed while playing. Decode it only
+    // when a paused frame is missing, then reuse the snapshot for the gesture.
+    guard let reader = try? AVAssetReader(asset: asset) else { return nil }
+    let output = AVAssetReaderVideoCompositionOutput(
+      videoTracks: asset.tracks(withMediaType: .video),
+      videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+    output.videoComposition = video
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else { return nil }
+    reader.add(output)
+    reader.timeRange = CMTimeRange(start: time(frame), duration: time(1))
+    guard reader.startReading() else { return nil }
+    defer { reader.cancelReading() }
+    guard output.copyNextSampleBuffer() != nil else { return nil }
+    return canvasFrames.frame(frame)
   }
 }
 private func sourceTime(_ frame: Double) -> CMTime {
@@ -357,13 +451,14 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
 }
 func buildComposition(
   _ p: Project, short: Int, preview: Bool = false, reusing existing: MediaGraph? = nil,
-  cancelled: () -> Bool = { false }
+  playback: PreviewPlayback? = nil, cancelled: () -> Bool = { false }
 ) throws -> Composition {
   let graph = try existing ?? buildMediaGraph(p, cancelled: cancelled)
   let visibleVideo = p.videoVisibility
   let vc = AVMutableVideoComposition()
   let size = p.canvas.size(short)
   let painter = FramePainter(p, size, preview: preview)
+  let canvasFrames = playback == nil ? nil : CanvasFrames()
   var begins = [Int: [Int]]()
   var ends = [Int: [Int]]()
   for (i, c) in p.clips.enumerated() where c.kind != .audio {
@@ -383,12 +478,12 @@ func buildComposition(
     inst.append(
       Slice(
         CMTimeRange(start: time(start), duration: time(end - start)), cs, maps, graph.clock,
-        painter, preview: preview, stills: graph.stills
+        painter, preview: preview, playback: playback, canvasFrames: canvasFrames, stills: graph.stills
       ))
   }
   vc.instructions = inst
   vc.customVideoCompositorClass = Compositor.self
   vc.frameDuration = time(1)
   vc.renderSize = size
-  return Composition(graph: graph, video: vc)
+  return Composition(graph: graph, video: vc, canvasFrames: canvasFrames)
 }

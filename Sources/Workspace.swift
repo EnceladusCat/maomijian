@@ -135,6 +135,7 @@ struct Preview: View {
           UI.deep
           ZStack {
             PlayerSurface(player: e.player, background: e.p.background).allowsHitTesting(false)
+            LiveCanvasOverlay(preview: e.liveCanvas)
             if e.p.clips.isEmpty {
               VStack(spacing: 13) {
                 Image(systemName: "film.stack").font(.system(size: 32, weight: .light))
@@ -173,13 +174,21 @@ struct Preview: View {
               .gesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .named("canvas")).onChanged { v in
                   delta = v.translation
+                  var draft = c
+                  draft.x = bound(c.x + v.translation.width / w, 0, 1)
+                  draft.y = bound(c.y + v.translation.height / h, 0, 1)
+                  e.previewCanvas(draft)
                 }.onEnded { v in
-                  e.edit(c.id) {
-                    $0.x = bound(c.x + v.translation.width / w, 0, 1)
-                    $0.y = bound(c.y + v.translation.height / h, 0, 1)
-                  }
+                  var draft = c
+                  draft.x = bound(c.x + v.translation.width / w, 0, 1)
+                  draft.y = bound(c.y + v.translation.height / h, 0, 1)
+                  e.commitCanvas(draft)
                   delta = .zero
                 })
+              .onDisappear {
+                if e.liveCanvas.activeID == c.id { e.liveCanvas.clear() }
+                delta = .zero
+              }
             }
           }.frame(width: w, height: h).background(Color(cgColor: ink(e.p.background)))
             .coordinateSpace(name: "canvas")

@@ -5,7 +5,10 @@ import UniformTypeIdentifiers
 
 final class Transport: ObservableObject {
   @Published var frame = 0
-  @Published var playing = false
+  let playback = PreviewPlayback()
+  @Published var playing = false {
+    didSet { playback.setPlaying(playing) }
+  }
 }
 final class ShelfState: ObservableObject {
   let tabs = CurrentValueSubject<ToolTab, Never>(.media)
@@ -196,9 +199,11 @@ final class Editor: ObservableObject {
   private var exportSettings = ExportSettings()
   @Published var thumbnails = [UUID: NSImage]()
   let transport = Transport(), player = AVPlayer()
+  let liveCanvas = LiveCanvasPreview()
   private var baseline = Project(), undoStack = [Project](), redoStack = [Project](),
     observer: Any?, itemObservation: NSKeyValueObservation?
   private var graphSnapshot: Project?, previewGraph: MediaGraph?
+  private var previewComposition: Composition?
   private var buildTicket: Progress?
   private var playWhenReady = false
   private var revision = 0, generation = UUID(), pending: DispatchWorkItem?, job: ExportJob?
@@ -241,6 +246,7 @@ final class Editor: ObservableObject {
     if transport.playing { transport.playing = false }
   }
   func seek(_ f: Int) {
+    liveCanvas.clear()
     pause()
     transport.frame = bound(f, 0, p.duration)
     position()
@@ -253,6 +259,7 @@ final class Editor: ObservableObject {
       return
     }
     if scrubSession == nil {
+      liveCanvas.clear()
       pause()
       scrubSession = UUID()
     }
@@ -285,6 +292,7 @@ final class Editor: ObservableObject {
       toleranceAfter: .zero)
   }
   func play() {
+    liveCanvas.clear()
     if scrubSession != nil { seek(transport.frame) }
     if transport.playing {
       pause()
@@ -301,7 +309,7 @@ final class Editor: ObservableObject {
     transport.playing = true
     player.play()
   }
-  func change(_ body: (inout Project) -> Void) {
+  func change(keepingCanvasFrame: Bool = false, _ body: (inout Project) -> Void) {
     var next = p
     body(&next)
     guard next != p else { return }
@@ -312,9 +320,9 @@ final class Editor: ObservableObject {
     undoStack.append(p)
     if undoStack.count > 80 { undoStack.removeFirst() }
     redoStack.removeAll()
-    install(next)
+    install(next, keepingCanvasFrame: keepingCanvasFrame)
   }
-  private func install(_ next: Project) {
+  private func install(_ next: Project, keepingCanvasFrame: Bool = false) {
     pause()
     p = next
     let valid = Set(next.clips.map(\.id))
@@ -323,7 +331,7 @@ final class Editor: ObservableObject {
     if !selectedIDs.allSatisfy(valid.contains) { selectedIDs.removeAll { !valid.contains($0) } }
     if !libraryIDs.allSatisfy(assets.contains) { libraryIDs.removeAll { !assets.contains($0) } }
     if transport.frame > p.duration { transport.frame = p.duration }
-    rebuild()
+    rebuild(keepingCanvasFrame: keepingCanvasFrame)
   }
   func undo() {
     guard let back = undoStack.popLast() else { return }
@@ -335,7 +343,8 @@ final class Editor: ObservableObject {
     undoStack.append(p)
     install(next)
   }
-  func rebuild() {
+  func rebuild(keepingCanvasFrame: Bool = false) {
+    if !keepingCanvasFrame { liveCanvas.clear() }
     pause()
     pending?.cancel()
     buildTicket?.cancel()
@@ -348,6 +357,8 @@ final class Editor: ObservableObject {
     if snap.duration == 0 {
       previewGraph = nil
       graphSnapshot = nil
+      previewComposition = nil
+      liveCanvas.clear()
       player.replaceCurrentItem(with: nil)
       busy = false
       status = "就绪"
@@ -363,10 +374,12 @@ final class Editor: ObservableObject {
     busy = true
     if reuse == nil { status = "正在准备预览" }
     let existingItem = reuse == nil ? nil : player.currentItem
+    let playback = transport.playback
     let work = DispatchWorkItem { [weak self] in
       let result = Result {
         try buildComposition(
-          snap, short: short, preview: true, reusing: reuse, cancelled: { ticket.isCancelled })
+          snap, short: short, preview: true, reusing: reuse, playback: playback,
+          cancelled: { ticket.isCancelled })
       }
       if let existingItem, case .success(let composition) = result, !ticket.isCancelled {
         existingItem.videoComposition = composition.video
@@ -378,6 +391,7 @@ final class Editor: ObservableObject {
         case .success(let composition):
           self.graphSnapshot = snap
           self.previewGraph = composition.graph
+          self.previewComposition = composition
           if let existingItem, existingItem === self.player.currentItem {
             self.position()
             self.didPrepare()
@@ -400,6 +414,8 @@ final class Editor: ObservableObject {
         case .failure(let e):
           self.previewGraph = nil
           self.graphSnapshot = nil
+          self.previewComposition = nil
+          self.liveCanvas.clear()
           self.pause()
           self.player.replaceCurrentItem(with: nil)
           self.status = "预览未就绪"
@@ -420,6 +436,29 @@ final class Editor: ObservableObject {
   }
   func edit(_ id: UUID, _ body: (inout Clip) -> Void) {
     change { p in if let i = p.clips.firstIndex(where: { $0.id == id }) { body(&p.clips[i]) } }
+  }
+
+  func previewCanvas(_ draft: Clip) {
+    if transport.playing { pause() }
+    guard let previewComposition, !busy else { return }
+    liveCanvas.update(draft, frame: transport.frame, composition: previewComposition)
+  }
+
+  func commitCanvas(_ draft: Clip) {
+    let keep = previewComposition != nil && liveCanvas.activeID == draft.id
+    if keep, let previewComposition {
+      liveCanvas.end(with: draft, frame: transport.frame, composition: previewComposition)
+    }
+    let prior = revision
+    change(keepingCanvasFrame: keep) { project in
+      guard let index = project.clips.firstIndex(where: { $0.id == draft.id }) else { return }
+      project.clips[index].x = draft.x
+      project.clips[index].y = draft.y
+      project.clips[index].angle = draft.angle
+      project.clips[index].visualScale = draft.visualScale
+      project.clips[index].sourceCrop = draft.sourceCrop
+    }
+    if prior == revision { liveCanvas.clear() }
   }
   func beginCrop(_ c: Clip) {
     guard c.kind == .video else { return }
@@ -918,6 +957,8 @@ final class Editor: ObservableObject {
     libraryMarquee.cancel()
     graphSnapshot = nil
     previewGraph = nil
+    previewComposition = nil
+    liveCanvas.clear()
     regionTool = nil
     generation = UUID()
     undoStack = []
@@ -953,22 +994,48 @@ final class Editor: ObservableObject {
     } catch { self.error = error.localizedDescription }
   }
   func export() {
-    guard progress == nil, p.duration > 0 else { return }
+    guard progress == nil, p.duration > 0, let window = NSApp.keyWindow,
+      window.sheetParent == nil, window.attachedSheet == nil
+    else { return }
+    pause()
+    var initial = exportSettings
+    if initial.short != exportShort { initial.customMbps = nil }
+    initial.short = exportShort
+    let options = ExportOptions(settings: initial, project: p)
+    let sheet = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 466, height: 252),
+      styleMask: [.titled], backing: .buffered, defer: false)
+    sheet.title = "导出设置"
+    sheet.appearance = NSAppearance(named: .darkAqua)
+    let end: (NSApplication.ModalResponse) -> Void = { [weak window, weak sheet] response in
+      guard let sheet else { return }
+      if response == .OK { sheet.makeFirstResponder(nil) }
+      window?.endSheet(sheet, returnCode: response)
+    }
+    sheet.contentView = NSHostingView(
+      rootView: ExportSettingsView(
+        options: options, cancel: { end(.cancel) }, proceed: { end(.OK) }))
+    window.beginSheet(sheet) { [weak self, weak window] response in
+      options.cancelSample()
+      sheet.contentView = nil
+      guard response == .OK, let self, let window else { return }
+      self.chooseExportDestination(on: window, settings: options.settings)
+    }
+  }
+
+  private func chooseExportDestination(on window: NSWindow, settings: ExportSettings) {
     let panel = NSSavePanel()
     panel.allowedContentTypes = [.mpeg4Movie]
     panel.appearance = NSAppearance(named: .darkAqua)
     panel.prompt = "导出"
-    if exportSettings.short != exportShort { exportSettings.customMbps = nil }
-    exportSettings.short = exportShort
-    let options = ExportOptions(settings: exportSettings, project: p)
-    let accessory = NSHostingView(
-      rootView: ExportAccessory(options: options).preferredColorScheme(.dark))
-    accessory.frame = CGRect(x: 0, y: 0, width: 440, height: 181)
-    panel.accessoryView = accessory
     panel.nameFieldStringValue = (url?.deletingPathExtension().lastPathComponent ?? "剪辑") + ".mp4"
-    let response = panel.runModal()
-    options.cancelSample()
-    guard response == .OK, let dest = panel.url else { return }
+    panel.beginSheetModal(for: window) { [weak self] response in
+      guard response == .OK, let dest = panel.url else { return }
+      self?.startExport(to: dest, settings: settings)
+    }
+  }
+
+  private func startExport(to dest: URL, settings: ExportSettings) {
     guard
       !p.assets.contains(where: {
         URL(fileURLWithPath: $0.path).standardizedFileURL == dest.standardizedFileURL
@@ -977,8 +1044,6 @@ final class Editor: ObservableObject {
       error = "请选择与原素材不同的导出文件名。"
       return
     }
-    panel.makeFirstResponder(nil)
-    let settings = options.settings
     exportSettings = settings
     exportShort = settings.short
     pause()
