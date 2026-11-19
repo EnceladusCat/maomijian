@@ -78,6 +78,8 @@ final class PreviewStatus: ObservableObject {
   @Published var message = "就绪"
 }
 final class Editor: ObservableObject {
+  private static let timelineClipboardType = NSPasteboard.PasteboardType("local.framecut.timeline-clips.v1")
+  private var copiedProperties: (clip: Clip, hasAudio: Bool)?
   @Published var p = Project()
   let shelf = ShelfState()
   private var panelObservers = [ToolTab: PanelUpdates]()
@@ -117,6 +119,76 @@ final class Editor: ObservableObject {
   var selectedClips: [Clip] {
     let ids = Set(selectedIDs)
     return p.clips.filter { ids.contains($0.id) }
+  }
+  var canCopyClips: Bool { !libraryFocus && selectedTransition == nil && !selectedIDs.isEmpty }
+  var canPasteClips: Bool {
+    NSPasteboard.general.availableType(from: [Self.timelineClipboardType]) != nil
+  }
+  func selectForClipMenu(_ id: UUID) {
+    regionTool = nil
+    if selectedIDs.contains(id) {
+      deselectTransition()
+      libraryFocus = false
+    } else {
+      selected = id
+    }
+  }
+  @discardableResult func copyClips() -> Bool {
+    guard canCopyClips else { return false }
+    let payload = TimelineClipboard(project: p, selection: selectedIDs)
+    guard !payload.clips.isEmpty, let data = try? JSONEncoder().encode(payload) else { return false }
+    let clipboard = NSPasteboard.general
+    let item = NSPasteboardItem()
+    guard item.setData(data, forType: Self.timelineClipboardType) else { return false }
+    clipboard.clearContents()
+    guard clipboard.writeObjects([item]) else { return false }
+    status = "已复制 \(payload.clips.count) 个片段"
+    return true
+  }
+  func cutClips() {
+    if copyClips() { remove() }
+  }
+  func pasteClips() {
+    guard let data = NSPasteboard.general.data(forType: Self.timelineClipboardType) else { return }
+    let start = transport.frame
+    var next = p
+    let existingAssets = Set(p.assets.map(\.id))
+    do {
+      let payload = try JSONDecoder().decode(TimelineClipboard.self, from: data)
+      let pasted = try payload.paste(into: &next, at: start)
+      guard !pasted.isEmpty else { return }
+      change { $0 = next }
+      let installed = Set(p.clips.map(\.id))
+      guard pasted.allSatisfy(installed.contains) else { return }
+      deselectTransition()
+      libraryFocus = false
+      selectedIDs = pasted
+      timelineAnchor = pasted.first
+      for asset in p.assets where !existingAssets.contains(asset.id) { loadThumb(asset) }
+      seek(start)
+    } catch { self.error = error.localizedDescription }
+  }
+  func copyProperties(from id: UUID) {
+    guard let source = p.clips.first(where: { $0.id == id }) else { return }
+    copiedProperties = (source, source.kind.isMedia && p.asset(source.asset)?.audio == true)
+    status = "已复制片段属性"
+  }
+  var hasCopiedProperties: Bool { copiedProperties != nil }
+  func pasteProperties() {
+    guard let copiedProperties else { return }
+    let ids = Set(selectedIDs)
+    let audioAssets = Set(p.assets.filter(\.audio).map(\.id))
+    var matched = 0
+    change { project in
+      for index in project.clips.indices where ids.contains(project.clips[index].id) {
+        let clip = project.clips[index]
+        let audio = copiedProperties.hasAudio && clip.kind.isMedia && clip.asset.map(audioAssets.contains) == true
+        guard clip.acceptsProperties(from: copiedProperties.clip, sharedAudio: audio) else { continue }
+        project.clips[index].applyProperties(from: copiedProperties.clip, sharedAudio: audio)
+        matched += 1
+      }
+    }
+    status = matched > 0 ? "已粘贴 \(matched) 个片段的属性" : "所选片段没有可以共用的属性"
   }
   var isWholeGroupSelected: Bool {
     guard let id = selectedClips.first?.groupID else { return false }

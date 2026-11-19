@@ -178,6 +178,44 @@ struct ClipLane: NSViewRepresentable {
       else { return "" }
       return p.name + "  " + tc(p.clip.start) + " – " + tc(p.clip.end)
     }
+    override func menu(for event: NSEvent) -> NSMenu? {
+      guard let d = layoutData, let editor else { return nil }
+      let point = convert(event.locationInWindow, from: nil)
+      let clip = d.pieces.last(where: { rect($0.clip, d).contains(point) })?.clip
+      guard clip != nil || editor.canPasteClips else { return nil }
+      window?.makeFirstResponder(self)
+      let menu = NSMenu()
+      menu.autoenablesItems = false
+      func add(_ title: String, _ action: Selector, shortcut: String = "", enabled: Bool = true) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: shortcut)
+        item.target = self
+        item.isEnabled = enabled
+        menu.addItem(item)
+      }
+      if let clip {
+        editor.selectForClipMenu(clip.id)
+        add("剪切", #selector(cutClips), shortcut: "x")
+        add("复制", #selector(copyClips), shortcut: "c")
+      }
+      add("粘贴", #selector(pasteClips), shortcut: "v", enabled: editor.canPasteClips)
+      if let clip {
+        add("删除", #selector(deleteClips))
+        menu.addItem(.separator())
+        add("复制属性", #selector(copyProperties(_:)))
+        menu.items.last?.representedObject = clip.id
+        add("粘贴属性", #selector(pasteProperties), enabled: editor.hasCopiedProperties)
+      }
+      return menu
+    }
+    @objc private func cutClips() { editor?.cutClips() }
+    @objc private func copyClips() { editor?.copyClips() }
+    @objc private func pasteClips() { editor?.pasteClips() }
+    @objc private func deleteClips() { editor?.remove() }
+    @objc private func copyProperties(_ item: NSMenuItem) {
+      if let id = item.representedObject as? UUID { editor?.copyProperties(from: id) }
+    }
+    @objc private func pasteProperties() { editor?.pasteProperties() }
+
     override func mouseDown(with event: NSEvent) {
       guard let d = layoutData, let e = editor else { return }
       window?.makeFirstResponder(self)

@@ -1,35 +1,5 @@
 import SwiftUI
 
-private struct Lane: Identifiable {
-  let title: String, k: Kind, index: Int
-  var clips: [Clip]
-  var id: String { k.rawValue + String(index) }
-}
-private func tracks(_ p: Project, joins: [Project.Join]) -> [Lane] {
-  var all = [Lane]()
-  for (k, title) in [
-    (Kind.caption, "字幕"), (.text, "标注"), (.zoom, "效果"), (.video, "视频"), (.audio, "音频"),
-  ] {
-    if k == .video {
-      all += p.videoLanes(joins).enumerated().map {
-        Lane(title: title, k: k, index: $0.offset, clips: $0.element)
-      }
-      continue
-    }
-    var rows = [Lane(title: title, k: k, index: 0, clips: [])]
-    let items = p.clips.filter { k == .text ? $0.kind.isArt && $0.kind != .caption : $0.kind == k }
-      .sorted { $0.start < $1.start }
-    for c in items {
-      if let i = rows.firstIndex(where: { ($0.clips.last?.end ?? 0) <= c.start }) {
-        rows[i].clips.append(c)
-      } else {
-        rows.append(Lane(title: title, k: k, index: rows.count, clips: [c]))
-      }
-    }
-    all += rows
-  }
-  return all
-}
 private struct Needle: View {
   @ObservedObject var t: Transport
   let first: Double, per: Double
@@ -75,14 +45,47 @@ struct Timeline: View {
   @State private var zoom = 1.0
   @State private var first = 0.0
   @State private var laneFrames = [String: CGRect]()
+  @GestureState private var trackDrop: TrackDrop?
   private let marqueeSpace = "timelineMarquee"
   let head = 78.0
-  func label(_ text: String, _ k: Kind) -> some View {
-    HStack(spacing: 6) {
-      Image(systemName: k.icon).foregroundStyle(UI.color(k)).frame(width: 14)
-      Text(text).font(.system(size: 11))
-      Spacer()
-    }.padding(.leading, 12).frame(width: head)
+
+  private struct TrackDrop {
+    let destination: String, after: Bool
+  }
+  private func trackDestination(_ source: String, y: Double, order: [String]) -> TrackDrop? {
+    guard let from = order.firstIndex(of: source), let to = order.indices.min(by: {
+      abs((laneFrames[order[$0]]?.midY ?? .infinity) - y)
+        < abs((laneFrames[order[$1]]?.midY ?? .infinity) - y)
+    }), from != to, laneFrames[order[to]] != nil else { return nil }
+    return TrackDrop(destination: order[to], after: to > from)
+  }
+  @ViewBuilder private func trackHeader(_ track: TimelineTrack, order: [String]) -> some View {
+    let label = HStack(spacing: 4) {
+      Image(systemName: track.kind.icon).foregroundStyle(UI.color(track.kind)).frame(width: 13)
+      Text(track.name).font(.system(size: 11)).lineLimit(1).fixedSize()
+      Spacer(minLength: 0)
+      Image(systemName: track.pinned ? "lock" : "line.3.horizontal")
+        .font(.system(size: 8)).foregroundStyle(UI.muted.opacity(0.7))
+    }.padding(.horizontal, 8).frame(width: head).frame(maxHeight: .infinity).contentShape(Rectangle())
+    if let index = order.firstIndex(of: track.id) {
+      label.help("拖动轨道标题调整层级")
+        .gesture(DragGesture(minimumDistance: 4, coordinateSpace: .named(marqueeSpace))
+          .updating($trackDrop) { value, state, _ in
+            state = trackDestination(track.id, y: value.location.y, order: order)
+          }.onEnded { value in
+            if let drop = trackDestination(track.id, y: value.location.y, order: order) {
+              e.change { $0.moveTrack(track.id, to: drop.destination) }
+            }
+          })
+        .contextMenu {
+          Button("上移轨道") { e.change { $0.moveTrack(track.id, to: order[index - 1]) } }
+            .disabled(index == 0)
+          Button("下移轨道") { e.change { $0.moveTrack(track.id, to: order[index + 1]) } }
+            .disabled(index + 1 == order.count)
+        }
+    } else {
+      label.help("字幕固定在最上方")
+    }
   }
   var body: some View {
     GeometryReader { geo in
@@ -93,7 +96,8 @@ struct Timeline: View {
       let limit = max(0, total - seen)
       let left = min(first, limit)
       let joins = e.p.joins
-      let lanes = tracks(e.p, joins: joins)
+      let lanes = e.p.timelineTracks(joins: joins)
+      let order = lanes.filter { !$0.pinned }.map(\.id)
       let selected = Set(e.selectedIDs)
       let movedLeft = left - groupOffset / per
       VStack(spacing: 0) {
@@ -162,10 +166,9 @@ struct Timeline: View {
             VStack(spacing: 1) {
               ForEach(lanes) { lane in
                 let ids = Set(lane.clips.map(\.id))
-                let laneJoins = lane.k == .video ? joins.filter { ids.contains($0.after.id) && ids.contains($0.before.id) } : []
+                let laneJoins = lane.kind == .video ? joins.filter { ids.contains($0.after.id) && ids.contains($0.before.id) } : []
                 HStack(spacing: 0) {
-                  label(lane.title + (lane.index == 0 ? "" : " \(lane.index+1)"), lane.k)
-                    .background(MarqueeBlank(selection: e.timelineMarquee) { e.selected = nil })
+                  trackHeader(lane, order: order)
                   ZStack(alignment: .topLeading) {
                     Color.white.opacity(0.035)
                     ClipLane(
@@ -199,7 +202,7 @@ struct Timeline: View {
                           title: "接缝转场 " + tc(join.frame), first: origin, per: per, width: width)
                       }
                     }
-                    if lane.k == .video {
+                    if lane.kind == .video {
                       ForEach(
                         lane.clips.filter {
                           let origin = selected.contains($0.id) ? movedLeft : left
@@ -225,17 +228,22 @@ struct Timeline: View {
                   }.clipped()
                     .background(MarqueeTarget(id: lane.id, space: marqueeSpace))
                     .background {
-                      if lane.k == .video {
+                      if lane.kind == .video {
                         DropBandReader(
                           first: left, per: per, joins: laneJoins, clips: lane.clips,
                           viewport: viewport.frame(in: .named(DropBandKey.coordinateSpace)))
                       }
                     }
-                }.frame(height: ClipLane.rowHeight(lane.k)).padding(.trailing, 12)
+                }.frame(height: ClipLane.rowHeight(lane.kind)).padding(.trailing, 12)
+                  .overlay(alignment: trackDrop?.after == true ? .bottom : .top) {
+                    if trackDrop?.destination == lane.id {
+                      Rectangle().fill(UI.accent).frame(height: 2).allowsHitTesting(false)
+                    }
+                  }
               }
               MarqueeBlank(selection: e.timelineMarquee) { e.selected = nil }
                 .frame(height: max(0, viewport.size.height - lanes.reduce(0) {
-                  $0 + ClipLane.rowHeight($1.k) + 1
+                  $0 + ClipLane.rowHeight($1.kind) + 1
                 }))
                 .padding(.leading, head).padding(.trailing, 12)
             }

@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
   let e = Editor()
   var window: NSWindow!, monitor: Any?
   var deferredURL: URL?
@@ -112,9 +112,9 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     add(edit, "撤销", #selector(undoEdit), "z", target: self)
     add(edit, "重做", #selector(redoEdit), "z", shift: true, target: self)
     edit.addItem(.separator())
-    add(edit, "剪切", #selector(NSText.cut(_:)), "x")
-    add(edit, "复制", #selector(NSText.copy(_:)), "c")
-    add(edit, "粘贴", #selector(NSText.paste(_:)), "v")
+    add(edit, "剪切", #selector(cutSelection(_:)), "x", target: self)
+    add(edit, "复制", #selector(copySelection(_:)), "c", target: self)
+    add(edit, "粘贴", #selector(pasteSelection(_:)), "v", target: self)
     add(edit, "全选", #selector(selectItems), "a", target: self)
     edit.addItem(.separator())
     add(edit, "在播放头分割", #selector(split), "b", target: self)
@@ -136,6 +136,33 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
   @objc func render() { e.export() }
   @objc func undoEdit() { e.undo() }
   @objc func redoEdit() { e.redo() }
+  private var textEditor: NSText? { NSApp.keyWindow?.firstResponder as? NSText }
+  @objc func cutSelection(_ sender: Any?) {
+    if let textEditor { textEditor.cut(sender) }
+    else if window.isKeyWindow { e.cutClips() }
+  }
+  @objc func copySelection(_ sender: Any?) {
+    if let textEditor { textEditor.copy(sender) }
+    else if window.isKeyWindow { e.copyClips() }
+  }
+  @objc func pasteSelection(_ sender: Any?) {
+    if let textEditor { textEditor.paste(sender) }
+    else if window.isKeyWindow { e.pasteClips() }
+  }
+  func validateMenuItem(_ item: NSMenuItem) -> Bool {
+    switch item.action {
+    case #selector(cutSelection(_:)):
+      if let textEditor { return textEditor.isEditable && textEditor.selectedRange.length > 0 }
+      return window.isKeyWindow && e.canCopyClips
+    case #selector(copySelection(_:)):
+      if let textEditor { return textEditor.selectedRange.length > 0 }
+      return window.isKeyWindow && e.canCopyClips
+    case #selector(pasteSelection(_:)):
+      if let textEditor { return textEditor.isEditable && NSPasteboard.general.string(forType: .string) != nil }
+      return window.isKeyWindow && e.canPasteClips
+    default: return true
+    }
+  }
   @objc func selectItems() {
     if let text = NSApp.keyWindow?.firstResponder as? NSTextView {
       text.selectAll(nil)

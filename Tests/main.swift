@@ -684,3 +684,92 @@ precondition(trimSnap.placement(for: 5.5, per: 2).guide == 43)
 let groupedSnap = TimelineSnap(anchors: [40, 65, 20, 95], targets: [105], limits: -20...100)
 precondition(groupedSnap.placement(for: 9, per: 2).guide == 105)
 print("Passed grouped upper/lower transition frames and move and trim alignment.")
+
+let clipboardMedia = Media(path: "/tmp/framecut-clipboard.mp4", frames: 180, video: true, audio: true)
+var clipboardSource = Project()
+clipboardSource.assets = [clipboardMedia]
+var copyA = Clip(kind: .video, asset: clipboardMedia.id, start: 10, length: 40)
+copyA.x = -0.25
+copyA.volume = 0.55
+copyA.pitchSemitones = -3
+copyA.filters = [ClipFilter(look: .neon), ClipFilter(look: .prism, amount: 0.5)]
+copyA.startEffect = ClipEdgeEffect(style: .dissolve, frames: 10)
+let copyB = Clip(kind: .video, asset: clipboardMedia.id, start: 50, length: 40, offset: 11)
+let copyLabel = Clip.annotation(.text, at: 20)
+clipboardSource.clips = [copyA, copyB, copyLabel]
+clipboardSource.group([copyA.id, copyB.id, copyLabel.id])
+try clipboardSource.setTransition(copyB.id, frames: 15, style: .glitch)
+let payload = TimelineClipboard(project: clipboardSource, selection: [copyLabel.id])
+let clipboard = try JSONDecoder().decode(TimelineClipboard.self, from: JSONEncoder().encode(payload))
+var pasteTarget = clipboardSource
+let newIDs = try clipboard.paste(into: &pasteTarget, at: 150)
+let pasted = Array(pasteTarget.clips.suffix(3))
+precondition(newIDs == pasted.map(\.id) && Set(newIDs).isDisjoint(with: [copyA.id, copyB.id, copyLabel.id]))
+precondition(pasteTarget.assets == clipboardSource.assets && pasted.map(\.start) == [150, 190, 160])
+precondition(pasteTarget.expandingGroups([newIDs[0]]).count == 3 && pasted[0].groupID != clipboardSource.clips[0].groupID)
+precondition(pasted[1].from == newIDs[0] && pasted[1].offset == 11 && pasted[1].transitionStyle == .glitch)
+precondition(pasted[0].startEffect == copyA.startEffect)
+let validPaste = try pasteTarget.checked()
+precondition(validPaste == pasteTarget)
+do {
+  _ = try clipboard.paste(into: &pasteTarget, at: maxFrames - 10)
+  preconditionFailure("A paste outside the timeline was accepted")
+} catch { precondition(pasteTarget == validPaste) }
+clipboardSource.ungroup([copyA.id])
+let singleClip = TimelineClipboard(project: clipboardSource, selection: [copyB.id])
+var newDocument = Project()
+_ = try singleClip.paste(into: &newDocument, at: 0)
+precondition(newDocument.assets == [clipboardMedia] && newDocument.clips[0].from == nil)
+
+var propertyReceiver = clipboardSource.clips[1]
+let propertyIdentity = propertyReceiver
+propertyReceiver.applyProperties(from: clipboardSource.clips[0], sharedAudio: true)
+precondition(propertyReceiver.x == copyA.x && propertyReceiver.volume == copyA.volume)
+precondition(propertyReceiver.pitch == copyA.pitch && propertyReceiver.filters == copyA.filters)
+precondition(propertyReceiver.id == propertyIdentity.id && propertyReceiver.asset == propertyIdentity.asset)
+precondition(propertyReceiver.start == propertyIdentity.start && propertyReceiver.sourceIn == propertyIdentity.sourceIn)
+precondition(propertyReceiver.length == propertyIdentity.length && propertyReceiver.from == propertyIdentity.from)
+precondition(propertyReceiver.startEffect == propertyIdentity.startEffect && propertyReceiver.blend == propertyIdentity.blend)
+var titleSource = copyLabel
+titleSource.textAppearance = TextAppearance(size: 640, shadow: TextShadow(color: "#FF0000"))
+var titleTarget = Clip.annotation(.text, at: 92)
+titleTarget.text = "Different title"
+titleTarget.applyProperties(from: titleSource)
+precondition(titleTarget.text == "Different title" && titleTarget.textAppearance == titleSource.textAppearance)
+let existingTextAppearance = titleTarget.textAppearance
+titleTarget.applyProperties(from: copyA)
+precondition(titleTarget.x == 0 && titleTarget.opacity == copyA.opacity && titleTarget.textAppearance == existingTextAppearance)
+var audioReceiver = Clip(kind: .audio, asset: clipboardMedia.id, start: 15, length: 25)
+precondition(audioReceiver.acceptsProperties(from: copyA, sharedAudio: true))
+precondition(!audioReceiver.acceptsProperties(from: titleSource, sharedAudio: false))
+audioReceiver.applyProperties(from: copyA, sharedAudio: true)
+precondition(audioReceiver.volume == copyA.volume && audioReceiver.pitch == copyA.pitch && audioReceiver.start == 15)
+
+var layers = Project()
+var overlapVideo = enteringVideo
+overlapVideo.start = 0
+layers.clips = [outgoingVideo, overlapVideo, leftCaption]
+layers.moveTrack("video0", to: "text0")
+precondition(layers.timelineTracks(joins: layers.joins).map(\.id).prefix(3) == ["caption0", "video0", "text0"])
+let lowerVideoOnTop = transitionPixels(layers, frame: 0, parts: [outgoingVideo, overlapVideo])
+precondition(lowerVideoOnTop == transitionPixels(layers, frame: 0, parts: [outgoingVideo]))
+layers.moveTrack("video0", to: "video1")
+let upperVideoOnTop = transitionPixels(layers, frame: 0, parts: [outgoingVideo, overlapVideo])
+precondition(upperVideoOnTop == transitionPixels(layers, frame: 0, parts: [overlapVideo]))
+let layerOrder = layers.trackOrder
+layers.moveTrack("caption0", to: "video1")
+layers.moveTrack("video1", to: "caption0")
+precondition(layers.trackOrder == layerOrder && layers.timelineTracks(joins: layers.joins)[0].pinned)
+let layerRoundTrip = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(layers))
+precondition(layerRoundTrip.trackOrder == layerOrder)
+var fullDim = Clip.annotation(.highlight, at: 0)
+fullDim.setRegion(CGRect(x: 0.1, y: 0.1, width: 0.1, height: 0.1))
+fullDim.opacity = 1
+var captionOnTop = Clip.annotation(.caption, at: 0)
+captionOnTop.text = "Always above"
+layers.clips = [outgoingVideo, fullDim, captionOnTop]
+layers.moveTrack("text0", to: "zoom0")
+let captionWithEffect = transitionPixels(layers, frame: 0, parts: layers.clips)
+let withoutCaption = transitionPixels(layers, frame: 0, parts: [outgoingVideo, fullDim])
+precondition(captionWithEffect != withoutCaption)
+print("Passed clipboard remapping, property application, track order persistence and caption stacking.")

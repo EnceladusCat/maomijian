@@ -276,6 +276,7 @@ final class FramePainter {
   private let motionPreview: FramePainter?
   private let groupedArtwork: [UUID: [Clip]]
   private let clipOrder: [UUID: Int]
+  private let trackDepth: [UUID: Int]?
   private var artworks = [UUID: (text: String, image: CGImage)]()
   private var textLayouts = [UUID: (text: String, appearance: TextAppearance, color: String, layout: FixedText)]()
   private let filteredStills: NSCache<NSUUID, CGImage> = {
@@ -288,6 +289,7 @@ final class FramePainter {
     self.project = project
     self.size = size
     self.preview = preview
+    trackDepth = project.visualTrackDepth()
     var artworkByGroup: [UUID: [Clip]] = [:]
     for clip in project.clips where !clip.kind.isMedia {
       if let group = clip.groupID { artworkByGroup[group, default: []].append(clip) }
@@ -408,7 +410,7 @@ final class FramePainter {
   func paint(
     _ g: CGContext, frame: Int, active: [Clip], sourceForCanvas source: (UUID, CGSize) -> Picture?
   ) {
-    let videos = active.filter { $0.kind == .video }
+    let videos = backToFront(active.filter { $0.kind == .video })
     if let incoming = videos.last(where: { c in
       c.from != nil && c.blend > 0 && frame >= c.blendStart && frame < c.blendStart + c.blend
         && videos.contains(where: { $0.id == c.from })
@@ -457,6 +459,11 @@ final class FramePainter {
       }
     }
     paintScene(g, frame: frame, active: active, source: source)
+  }
+
+  private func backToFront(_ clips: [Clip]) -> [Clip] {
+    guard let trackDepth else { return clips }
+    return clips.sorted { trackDepth[$0.id, default: Int.max] > trackDepth[$1.id, default: Int.max] }
   }
 
   private func paintTransition(
@@ -591,9 +598,8 @@ final class FramePainter {
     g.translateBy(x: 0, y: H)
     g.scaleBy(x: 1, y: -1)
     g.interpolationQuality = .medium
-    let videos = active.filter { $0.kind == .video }
-    for c in videos {
-      guard let p = source(c.id, size) else { continue }
+    func paintVideo(_ c: Clip) {
+      guard let p = source(c.id, size) else { return }
       g.saveGState()
       let m = c.motionOffset(at: frame, size: size)
       let filters = c.filters
@@ -629,9 +635,7 @@ final class FramePainter {
       }
       g.restoreGState()
     }
-    for c in active.filter({ $0.kind.isArt && !$0.kind.isRegion && $0.kind != .caption })
-      + active.filter({ $0.kind == .caption })
-    {
+    func paintArt(_ c: Clip) {
       let sample = bound(frame, c.start, c.end - 1)
       let m = c.motionOffset(at: sample, size: size)
       g.saveGState()
@@ -652,8 +656,8 @@ final class FramePainter {
       }
       g.restoreGState()
     }
-    let lenses = active.filter { $0.kind == .zoom }
-    if !lenses.isEmpty {
+    func paintLenses(_ lenses: [Clip]) {
+      guard !lenses.isEmpty else { return }
       g.flush()
       let patches = lenses.compactMap { lensPatch(for: $0, at: bound(frame, $0.start, $0.end - 1), in: g) }
       for patch in patches {
@@ -678,8 +682,8 @@ final class FramePainter {
         g.restoreGState()
       }
     }
-    let lights = active.filter { $0.kind == .highlight }
-    if let darkness = lights.map(\.opacity).max(), darkness > 0 {
+    func paintHighlights(_ lights: [Clip]) {
+      guard let darkness = lights.map(\.opacity).max(), darkness > 0 else { return }
       g.saveGState()
       for c in lights {
         g.beginPath()
@@ -694,5 +698,24 @@ final class FramePainter {
       g.restoreGState()
     }
 
+    if trackDepth != nil {
+      for clip in backToFront(active) {
+        switch clip.kind {
+        case .video: paintVideo(clip)
+        case .zoom: paintLenses([clip])
+        case .highlight: paintHighlights([clip])
+        case .audio, .caption: break
+        default: paintArt(clip)
+        }
+      }
+    } else {
+      for clip in active where clip.kind == .video { paintVideo(clip) }
+      for clip in active where clip.kind.isArt && !clip.kind.isRegion && clip.kind != .caption {
+        paintArt(clip)
+      }
+      paintLenses(active.filter { $0.kind == .zoom })
+      paintHighlights(active.filter { $0.kind == .highlight })
+    }
+    for clip in active where clip.kind == .caption { paintArt(clip) }
   }
 }

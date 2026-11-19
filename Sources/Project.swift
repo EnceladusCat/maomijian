@@ -619,6 +619,7 @@ struct CaptionPreset: Identifiable, Codable, Equatable {
 }
 struct Project: Codable, Equatable {
   var captionStyle: CaptionStyle?
+  var trackOrder: [String]?
   var backgroundColor: String?
   var background: String { backgroundColor ?? "#000000" }
   var version = 1
