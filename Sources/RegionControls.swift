@@ -27,14 +27,15 @@ struct RegionControls: View {
           }
         ).frame(width: size.width, height: size.height)
         HStack(spacing: 8) {
-          Text(tool == .zoom ? "拖出需要放大的区域" : "拖出需要保留亮度的区域")
-          Button("取消") {
+          Text(tool == .zoom ? L("拖出需要放大的区域") : L("拖出需要保留亮度的区域"))
+            .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
+          Button(L("取消")) {
             e.regionTool = nil
             draft = nil
           }.buttonStyle(.borderless)
         }.font(.callout).padding(.horizontal, 10).padding(.vertical, 5).background(
           UI.panel, in: Capsule()
-        ).fixedSize().frame(maxWidth: .infinity).padding(.top, 7)
+        ).padding(.horizontal, 8).frame(maxWidth: .infinity).padding(.top, 7)
       }
       if let rect = displayed, e.regionTool == nil || draft != nil {
         let r = rect.applying(CGAffineTransform(scaleX: size.width, y: size.height))

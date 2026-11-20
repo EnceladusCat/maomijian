@@ -5,10 +5,21 @@ import QuartzCore
 enum RenderStatistics {
   private static let lock = NSLock()
   private static var frames: [Int: Double] = [:]
-  static func record(_ frame: Int, _ milliseconds: Double) {
+  private static var directFrames = Set<Int>()
+  private static var parityChecks = [Int: Bool]()
+  static func record(_ frame: Int, _ milliseconds: Double, direct: Bool = false) {
     lock.lock()
     frames[frame] = max(frames[frame] ?? 0, milliseconds)
+    if direct { directFrames.insert(frame) }
     lock.unlock()
+  }
+  static func recordParity(_ frame: Int, matches: Bool) {
+    lock.withLock { parityChecks[frame] = (parityChecks[frame] ?? true) && matches }
+  }
+  static func parity() -> [String: Any] {
+    lock.withLock {
+      ["framesChecked": parityChecks.count, "mismatch": parityChecks.filter { !$0.value }.keys.sorted()]
+    }
   }
   static func summary(_ first: Int, _ last: Int) -> [String: Any] {
     lock.lock()
@@ -18,6 +29,7 @@ enum RenderStatistics {
     return [
       "uniqueComposedFrames": values.count, "notComposed": last - first + 1 - values.count,
       "p95ComposeMs": values[Int(Double(values.count - 1) * 0.95)], "maxComposeMs": values.last!,
+      "directFrames": directFrames.filter { first...last ~= $0 }.count,
     ]
   }
 }
@@ -80,6 +92,7 @@ final class PlaybackProbe {
     var data = results
     data["stage"] = status
     data["drags"] = drags
+    data["pixelParity"] = RenderStatistics.parity()
     try? JSONSerialization.data(withJSONObject: data, options: [.prettyPrinted, .sortedKeys]).write(
       to: URL(fileURLWithPath: cfg.result), options: .atomic)
   }

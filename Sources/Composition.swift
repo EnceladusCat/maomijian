@@ -7,6 +7,7 @@ func time(_ f: Int) -> CMTime { CMTime(value: Int64(f), timescale: 30) }
 struct SourceMap {
   let track: CMPersistentTrackID
   let transform: CGAffineTransform
+  let opaque: Bool
 }
 final class PreviewPlayback {
   private let lock = NSLock()
@@ -26,6 +27,7 @@ final class Slice: NSObject, AVVideoCompositionInstructionProtocol {
   let canvasFrames: CanvasFrames?
   let stills: [UUID: URL]
   let painter: FramePainter, clips: [Clip], sources: [UUID: SourceMap]
+  let plainVideo: Clip?
   init(
     _ range: CMTimeRange, _ clips: [Clip], _ sources: [UUID: SourceMap],
     _ clock: CMPersistentTrackID, _ painter: FramePainter, preview: Bool,
@@ -39,6 +41,18 @@ final class Slice: NSObject, AVVideoCompositionInstructionProtocol {
     self.clips = clips
     self.sources = sources
     self.painter = painter
+    if preview, let clip = clips.first(where: { $0.kind == .video }),
+      clips.allSatisfy({ $0.kind == .caption || $0.id == clip.id }),
+      let source = sources[clip.id], source.opaque, source.transform.isIdentity,
+      clip.x == 0.5, clip.y == 0.5, clip.angle == 0, clip.opacity == 1, clip.displayScale == 1,
+      clip.sourceCrop == nil, clip.visualBorder == nil, clip.pictureInset == nil, clip.filters.isEmpty,
+      clip.motion == .none, clip.entranceFrames == 0,
+      clip.from == nil, clip.startEffect == nil, clip.endEffect == nil
+    {
+      plainVideo = clip
+    } else {
+      plainVideo = nil
+    }
     requiredSourceTrackIDs = ([clock] + sources.values.map(\.track)).map { NSNumber(value: $0) }
   }
 }
@@ -145,38 +159,56 @@ final class Compositor: NSObject, AVVideoCompositing {
     previous.pending.wait()
   }
 
+  private func copyMatchingFrame(_ source: CVPixelBuffer, to destination: CVPixelBuffer, size: CGSize)
+    -> Bool
+  {
+    let width = CVPixelBufferGetWidth(source)
+    let height = CVPixelBufferGetHeight(source)
+    guard CGFloat(width) == size.width, CGFloat(height) == size.height,
+      width == CVPixelBufferGetWidth(destination), height == CVPixelBufferGetHeight(destination),
+      CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_32BGRA,
+      CVPixelBufferGetPixelFormatType(destination) == kCVPixelFormatType_32BGRA,
+      CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess
+    else { return false }
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    guard CVPixelBufferLockBaseAddress(destination, []) == kCVReturnSuccess else { return false }
+    defer { CVPixelBufferUnlockBaseAddress(destination, []) }
+    guard let input = CVPixelBufferGetBaseAddress(source),
+      let output = CVPixelBufferGetBaseAddress(destination)
+    else { return false }
+    let sourceStride = CVPixelBufferGetBytesPerRow(source)
+    let destinationStride = CVPixelBufferGetBytesPerRow(destination)
+    let bytes = width * 4
+    if sourceStride == bytes && destinationStride == bytes {
+      memcpy(output, input, bytes * height)
+    } else {
+      for row in 0..<height {
+        memcpy(output + row * destinationStride, input + row * sourceStride, bytes)
+      }
+    }
+    return true
+  }
+
   private func render(
     _ request: AVAsynchronousVideoCompositionRequest, cancellation: Progress
   ) {
     #if FRAME_BENCH
       let start = CFAbsoluteTimeGetCurrent()
+      var direct = false
+      var verificationTime = 0.0
       defer {
         RenderStatistics.record(
           Int((request.compositionTime.seconds * 30).rounded()),
-          1000 * (CFAbsoluteTimeGetCurrent() - start))
+          1000 * (CFAbsoluteTimeGetCurrent() - start - verificationTime), direct: direct)
       }
     #endif
     autoreleasepool {
       guard let s = request.videoCompositionInstruction as? Slice,
         let out = request.renderContext.newPixelBuffer()
       else {
-        request.finish(with: EditError.message("无法分配预览画面。"))
+        request.finish(with: EditError.message(L("无法分配预览画面。")))
         return
       }
-      CVPixelBufferLockBaseAddress(out, [])
-      guard
-        let g = bitmap(
-          CVPixelBufferGetWidth(out), CVPixelBufferGetHeight(out),
-          data: CVPixelBufferGetBaseAddress(out), row: CVPixelBufferGetBytesPerRow(out))
-      else {
-        CVPixelBufferUnlockBaseAddress(out, [])
-        request.finish(with: EditError.message("无法创建画布。"))
-        return
-      }
-      // AVFoundation may change the backing size for a render context.
-      g.scaleBy(
-        x: CGFloat(CVPixelBufferGetWidth(out)) / s.painter.size.width,
-        y: CGFloat(CVPixelBufferGetHeight(out)) / s.painter.size.height)
       let frame = Int((request.compositionTime.seconds * 30).rounded())
       let captures = s.playback?.isPlaying == false ? s.canvasFrames : nil
       var pictures = [UUID: Picture]()
@@ -218,13 +250,58 @@ final class Compositor: NSObject, AVVideoCompositing {
         else { return nil }
         return Picture(image: im, transform: m.transform)
       }
-      s.painter.paint(g, frame: frame, active: s.clips) { id, canvas in
-        let result = picture(id, canvas: canvas)
-        if let result, captures != nil { pictures[id] = result }
-        return result
+      var copied = false
+      if let clip = s.plainVideo, let source = s.sources[clip.id],
+        let input = request.sourceFrame(byTrackID: source.track),
+        copyMatchingFrame(input, to: out, size: s.painter.size)
+      {
+        copied = true
+        if captures != nil { pictures[clip.id] = picture(clip.id, canvas: s.painter.size) }
       }
-      g.flush()
-      CVPixelBufferUnlockBaseAddress(out, [])
+      if !copied || s.clips.count > 1 {
+        CVPixelBufferLockBaseAddress(out, [])
+        guard let g = bitmap(
+          CVPixelBufferGetWidth(out), CVPixelBufferGetHeight(out),
+          data: CVPixelBufferGetBaseAddress(out), row: CVPixelBufferGetBytesPerRow(out))
+        else {
+          CVPixelBufferUnlockBaseAddress(out, [])
+          request.finish(with: EditError.message(L("无法创建画布。")))
+          return
+        }
+        // AVFoundation may change the backing size for a render context.
+        g.scaleBy(
+          x: CGFloat(CVPixelBufferGetWidth(out)) / s.painter.size.width,
+          y: CGFloat(CVPixelBufferGetHeight(out)) / s.painter.size.height)
+        if copied {
+          s.painter.paintCaptions(g, frame: frame, active: s.clips)
+        } else {
+          s.painter.paint(g, frame: frame, active: s.clips) { id, canvas in
+            let result = picture(id, canvas: canvas)
+            if let result, captures != nil { pictures[id] = result }
+            return result
+          }
+        }
+        g.flush()
+        CVPixelBufferUnlockBaseAddress(out, [])
+      }
+      #if FRAME_BENCH
+        direct = copied
+        if copied, frame % 211 == 0, let reference = bitmap(CVPixelBufferGetWidth(out), CVPixelBufferGetHeight(out)) {
+          let began = CFAbsoluteTimeGetCurrent()
+          s.painter.paint(reference, frame: frame, active: s.clips, sourceForCanvas: picture)
+          reference.flush()
+          CVPixelBufferLockBaseAddress(out, .readOnly)
+          let actual = CVPixelBufferGetBaseAddress(out)!
+          let expected = reference.data!
+          let rowsMatch = (0..<reference.height).allSatisfy { row in
+            memcmp(actual + row * CVPixelBufferGetBytesPerRow(out),
+                   expected + row * reference.bytesPerRow, reference.width * 4) == 0
+          }
+          CVPixelBufferUnlockBaseAddress(out, .readOnly)
+          RenderStatistics.recordParity(frame, matches: rowsMatch)
+          verificationTime = CFAbsoluteTimeGetCurrent() - began
+        }
+      #endif
       if cancellation.isCancelled { request.finishCancelledRequest() }
       else {
         captures?.store(CanvasFrame(number: frame, painter: s.painter, clips: s.clips, pictures: pictures))
@@ -238,6 +315,12 @@ struct MediaGraph {
   let sources: [UUID: SourceMap], clock: CMPersistentTrackID
   let pitchFiles: [PitchedAudio]
   let stills: [UUID: URL]
+
+  func retainAudio(on object: AnyObject) {
+    if !pitchFiles.isEmpty {
+      objc_setAssociatedObject(object, &audioLeaseKey, pitchFiles, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+  }
 }
 private var audioLeaseKey: UInt8 = 0
 struct Composition {
@@ -245,18 +328,12 @@ struct Composition {
   var canvasFrames: CanvasFrames? = nil
   var asset: AVMutableComposition { graph.asset }
   var audio: AVMutableAudioMix { graph.audio }
-  func retainAudio(on object: AnyObject) {
-    if !graph.pitchFiles.isEmpty {
-      objc_setAssociatedObject(
-        object, &audioLeaseKey, graph.pitchFiles, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
-    }
-  }
   func item() -> AVPlayerItem {
     let i = AVPlayerItem(asset: asset)
     i.videoComposition = video
     i.audioMix = audio
     i.audioTimePitchAlgorithm = .spectral
-    retainAudio(on: i)
+    graph.retainAudio(on: i)
     return i
   }
 
@@ -285,7 +362,7 @@ private func sourceTime(_ frame: Double) -> CMTime {
 }
 func clockURL() throws -> URL {
   guard let u = Bundle.main.url(forResource: "Clock", withExtension: "mp4") else {
-    throw EditError.message("应用缺少 Clock.mp4 资源。")
+    throw EditError.message(L("应用缺少 Clock.mp4 资源。"))
   }
   return u
 }
@@ -301,7 +378,7 @@ func inspect(_ u: URL) throws -> Media {
   let s = !a.tracks(withMediaType: .audio).isEmpty
   let sec = a.duration.seconds
   guard a.isPlayable, sec.isFinite, sec >= 1.0 / 30, sec <= 86400, v || s else {
-    throw EditError.message("无法读取「\(u.lastPathComponent)」。请使用系统可解码的图片、视频或音频文件。")
+    throw EditError.message(L("无法读取「\(u.lastPathComponent)」。请使用系统可解码的图片、视频或音频文件。"))
   }
   return Media(
     path: u.standardizedFileURL.path, frames: max(1, Int(floor(sec * 30 + 0.00001))), video: v,
@@ -341,19 +418,23 @@ private func insertVideo(
       from: available.end, at: start + lead + coreDuration, duration: length - lead - coreDuration)
   }
 }
-func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
-  guard p.duration > 0 else { throw EditError.message("时间线上还没有片段。") }
+func buildMediaGraph(_ p: Project, includeVideo: Bool = true, cancelled: () -> Bool) throws -> MediaGraph {
+  guard p.duration > 0 else { throw EditError.message(L("时间线上还没有片段。")) }
   let a = AVMutableComposition()
   var pitchFiles = [PitchedAudio]()
   let mix = AVMutableAudioMix()
-  let base = AVURLAsset(url: try clockURL())
-  guard let track = base.tracks(withMediaType: .video).first,
-    let clk = a.addMutableTrack(
-      withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
-  else { throw EditError.message("无法建立预览轨道。") }
-  try clk.insertTimeRange(track.timeRange, of: track, at: .zero)
-  clk.scaleTimeRange(track.timeRange, toDuration: time(p.duration))
-  let visibleVideo = p.videoVisibility
+  var clock = kCMPersistentTrackID_Invalid
+  if includeVideo {
+    let base = AVURLAsset(url: try clockURL())
+    guard let track = base.tracks(withMediaType: .video).first,
+      let clk = a.addMutableTrack(
+        withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+    else { throw EditError.message(L("无法建立预览轨道。")) }
+    try clk.insertTimeRange(track.timeRange, of: track, at: .zero)
+    clk.scaleTimeRange(track.timeRange, toDuration: time(p.duration))
+    clock = clk.trackID
+  }
+  let visibleVideo = includeVideo ? p.videoVisibility : [:]
   var sources = [UUID: SourceMap]()
   var stills = [UUID: URL]()
   var checkedStills = Set<UUID>()
@@ -361,14 +442,19 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
   var pools = [AVMediaType: [(AVMutableCompositionTrack, Int)]]()
   var volumes = [CMPersistentTrackID: AVMutableAudioMixInputParameters]()
   for c in p.clips.sorted(by: { $0.start < $1.start }) where c.kind.isMedia {
-    if cancelled() { throw EditError.message("预览更新已替换。") }
-    guard let media = p.asset(c.asset), FileManager.default.fileExists(atPath: media.path) else {
-      throw EditError.message("找不到「\(p.name(c))」。请在素材列表中重新定位文件。")
+    if cancelled() { throw EditError.message(L("预览更新已替换。")) }
+    guard let media = p.asset(c.asset) else {
+      throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
+    }
+    if !includeVideo, c.volume == 0 || media.isStill { continue }
+    guard FileManager.default.fileExists(atPath: media.path) else {
+      if !includeVideo, c.kind == .video, !media.audio { continue }
+      throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
     }
     if media.isStill {
       let url = URL(fileURLWithPath: media.path)
       if checkedStills.insert(media.id).inserted, StillImages.dimensions(url) == nil {
-        throw EditError.message("无法读取图片「" + media.name + "」。")
+        throw EditError.message(L("无法读取图片「\(media.name)」。"))
       }
       stills[c.id] = url
       continue
@@ -378,19 +464,20 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
         url: URL(fileURLWithPath: media.path),
         options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
       assets[media.id] = (
-        asset, asset.tracks(withMediaType: .video).first, asset.tracks(withMediaType: .audio).first)
+        asset, includeVideo ? asset.tracks(withMediaType: .video).first : nil,
+        asset.tracks(withMediaType: .audio).first)
     }
     guard let source = assets[media.id] else { continue }
     var tracks: [(AVMediaType, AVAssetTrack)] = []
-    if c.kind == .video {
+    if includeVideo && c.kind == .video {
       guard let video = source.video else {
-        throw EditError.message("无法读取「\(media.name)」的轨道。")
+        throw EditError.message(L("无法读取「\(media.name)」的轨道。"))
       }
       tracks.append((.video, video))
     }
     if c.volume > 0 {
       if let audio = source.audio { tracks.append((.audio, audio)) }
-      else if c.kind == .audio { throw EditError.message("无法读取「\(media.name)」的音轨。") }
+      else if c.kind == .audio { throw EditError.message(L("无法读取「\(media.name)」的音轨。")) }
     }
     for (type, original) in tracks {
       let span = type == .video ? visibleVideo[c.id] ?? (c.start..<c.end) : (c.start..<c.end)
@@ -408,14 +495,20 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
         guard
           let t = a.addMutableTrack(
             withMediaType: type, preferredTrackID: kCMPersistentTrackID_Invalid)
-        else { throw EditError.message("轨道数量超出系统限制。") }
+        else { throw EditError.message(L("轨道数量超出系统限制。")) }
         lane = t
         lanes.append((t, span.upperBound))
       }
       pools[type] = lanes
       if type == .video {
         try insertVideo(c, visible: span, source: original, into: lane)
-        sources[c.id] = SourceMap(track: lane.trackID, transform: original.preferredTransform)
+        let formats = original.formatDescriptions as? [CMFormatDescription] ?? []
+        let opaque = !formats.isEmpty && !original.hasMediaCharacteristic(.containsAlphaChannel)
+          && formats.allSatisfy {
+            [kCMVideoCodecType_H264, kCMVideoCodecType_HEVC].contains(CMFormatDescriptionGetMediaSubType($0))
+          }
+        sources[c.id] = SourceMap(
+          track: lane.trackID, transform: original.preferredTransform, opaque: opaque)
       } else {
         let start =
           time(c.start)
@@ -429,7 +522,7 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
           pitchFiles.append(file)
           let pitchedAsset = file.readable
           guard let t = pitchedAsset.tracks(withMediaType: .audio).first else {
-            throw EditError.message("无法读取变调后的音轨。")
+            throw EditError.message(L("无法读取变调后的音轨。"))
           }
           input = t
           inputRange = t.timeRange
@@ -438,7 +531,7 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
           inputRange = range
         }
         do { try lane.insertTimeRange(inputRange, of: input, at: start) } catch {
-          throw EditError.message("无法合成「" + media.name + "」的音轨。" + error.localizedDescription)
+          throw EditError.message(L("无法合成「\(media.name)」的音轨。") + " " + error.localizedDescription)
         }
         if inputRange.duration != duration {
           lane.scaleTimeRange(
@@ -453,7 +546,7 @@ func buildMediaGraph(_ p: Project, cancelled: () -> Bool) throws -> MediaGraph {
   }
   mix.inputParameters = Array(volumes.values)
   return MediaGraph(
-    asset: a, audio: mix, sources: sources, clock: clk.trackID, pitchFiles: pitchFiles,
+    asset: a, audio: mix, sources: sources, clock: clock, pitchFiles: pitchFiles,
     stills: stills)
 }
 func buildComposition(
@@ -464,7 +557,9 @@ func buildComposition(
   let visibleVideo = p.videoVisibility
   let vc = AVMutableVideoComposition()
   let size = p.canvas.size(short)
-  let painter = FramePainter(p, size, preview: preview)
+  let signals = audioSignals(in: p, cancelled: cancelled)
+  if cancelled() { throw EditError.message(L("预览更新已替换。")) }
+  let painter = FramePainter(p, size, preview: preview, audioSignals: signals)
   let canvasFrames = playback == nil ? nil : CanvasFrames()
   var begins = [Int: [Int]]()
   var ends = [Int: [Int]]()
@@ -493,4 +588,23 @@ func buildComposition(
   vc.frameDuration = time(1)
   vc.renderSize = size
   return Composition(graph: graph, video: vc, canvasFrames: canvasFrames)
+}
+
+func audioSignals(in project: Project, cancelled: () -> Bool) -> [UUID: AudioSignalTrack] {
+  let links = Set(project.clips.compactMap { $0.audioVisualization?.source })
+  guard !links.isEmpty else { return [:] }
+  var waves = [UUID: AudioWaveform]()
+  var attempted = Set<UUID>()
+  var pieces = [UUID: [AudioSignal]]()
+  for clip in project.clips where clip.kind.isMedia && links.contains(clip.audioFamily) {
+    if cancelled() { break }
+    guard let asset = project.asset(clip.asset), !asset.isStill else { continue }
+    if attempted.insert(asset.id).inserted {
+      waves[asset.id] = AudioWaveform.cached(asset, cancelled: cancelled).wave
+    }
+    if let wave = waves[asset.id] {
+      pieces[clip.audioFamily, default: []].append(AudioSignal(clip: clip, wave: wave))
+    }
+  }
+  return pieces.mapValues(AudioSignalTrack.init)
 }

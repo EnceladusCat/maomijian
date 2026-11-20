@@ -7,9 +7,10 @@
 <key>CFBundleIconFile</key><string>MaoMiJian.icns</string>
 <key>CFBundleIdentifier</key><string>local.framecut.editor</string>
 <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+<key>CFBundleLocalizations</key><array><string>zh-Hans</string><string>en</string></array>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.13.7</string>
-<key>CFBundleVersion</key><string>21</string>
+<key>CFBundleShortVersionString</key><string>0.16.6</string>
+<key>CFBundleVersion</key><string>39</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>

@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import VideoToolbox
 
 enum ExportCodec: String, CaseIterable {
   case h264 = "H.264"
@@ -8,11 +9,20 @@ enum ExportCodec: String, CaseIterable {
 }
 enum ExportQuality: String, CaseIterable {
   case balanced = "均衡"
+  case screen = "录屏压缩"
   case high = "高质量"
   case near = "近无损"
+
+  static func available(for codec: ExportCodec) -> [Self] {
+    #if arch(arm64)
+    if codec == .hevc { return allCases }
+    #endif
+    return [.balanced, .high, .near]
+  }
+
   var bitsPerPixel: Double {
     switch self {
-    case .balanced: return 0.12
+    case .balanced, .screen: return 0.12
     case .high: return 0.24
     case .near: return 0.76
     }
@@ -25,6 +35,9 @@ struct ExportSettings: Equatable {
   var customMbps: Double?
   static let bitrateRange = 0.5...120.0
   static let audioBitrate = 256_000
+  var screenCompression: Bool { quality == .screen && codec == .hevc && customMbps == nil }
+  var keyframeInterval: Int { (screenCompression ? 6 : 2) * fps }
+  var fullSampleLimit: Int { screenCompression ? 3 * keyframeInterval : 8 * fps }
 
   func videoMbps(canvas: Canvas) -> Double {
     if let customMbps {
@@ -48,6 +61,7 @@ struct ExportSettings: Equatable {
 }
 
 final class ExportJob {
+  fileprivate static let audioSampleRate: CMTimeScale = 48_000
   private let lock = NSLock()
   private var stopped = false
   private var stopReading: (() -> Void)?
@@ -64,7 +78,7 @@ final class ExportJob {
     if let cancelRead { DispatchQueue.global(qos: .utility).async { cancelRead() } }
   }
   private func check() throws {
-    if cancelled { throw EditError.message("已取消导出。") }
+    if cancelled { throw EditError.message(L("已取消导出。")) }
   }
 
   func run(_ p: Project, to url: URL, short: Int, progress: @escaping (Double) -> Void) throws {
@@ -76,30 +90,82 @@ final class ExportJob {
     _ p: Project, to url: URL, settings: ExportSettings,
     progress: @escaping (Double) -> Void
   ) throws {
-    let tmp = url.deletingLastPathComponent().appendingPathComponent(
-      ".framecut-\(UUID().uuidString).mp4")
-    defer { try? FileManager.default.removeItem(at: tmp) }
     try check()
-    guard p.duration > 0 else { throw EditError.message("时间线上还没有片段。") }
-    let destination = url.resolvingSymlinksInPath().standardizedFileURL
-    guard
-      !p.assets.contains(where: {
-        URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL == destination
-      })
-    else { throw EditError.message("导出文件不能覆盖原素材。") }
+    guard p.duration > 0 else { throw EditError.message(L("时间线上还没有片段。")) }
+    try Self.checkDestination(url, project: p)
+    let staged = try MediaScratch.shared.make(.video, beside: url.deletingLastPathComponent())
+    defer { withExtendedLifetime(staged) {} }
 
     let built = try buildComposition(p, short: settings.short, cancelled: { self.cancelled })
     try encode(
-      built, to: tmp, canvas: p.canvas, settings: settings,
+      built, to: staged.url, canvas: p.canvas, settings: settings,
       frames: 0..<p.duration, progress: progress)
-    // Serialize final replacement with a cancellation requested close to completion.
-    do {
-      lock.lock()
-      defer { lock.unlock() }
-      guard !stopped else { throw EditError.message("已取消导出。") }
-      try commit(tmp, url)
+    try finish { try commit(staged.url, url) }
+    progress(1)
+  }
+
+  func runAudio(_ p: Project, to url: URL, progress: (Double) -> Void) throws {
+    try Self.checkDestination(url, project: p)
+    try check()
+    let staged = try MediaScratch.shared.make(.audio, beside: url.deletingLastPathComponent())
+    defer { withExtendedLifetime(staged) {} }
+    try encodeAudio(p, to: staged.url, progress: progress)
+    try finish { try commit(staged.url, url) }
+    progress(1)
+  }
+
+  func runAudioAndSubtitles(
+    _ p: Project, in folder: URL, name: String, progress: (Double) -> Void
+  ) throws -> [URL] {
+    try check()
+    let audio = try MediaScratch.shared.make(.audio, beside: folder)
+    let subtitles = try MediaScratch.shared.make(.subtitles, beside: folder)
+    let files = FileManager.default
+    defer { withExtendedLifetime((audio, subtitles)) {} }
+    try Self.writeSubtitles(p, to: subtitles.url)
+    try encodeAudio(p, to: audio.url, progress: progress)
+    let destinations = try finish {
+      var suffix = 1
+      while true {
+        let base = folder.appendingPathComponent(suffix == 1 ? name : "\(name)-\(suffix)")
+        let audioURL = base.appendingPathExtension("m4a")
+        let subtitleURL = base.appendingPathExtension("srt")
+        if files.fileExists(atPath: audioURL.path) || files.fileExists(atPath: subtitleURL.path) {
+          suffix += 1
+          continue
+        }
+        try files.moveItem(at: audio.url, to: audioURL)
+        do { try files.moveItem(at: subtitles.url, to: subtitleURL) } catch {
+          try? files.removeItem(at: audioURL)
+          throw error
+        }
+        return [audioURL, subtitleURL]
+      }
     }
     progress(1)
+    return destinations
+  }
+
+  static func writeSubtitles(_ p: Project, to url: URL) throws {
+    let subtitles = SRT.write(p.clips)
+    guard !subtitles.isEmpty else { throw EditError.message(L("时间线上还没有字幕。")) }
+    try checkDestination(url, project: p)
+    try subtitles.write(to: url, atomically: true, encoding: .utf8)
+  }
+
+  private static func checkDestination(_ url: URL, project: Project) throws {
+    let destination = url.resolvingSymlinksInPath().standardizedFileURL
+    guard !project.assets.contains(where: {
+      URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL == destination
+    }) else { throw EditError.message(L("导出文件不能覆盖原素材。")) }
+  }
+
+  // Serialize final replacement with a cancellation requested close to completion.
+  private func finish<T>(_ commit: () throws -> T) throws -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    guard !stopped else { throw EditError.message(L("已取消导出。")) }
+    return try commit()
   }
 
   func sampleSize(_ project: Project, settings: ExportSettings) throws -> Int64 {
@@ -108,10 +174,10 @@ final class ExportJob {
     guard frames > 0 else { return 0 }
     let built = try buildComposition(project, short: settings.short, cancelled: { self.cancelled })
     let ranges: [Range<Int>]
-    if frames <= 8 * fps {
+    if frames <= settings.fullSampleLimit {
       ranges = [0..<frames]
     } else {
-      let length = 2 * fps
+      let length = settings.keyframeInterval
       ranges = [1, 3, 5].map { index in
         let start = bound(frames * index / 6 - length / 2, 0, frames - length)
         return start..<start + length
@@ -119,12 +185,11 @@ final class ExportJob {
     }
     var bytes: Int64 = 0
     for range in ranges {
-      let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(
-        "framecut-estimate-" + UUID().uuidString + ".mp4")
-      defer { try? FileManager.default.removeItem(at: tmp) }
-      try encode(built, to: tmp, canvas: project.canvas, settings: settings, frames: range) { _ in }
-      let info = try tmp.resourceValues(forKeys: [.fileSizeKey])
-      guard let size = info.fileSize else { throw EditError.message("无法读取抽样文件大小。") }
+      let staged = try MediaScratch.shared.make(.video)
+      defer { withExtendedLifetime(staged) {} }
+      try encode(built, to: staged.url, canvas: project.canvas, settings: settings, frames: range) { _ in }
+      let info = try staged.url.resourceValues(forKeys: [.fileSizeKey])
+      guard let size = info.fileSize else { throw EditError.message(L("无法读取抽样文件大小。")) }
       bytes += Int64(size)
     }
     try check()
@@ -139,47 +204,74 @@ final class ExportJob {
     try check()
     let reader = try AVAssetReader(asset: built.asset)
     let writer = try AVAssetWriter(outputURL: tmp, fileType: .mp4)
-    built.retainAudio(on: reader)
+    built.graph.retainAudio(on: reader)
     writer.shouldOptimizeForNetworkUse = true
     let range = CMTimeRange(start: time(frames.lowerBound), duration: time(frames.count))
-    reader.timeRange = range
-
     let videoOut = AVAssetReaderVideoCompositionOutput(
       videoTracks: built.asset.tracks(withMediaType: .video),
       videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
     videoOut.videoComposition = built.video
     videoOut.alwaysCopiesSampleData = false
     let videoIn = try videoInput(writer, settings: settings, canvas: canvas)
-    guard reader.canAdd(videoOut) else { throw EditError.message("无法读取合成后的画面。") }
+    guard reader.canAdd(videoOut) else { throw EditError.message(L("无法读取合成后的画面。")) }
     reader.add(videoOut)
     writer.add(videoIn)
-    var audio: ExportStream?
-    let tracks = built.asset.tracks(withMediaType: .audio)
-    if !tracks.isEmpty {
-      let audioOut = AVAssetReaderAudioMixOutput(
-        audioTracks: tracks,
-        audioSettings: [
-          AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
-          AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
-          AVLinearPCMIsNonInterleaved: false,
-        ])
-      audioOut.audioMix = built.audio
-      audioOut.audioTimePitchAlgorithm = .spectral
-      audioOut.alwaysCopiesSampleData = false
-      let audioIn = AVAssetWriterInput(
-        mediaType: .audio,
-        outputSettings: [
-          AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48_000, AVNumberOfChannelsKey: 2,
-          AVEncoderBitRateKey: ExportSettings.audioBitrate,
-        ])
-      guard reader.canAdd(audioOut), writer.canAdd(audioIn) else {
-        throw EditError.message("无法建立导出的音轨。")
-      }
-      reader.add(audioOut)
-      writer.add(audioIn)
-      audio = ExportStream(input: audioIn, output: audioOut)
-    }
+    let audio = try audioStream(built.graph, reader: reader, writer: writer)
+    try write(reader, writer, range: range, video: ExportStream(input: videoIn, output: videoOut),
+              audio: audio, progress: progress)
+  }
 
+  private func encodeAudio(_ p: Project, to url: URL, progress: (Double) -> Void) throws {
+    try check()
+    let graph = try buildMediaGraph(p, includeVideo: false, cancelled: { self.cancelled })
+    guard !graph.audio.inputParameters.isEmpty else {
+      throw EditError.message(L("时间线上没有可导出的音频。"))
+    }
+    let reader = try AVAssetReader(asset: graph.asset)
+    let writer = try AVAssetWriter(outputURL: url, fileType: .m4a)
+    graph.retainAudio(on: reader)
+    guard var audio = try audioStream(graph, reader: reader, writer: writer) else {
+      throw EditError.message(L("时间线上没有可导出的音频。"))
+    }
+    audio.padsAudioToEnd = true
+    let range = CMTimeRange(start: .zero, duration: time(p.duration))
+    try write(reader, writer, range: range, video: nil, audio: audio, progress: progress)
+  }
+
+  private func audioStream(
+    _ graph: MediaGraph, reader: AVAssetReader, writer: AVAssetWriter
+  ) throws -> ExportStream? {
+    let tracks = graph.asset.tracks(withMediaType: .audio)
+    guard !tracks.isEmpty else { return nil }
+    let audioOut = AVAssetReaderAudioMixOutput(
+      audioTracks: tracks,
+      audioSettings: [
+        AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: Self.audioSampleRate, AVNumberOfChannelsKey: 2,
+        AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
+        AVLinearPCMIsNonInterleaved: false,
+      ])
+    audioOut.audioMix = graph.audio
+    audioOut.audioTimePitchAlgorithm = .spectral
+    audioOut.alwaysCopiesSampleData = false
+    let audioIn = AVAssetWriterInput(
+      mediaType: .audio,
+      outputSettings: [
+        AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: Self.audioSampleRate, AVNumberOfChannelsKey: 2,
+        AVEncoderBitRateKey: ExportSettings.audioBitrate,
+      ])
+    guard reader.canAdd(audioOut), writer.canAdd(audioIn) else {
+      throw EditError.message(L("无法建立导出的音轨。"))
+    }
+    reader.add(audioOut)
+    writer.add(audioIn)
+    return ExportStream(input: audioIn, output: audioOut)
+  }
+
+  private func write(
+    _ reader: AVAssetReader, _ writer: AVAssetWriter, range: CMTimeRange,
+    video: ExportStream?, audio: ExportStream?, progress: (Double) -> Void
+  ) throws {
+    reader.timeRange = range
     let cancelRead = { if reader.status == .reading { reader.cancelReading() } }
     lock.lock()
     stopReading = cancelRead
@@ -193,43 +285,46 @@ final class ExportJob {
     }
     try check()
     guard writer.startWriting() else {
-      throw writer.error ?? EditError.message("无法启动视频编码器。")
+      throw writer.error ?? EditError.message(L("无法启动编码器。"))
     }
     guard reader.startReading() else {
-      throw reader.error ?? EditError.message("无法读取时间线。")
+      throw reader.error ?? EditError.message(L("无法读取时间线。"))
     }
     writer.startSession(atSourceTime: range.start)
-    var video = ExportStream(input: videoIn, output: videoOut)
+    var video = video
+    var audio = audio
     var lastProgress = 0.0
-    while !video.done || audio?.done == false {
+    while video?.done == false || audio?.done == false {
       try check()
       try verifyIO(reader: reader, writer: writer)
-      var advanced = false
-      try autoreleasepool {
-        if let timestamp = try video.step(until: range.end, writer: writer) {
+      let advanced = try autoreleasepool {
+        let videoTime = try video?.step(until: range.end, writer: writer)
+        let audioTime = try audio?.step(until: range.end, writer: writer)
+        if let timestamp = video == nil ? audioTime : videoTime {
           let fraction = bound((timestamp - range.start).seconds / range.duration.seconds, 0, 0.995)
           if fraction - lastProgress >= 0.005 {
             lastProgress = fraction
             progress(fraction)
           }
-          advanced = true
         }
-        if try audio?.step(until: range.end, writer: writer) != nil { advanced = true }
+        return videoTime != nil || audioTime != nil
       }
-      if !advanced && (!video.done || audio?.done == false) {
+      if !advanced && (video?.done == false || audio?.done == false) {
         Thread.sleep(forTimeInterval: 0.004)
       }
     }
     try check()
     try verifyIO(reader: reader, writer: writer)
-    guard video.samples > 0 else { throw EditError.message("导出没有收到视频帧。") }
+    guard ((video ?? audio)?.samples ?? 0) > 0 else {
+      throw EditError.message(video == nil ? L("导出没有收到音频采样。") : L("导出没有收到视频帧。"))
+    }
     writer.endSession(atSourceTime: range.end)
     let gate = DispatchSemaphore(value: 0)
     writer.finishWriting { gate.signal() }
     while gate.wait(timeout: .now() + 0.15) == .timedOut { try check() }
     try check()
     guard writer.status == .completed else {
-      throw writer.error ?? EditError.message("系统编码器没有完成导出。")
+      throw writer.error ?? EditError.message(L("系统编码器没有完成导出。"))
     }
   }
 
@@ -238,10 +333,15 @@ final class ExportJob {
   {
     let size = canvas.size(settings.short)
     var compression: [String: Any] = [
-      AVVideoAverageBitRateKey: Int((settings.videoMbps(canvas: canvas) * 1_000_000).rounded()),
       AVVideoExpectedSourceFrameRateKey: fps,
-      AVVideoMaxKeyFrameIntervalKey: fps * 2,
+      AVVideoMaxKeyFrameIntervalKey: settings.keyframeInterval,
     ]
+    if settings.screenCompression {
+      compression[kVTCompressionPropertyKey_Quality as String] = 0.75
+    } else {
+      compression[AVVideoAverageBitRateKey] =
+        Int((settings.videoMbps(canvas: canvas) * 1_000_000).rounded())
+    }
     if settings.codec == .h264 {
       compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
     }
@@ -256,19 +356,22 @@ final class ExportJob {
       ],
     ]
     guard writer.canApply(outputSettings: output, forMediaType: .video) else {
-      throw EditError.message("当前编码器不支持这组导出设置。请调低码率或改用另一种编码。")
+      if settings.screenCompression {
+        throw EditError.message(L("当前 HEVC 编码器无法使用录屏压缩。请改用均衡档。"))
+      }
+      throw EditError.message(L("当前编码器不支持这组导出设置。请调低码率或改用另一种编码。"))
     }
     let input = AVAssetWriterInput(mediaType: .video, outputSettings: output)
-    guard writer.canAdd(input) else { throw EditError.message("无法建立导出的视频轨。") }
+    guard writer.canAdd(input) else { throw EditError.message(L("无法建立导出的视频轨。")) }
     return input
   }
 
   private func verifyIO(reader: AVAssetReader, writer: AVAssetWriter) throws {
     if reader.status == .failed {
-      throw reader.error ?? EditError.message("读取导出帧失败。")
+      throw reader.error ?? EditError.message(L("读取导出帧失败。"))
     }
     if writer.status == .failed {
-      throw writer.error ?? EditError.message("写入导出帧失败。")
+      throw writer.error ?? EditError.message(L("写入导出帧失败。"))
     }
   }
 
@@ -286,21 +389,68 @@ private struct ExportStream {
   let output: AVAssetReaderOutput
   var done = false
   var samples = 0
+  var padsAudioToEnd = false
+  private var audioTail: (next: CMTime, format: CMFormatDescription)?
+  private var drained = false
+
+  init(input: AVAssetWriterInput, output: AVAssetReaderOutput) {
+    self.input = input
+    self.output = output
+  }
 
   mutating func step(until end: CMTime, writer: AVAssetWriter) throws -> CMTime? {
     guard !done, input.isReadyForMoreMediaData else { return nil }
-    while let sample = output.copyNextSampleBuffer() {
-      let pts = sample.presentationTimeStamp
-      if pts >= end { break }
-      if !CMSampleBufferDataIsReady(sample) || sample.numSamples == 0 { continue }
-      guard input.append(sample) else {
-        throw writer.error ?? EditError.message("系统编码器拒绝了时间线采样。")
+    if !drained {
+      while let sample = output.copyNextSampleBuffer() {
+        let pts = sample.presentationTimeStamp
+        if pts >= end { break }
+        if !CMSampleBufferDataIsReady(sample) || sample.numSamples == 0 { continue }
+        try append(sample, writer: writer)
+        if padsAudioToEnd, let format = sample.formatDescription {
+          audioTail = (
+            pts + CMTime(value: Int64(sample.numSamples), timescale: ExportJob.audioSampleRate),
+            format)
+        }
+        return pts
       }
-      samples += 1
-      return pts
+      drained = true
+    }
+    if let tail = audioTail, let silence = try silence(from: tail.next, until: end, format: tail.format) {
+      try append(silence, writer: writer)
+      audioTail?.next = tail.next + CMTime(value: Int64(silence.numSamples), timescale: ExportJob.audioSampleRate)
+      return tail.next
     }
     if writer.status == .writing { input.markAsFinished() }
     done = true
     return nil
+  }
+
+  private mutating func append(_ sample: CMSampleBuffer, writer: AVAssetWriter) throws {
+    guard input.append(sample) else {
+      throw writer.error ?? EditError.message(L("系统编码器拒绝了时间线采样。"))
+    }
+    samples += 1
+  }
+
+  private func silence(from start: CMTime, until end: CMTime, format: CMFormatDescription) throws -> CMSampleBuffer? {
+    // The mix reader emits interleaved, stereo, 16-bit PCM and may stop before the project ends.
+    let remaining = (end - start).convertScale(ExportJob.audioSampleRate, method: .roundTowardZero).value
+    guard remaining > 0 else { return nil }
+    let count = Int(min(8192, remaining))
+    let bytes = count * 4
+    var block: CMBlockBuffer?
+    var sample: CMSampleBuffer?
+    guard CMBlockBufferCreateWithMemoryBlock(
+      allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes,
+      blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
+      dataLength: bytes, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block) == noErr,
+      let block, CMBlockBufferFillDataBytes(with: 0, blockBuffer: block, offsetIntoDestination: 0,
+                                          dataLength: bytes) == noErr,
+      CMAudioSampleBufferCreateReadyWithPacketDescriptions(
+        allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format,
+        sampleCount: count, presentationTimeStamp: start, packetDescriptions: nil,
+        sampleBufferOut: &sample) == noErr, let sample
+    else { throw EditError.message(L("无法补齐音频结尾的静音。")) }
+    return sample
   }
 }

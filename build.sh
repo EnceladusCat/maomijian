@@ -7,6 +7,6 @@ mkdir -p "$dest/Contents/MacOS" "$dest/Contents/Resources" "$cache"
 xcrun swiftc -O -whole-module-optimization -swift-version 5 -target "$(uname -m)-apple-macos14.0" \
   -module-cache-path "$cache" -suppress-warnings "$src"/Sources/*.swift -o "$dest/Contents/MacOS/MaoMiJian"
 cp "$src/Info.plist" "$dest/Contents/Info.plist"
-cp "$src/Resources/"* "$dest/Contents/Resources/"
+cp -R "$src/Resources/"* "$dest/Contents/Resources/"
 cp "$src/LICENSE" "$dest/Contents/Resources/"
 codesign --force --sign - "$dest"

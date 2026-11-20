@@ -12,6 +12,10 @@ final class AudioWaveform: Equatable {
 
   static func == (lhs: AudioWaveform, rhs: AudioWaveform) -> Bool { lhs === rhs }
 
+  static func cached(_ media: Media, cancelled: () -> Bool) -> (hasAudio: Bool, wave: AudioWaveform?) {
+    WaveformCache.shared.read(media, cancelled: cancelled)
+  }
+
   func peak(from start: Double, to end: Double) -> Double {
     guard !peaks.isEmpty, start < Double(frames), end > 0 else { return 0 }
     let rate = Double(peaks.count) / Double(frames)
@@ -85,6 +89,51 @@ final class AudioWaveform: Equatable {
   }
 }
 
+private final class WaveformCache {
+  private final class Entry {
+    let result: (hasAudio: Bool, wave: AudioWaveform?)
+    init(_ result: (hasAudio: Bool, wave: AudioWaveform?)) { self.result = result }
+  }
+  static let shared = WaveformCache()
+  private let condition = NSCondition()
+  private let entries = NSCache<NSString, Entry>()
+  private var inFlight = Set<String>()
+
+  private init() {
+    entries.totalCostLimit = 32 * 1024 * 1024
+    entries.countLimit = 512
+  }
+
+  func read(_ media: Media, cancelled: () -> Bool) -> (hasAudio: Bool, wave: AudioWaveform?) {
+    let url = URL(fileURLWithPath: media.path).standardizedFileURL
+    let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+    let time = values?.contentModificationDate?.timeIntervalSinceReferenceDate ?? 0
+    let key = "\(url.path)\n\(media.frames)\n\(values?.fileSize ?? 0)\n\(time)"
+    condition.lock()
+    while !cancelled() {
+      if let entry = entries.object(forKey: key as NSString) {
+        condition.unlock()
+        return entry.result
+      }
+      if inFlight.insert(key).inserted {
+        condition.unlock()
+        let result = AudioWaveform.read(media, cancelled: cancelled)
+        condition.lock()
+        if values != nil, let wave = result.wave, !cancelled() {
+          entries.setObject(Entry(result), forKey: key as NSString, cost: wave.peaks.count)
+        }
+        inFlight.remove(key)
+        condition.broadcast()
+        condition.unlock()
+        return result
+      }
+      _ = condition.wait(until: Date(timeIntervalSinceNow: 0.1))
+    }
+    condition.unlock()
+    return (false, nil)
+  }
+}
+
 final class WaveformStore: ObservableObject {
   @Published private(set) var values = [UUID: AudioWaveform]()
   private var requested = [UUID: Media]()
@@ -106,7 +155,7 @@ final class WaveformStore: ObservableObject {
     tasks[media.id] = task
     queue.addOperation { [weak self] in
       guard !task.isCancelled else { return }
-      let result = AudioWaveform.read(media) { task.isCancelled }
+      let result = AudioWaveform.cached(media) { task.isCancelled }
       DispatchQueue.main.async {
         guard let self, self.tasks[media.id] === task else { return }
         self.tasks[media.id] = nil

@@ -3,7 +3,8 @@ import Foundation
 struct TimelineTrack: Identifiable {
   let title: String, kind: Kind, index: Int
   var clips: [Clip]
-  var id: String { kind.rawValue + String(index) }
+  var isInset = false
+  var id: String { (isInset ? "pictureInset" : kind.rawValue) + String(index) }
   var name: String { index == 0 ? title : "\(title) \(index + 1)" }
   var pinned: Bool { kind == .caption }
 }
@@ -16,7 +17,7 @@ extension Project {
   private func defaultTracks(joins: [Join]) -> [TimelineTrack] {
     var tracks: [TimelineTrack] = []
     for (kind, title) in [
-      (Kind.caption, "字幕"), (.text, "标注"), (.zoom, "效果"), (.video, "视频"), (.audio, "音频"),
+      (Kind.caption, L("字幕")), (.text, L("标注")), (.zoom, L("效果")), (.video, L("视频")), (.audio, L("音频")),
     ] {
       if kind == .video {
         tracks += videoLanes(joins).enumerated().map {
@@ -35,6 +36,11 @@ extension Project {
         }
       }
       tracks += rows
+      if kind == .caption {
+        tracks += videoLanes(joins, insets: true).enumerated().map {
+          TimelineTrack(title: L("画中画"), kind: .video, index: $0.offset, clips: $0.element, isInset: true)
+        }
+      }
     }
     return tracks
   }
@@ -54,8 +60,10 @@ extension Project {
     var remaining = Dictionary(uniqueKeysWithValues: movable.map { ($0.id, $0) })
     var ordered = trackOrder.compactMap { remaining.removeValue(forKey: $0) }
     for track in movable where remaining[track.id] != nil {
-      if let neighbor = ordered.lastIndex(where: { $0.kind == track.kind }) {
+      if let neighbor = ordered.lastIndex(where: { $0.kind == track.kind && $0.isInset == track.isInset }) {
         ordered.insert(track, at: neighbor + 1)
+      } else if track.isInset {
+        ordered.insert(track, at: 0)
       } else {
         ordered.append(track)
       }

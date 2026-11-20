@@ -17,7 +17,7 @@ func ink(_ hex: String, _ alpha: CGFloat = 1) -> CGColor {
     srgbRed: CGFloat((v >> 16) & 255) / 255, green: CGFloat((v >> 8) & 255) / 255,
     blue: CGFloat(v & 255) / 255, alpha: alpha)
 }
-private func textFont(_ family: String, bold: Bool, size: CGFloat) -> NSFont {
+func textFont(_ family: String, bold: Bool, size: CGFloat) -> NSFont {
   if !family.isEmpty, let font = NSFontManager.shared.font(
     withFamily: family, traits: bold ? .boldFontMask : [], weight: bold ? 8 : 5, size: size)
   {
@@ -26,7 +26,7 @@ private func textFont(_ family: String, bold: Bool, size: CGFloat) -> NSFont {
   return .systemFont(ofSize: size, weight: bold ? .semibold : .regular)
 }
 
-private func setTextShadow(_ shadow: TextShadow, unit: CGFloat, in g: CGContext) {
+func setTextShadow(_ shadow: TextShadow, unit: CGFloat, in g: CGContext) {
   g.setShadow(offset: CGSize(width: shadow.x * unit, height: -shadow.y * unit),
               blur: shadow.blur * unit, color: ink(shadow.color, shadow.opacity))
 }
@@ -35,26 +35,18 @@ private func setTextShadow(_ shadow: TextShadow, unit: CGFloat, in g: CGContext)
 // Increasing the authored size never allocates a larger bitmap.
 private struct FixedText {
   private let lines: [(CTLine, CGPoint)]
-  private static let fontSize = 64.0
-
-  init(_ text: String, appearance: TextAppearance, color: CGColor) {
-    let font = textFont(appearance.font, bold: appearance.bold, size: Self.fontSize)
-    let attributes: [NSAttributedString.Key: Any] = [
-      .font: font, .foregroundColor: NSColor(cgColor: color) ?? .white,
-    ]
-    let rows = text.components(separatedBy: "\n")
-    let spacing = font.ascender - font.descender + font.leading
-    let top = Double(rows.count - 1) * spacing / 2 - (font.ascender + font.descender) / 2
-    lines = rows.enumerated().map { i, row in
-      let line = CTLineCreateWithAttributedString(NSAttributedString(string: row, attributes: attributes))
-      let width = CTLineGetTypographicBounds(line, nil, nil, nil)
-      return (line, CGPoint(x: -width / 2, y: top - Double(i) * spacing))
-    }
+  private let face: CGPath?
+  init(_ text: String, appearance: TextAppearance, color: CGColor, relief: ReliefStyle?) {
+    lines = fixedTextLines(text, appearance: appearance, color: color)
+    face = relief != nil || appearance.activeDuotone != nil ? glyphFace(lines) : nil
   }
 
-  func draw(_ appearance: TextAppearance, unit: CGFloat, in g: CGContext) {
+  func draw(
+    _ appearance: TextAppearance, unit: CGFloat, relief: ReliefStyle?, color: CGColor,
+    in g: CGContext
+  ) {
     // Keep Core Graphics coordinates representable even for numbers far beyond the canvas.
-    let scale = min(appearance.size / Self.fontSize * unit, 65536)
+    let scale = min(appearance.size / fixedTextPointSize * unit, 65536)
     let shadow = appearance.shadow ?? TextShadow()
     let useShadow = shadow.enabled && shadow.opacity > 0
     g.saveGState()
@@ -65,6 +57,7 @@ private struct FixedText {
     g.saveGState()
     g.scaleBy(x: scale, y: scale)
     g.textMatrix = .identity
+    if let relief, let face { ReliefPaint.depth(face, relief, color, unit / scale, in: g) }
     let outline = appearance.outline
     if outline.style != .none {
       configureOutline(outline, width: max(0.5, outline.width * unit) / scale, in: g)
@@ -74,51 +67,54 @@ private struct FixedText {
       g.textPosition = baseline
       CTLineDraw(line, g)
     }
+    if let duotone = appearance.activeDuotone, let face {
+      TextColorPaint.draw(duotone, face: face, in: g)
+    } else if let relief, let face {
+      ReliefPaint.front(face, relief, color, in: g)
+    }
     g.restoreGState()
     if useShadow { g.endTransparencyLayer() }
     g.restoreGState()
   }
 }
 
-private func artHeight(_ c: Clip, size: CGSize, style: CaptionStyle?) -> CGFloat {
-  let original = size.height * c.h
-  guard c.kind == .caption, let style else { return original }
-  let unit = min(size.width, size.height) / 1080
-  return max(original, (style.fontSize * 1.6 + style.outlineWidth * 2 + 18) * unit)
+let fixedTextPointSize = 64.0
+
+func fixedTextLines(
+  _ text: String, appearance: TextAppearance, color: CGColor, animateCharacters: Bool = false
+) -> [(CTLine, CGPoint)] {
+  let font = textFont(appearance.font, bold: appearance.bold, size: fixedTextPointSize)
+  var attributes: [NSAttributedString.Key: Any] = [
+    .font: font, .foregroundColor: NSColor(cgColor: color) ?? .white,
+  ]
+  if animateCharacters { attributes[.ligature] = 0 }
+  let rows = text.components(separatedBy: "\n")
+  let spacing = font.ascender - font.descender + font.leading
+  let top = Double(rows.count - 1) * spacing / 2 - (font.ascender + font.descender) / 2
+  return rows.enumerated().map { index, row in
+    let line = CTLineCreateWithAttributedString(NSAttributedString(string: row, attributes: attributes))
+    let width = CTLineGetTypographicBounds(line, nil, nil, nil)
+    return (line, CGPoint(x: -width / 2, y: top - Double(index) * spacing))
+  }
 }
-func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil) -> CGImage? {
-  let w = max(2, Int((c.w * size.width).rounded()))
-  let h = max(2, Int(artHeight(c, size: size, style: style).rounded()))
-  guard let g = bitmap(w, h) else { return nil }
-  let rect = CGRect(x: 0, y: 0, width: w, height: h)
-  let col = ink(c.color)
-  g.setFillColor(col)
-  g.setStrokeColor(col)
-  switch c.kind {
-  case .rectangle, .ellipse:
-    let line = max(2.0, size.height * 0.006)
-    g.setLineWidth(line)
-    let r = rect.insetBy(dx: line / 2, dy: line / 2)
-    if c.kind == .rectangle { g.stroke(r) } else { g.strokeEllipse(in: r) }
-  case .arrow:
-    let neck = rect.width - min(rect.width * 0.45, rect.height * 1.25)
-    let mid = rect.midY
-    g.move(to: CGPoint(x: 0, y: mid * 0.73))
-    g.addLine(to: CGPoint(x: neck, y: mid * 0.73))
-    g.addLine(to: CGPoint(x: neck, y: 0))
-    g.addLine(to: CGPoint(x: rect.width, y: mid))
-    g.addLine(to: CGPoint(x: neck, y: rect.height))
-    g.addLine(to: CGPoint(x: neck, y: mid * 1.27))
-    g.addLine(to: CGPoint(x: 0, y: mid * 1.27))
-    g.closePath()
-    g.fillPath()
-  case .text, .caption, .timer:
+
+struct WrappedText {
+  let frame: CTFrame
+  let origin: CGPoint
+  let measured: CGSize
+  let fontSize: CGFloat
+  let padding: CGFloat
+  var lines: [(CTLine, CGPoint)] { textLines(frame, origin: origin) }
+
+  init(_ c: Clip, in rect: CGRect, unit: CGFloat, style: CaptionStyle? = nil) {
     let caption = c.kind == .caption ? style : nil
-    let unit = min(size.width, size.height) / 1080
     let appearance = c.kind == .caption ? nil : c.textAppearance
     let outline = appearance?.outline
+    let col = ink(c.color)
+    let relief = c.relief
     let pad = min(
-      max(2, rect.height * 0.07, (caption?.outlineWidth ?? outline?.width ?? 0) * unit),
+      max(2, rect.height * 0.07, (caption?.outlineWidth ?? outline?.width ?? 0) * unit,
+          relief == nil ? 0 : 16 * unit),
       (min(rect.width, rect.height) - 1) / 2)
 
     let box = rect.insetBy(dx: pad, dy: pad)
@@ -143,6 +139,7 @@ func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil) -> CGImage? {
         attributes[.strokeColor] = NSColor(cgColor: ink(style.outline))
         attributes[.strokeWidth] = -100 * style.outlineWidth * unit / pointSize
       }
+      if c.kind == .text && c.textAnimation?.characters == true { attributes[.ligature] = 0 }
       let attr = NSAttributedString(string: c.text, attributes: attributes)
       setter = CTFramesetterCreateWithAttributedString(attr)
       measured = CTFramesetterSuggestFrameSizeWithConstraints(
@@ -151,6 +148,67 @@ func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil) -> CGImage? {
       if measured.height <= box.height { break }
       fs *= 0.87
     }
+    let rh = min(box.height, ceil(measured.height) + 1)
+    let path = CGPath(
+      rect: CGRect(x: box.minX, y: (rect.height - rh) / 2, width: box.width, height: rh),
+      transform: nil)
+    frame = CTFramesetterCreateFrame(setter, CFRangeMake(0, 0), path, nil)
+    origin = path.boundingBoxOfPath.origin
+    self.measured = measured
+    fontSize = fs
+    padding = pad
+  }
+}
+
+private func artHeight(_ c: Clip, size: CGSize, style: CaptionStyle?) -> CGFloat {
+  let original = size.height * c.h
+  guard c.kind == .caption, let style else { return original }
+  let unit = min(size.width, size.height) / 1080
+  return max(original, (style.fontSize * 1.6 + style.outlineWidth * 2 + 18) * unit)
+}
+func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil, waitingForReveal: Bool = false) -> CGImage? {
+  let w = max(2, Int((c.w * size.width).rounded()))
+  let h = max(2, Int(artHeight(c, size: size, style: style).rounded()))
+  guard let g = bitmap(w, h) else { return nil }
+  let rect = CGRect(x: 0, y: 0, width: w, height: h)
+  let col = ink(c.color)
+  let relief = c.relief
+  g.setFillColor(col)
+  g.setStrokeColor(col)
+  switch c.kind {
+  case .editorial:
+    guard let spec = c.editorial else { return nil }
+    EditorialPaint.draw(spec, title: c.text, accent: c.color, in: rect,
+                        progress: waitingForReveal ? 0 : 1, context: g)
+  case .rectangle, .ellipse:
+    ShapePaint.draw(c, in: rect, canvas: size, color: col, context: g)
+  case .arrow:
+    let unit = min(size.width, size.height) / 1080
+    let face = relief == nil ? rect : ReliefPaint.faceRect(rect, unit: unit)
+    let neck = face.maxX - min(face.width * 0.45, face.height * 1.25)
+    let mid = face.midY, stem = face.height * 0.135
+    let path = CGMutablePath()
+    path.addLines(between: [
+      CGPoint(x: face.minX, y: mid - stem), CGPoint(x: neck, y: mid - stem),
+      CGPoint(x: neck, y: face.minY), CGPoint(x: face.maxX, y: mid),
+      CGPoint(x: neck, y: face.maxY), CGPoint(x: neck, y: mid + stem),
+      CGPoint(x: face.minX, y: mid + stem),
+    ])
+    path.closeSubpath()
+    if let relief {
+      ReliefPaint.draw(path, relief, col, unit, in: g)
+    } else {
+      g.addPath(path)
+      g.fillPath()
+    }
+  case .text, .caption, .timer:
+    let caption = c.kind == .caption ? style : nil
+    let unit = min(size.width, size.height) / 1080
+    let appearance = c.kind == .caption ? nil : c.textAppearance
+    let outline = appearance?.outline
+    let layout = WrappedText(c, in: rect, unit: unit, style: style)
+    let pad = layout.padding
+    let measured = layout.measured
     if c.kind == .caption && !c.text.isEmpty {
       let bw = min(rect.width, max(10, measured.width + 4 * pad))
       let bh = min(rect.height, measured.height + 2 * pad)
@@ -173,19 +231,25 @@ func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil) -> CGImage? {
             cornerHeight: innerRadius, transform: nil))
         g.strokePath()
       }
-    } else if appearance?.shadow == nil {
+    } else if appearance?.shadow == nil && relief == nil {
       g.setShadow(
-        offset: CGSize(width: 0, height: -1), blur: max(1, fs * 0.08), color: ink("#000000", 0.8))
+        offset: CGSize(width: 0, height: -1), blur: max(1, layout.fontSize * 0.08), color: ink("#000000", 0.8))
     }
-    let rh = min(box.height, ceil(measured.height) + 1)
-    let path = CGPath(
-      rect: CGRect(x: box.minX, y: (rect.height - rh) / 2, width: box.width, height: rh),
-      transform: nil)
-    let textFrame = CTFramesetterCreateFrame(setter, CFRangeMake(0, 0), path, nil)
+    let textFrame = layout.frame
+    let origin = layout.origin
+    let duotone = c.kind == .text ? appearance?.activeDuotone : nil
+    let face = relief != nil || duotone != nil ? glyphFace(layout.lines) : nil
+    if let relief, let face { ReliefPaint.depth(face, relief, col, unit, in: g) }
     if let outline, outline.style != .none {
-      traceGlyphs(textFrame, outline, origin: path.boundingBoxOfPath.origin, scale: unit, in: g)
+      traceGlyphs(textFrame, outline, origin: origin, scale: unit, in: g)
     }
     CTFrameDraw(textFrame, g)
+    if let duotone, let face {
+      g.setShadow(offset: .zero, blur: 0, color: nil)
+      TextColorPaint.draw(duotone, face: face, in: g)
+    } else if let relief, let face {
+      ReliefPaint.front(face, relief, col, in: g)
+    }
   default: return nil
   }
   return g.makeImage()
@@ -193,19 +257,27 @@ func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil) -> CGImage? {
 private func traceGlyphs(
   _ frame: CTFrame, _ outline: VisualBorder, origin: CGPoint, scale: CGFloat, in g: CGContext
 ) {
-  let lines = CTFrameGetLines(frame) as! [CTLine]
-  guard !lines.isEmpty else { return }
-  var origins = [CGPoint](repeating: .zero, count: lines.count)
-  CTFrameGetLineOrigins(frame, CFRangeMake(0, 0), &origins)
   g.saveGState()
   configureOutline(outline, width: max(0.5, outline.width * scale), in: g)
-  for (line, baseline) in zip(lines, origins) {
-    traceGlyphs(line, baseline: CGPoint(x: origin.x + baseline.x, y: origin.y + baseline.y), in: g)
-  }
+  for (line, baseline) in textLines(frame, origin: origin) { traceGlyphs(line, baseline: baseline, in: g) }
   g.restoreGState()
 }
 
-private func configureOutline(_ outline: VisualBorder, width: CGFloat, in g: CGContext) {
+private func textLines(_ frame: CTFrame, origin: CGPoint) -> [(CTLine, CGPoint)] {
+  let lines = CTFrameGetLines(frame) as! [CTLine]
+  guard !lines.isEmpty else { return [] }
+  var origins = [CGPoint](repeating: .zero, count: lines.count)
+  CTFrameGetLineOrigins(frame, CFRangeMake(0, 0), &origins)
+  return zip(lines, origins).map { ($0, CGPoint(x: origin.x + $1.x, y: origin.y + $1.y)) }
+}
+
+private func glyphFace(_ lines: [(CTLine, CGPoint)]) -> CGPath {
+  let path = CGMutablePath()
+  for (line, baseline) in lines { visitGlyphs(line, baseline: baseline) { path.addPath($0) } }
+  return path
+}
+
+func configureOutline(_ outline: VisualBorder, width: CGFloat, in g: CGContext) {
   g.setStrokeColor(ink(outline.color))
   g.setLineJoin(.round)
   g.setLineWidth(width * 2)
@@ -213,6 +285,13 @@ private func configureOutline(_ outline: VisualBorder, width: CGFloat, in g: CGC
 }
 
 private func traceGlyphs(_ line: CTLine, baseline: CGPoint, in g: CGContext) {
+  visitGlyphs(line, baseline: baseline) {
+    g.addPath($0)
+    g.strokePath()
+  }
+}
+
+private func visitGlyphs(_ line: CTLine, baseline: CGPoint, _ visit: (CGPath) -> Void) {
   for run in CTLineGetGlyphRuns(line) as! [CTRun] {
     let attributes = CTRunGetAttributes(run) as NSDictionary
     guard let font = attributes[kCTFontAttributeName] else { continue }
@@ -223,8 +302,7 @@ private func traceGlyphs(_ line: CTLine, baseline: CGPoint, in g: CGContext) {
       CTRunGetPositions(run, CFRangeMake(index, 1), &position)
       var transform = CGAffineTransform(translationX: baseline.x + position.x, y: baseline.y + position.y)
       if let outlinePath = CTFontCreatePathForGlyph(font as! CTFont, glyph, &transform) {
-        g.addPath(outlinePath)
-        g.strokePath()
+        visit(outlinePath)
       }
     }
   }
@@ -277,18 +355,28 @@ final class FramePainter {
   private let groupedArtwork: [UUID: [Clip]]
   private let clipOrder: [UUID: Int]
   private let trackDepth: [UUID: Int]?
-  private var artworks = [UUID: (text: String, image: CGImage)]()
+  private let audioSignals: [UUID: AudioSignalTrack]
+  private var animatedText = [UUID: (Clip, AnimatedTextLayout)]()
+  private var artworks = [UUID: (text: String, waiting: Bool, image: CGImage)]()
   private var textLayouts = [UUID: (text: String, appearance: TextAppearance, color: String, layout: FixedText)]()
+  private var chartLayouts = [UUID: (
+    spec: ChartSpec, aspect: Double, color: String, appearance: ChartAppearance?, layout: ChartLayout)]()
+  private let finishedCharts: NSCache<NSUUID, CGImage> = {
+    let cache = NSCache<NSUUID, CGImage>()
+    cache.totalCostLimit = 32 * 1024 * 1024
+    return cache
+  }()
   private let filteredStills: NSCache<NSUUID, CGImage> = {
     let cache = NSCache<NSUUID, CGImage>()
     cache.totalCostLimit = 64 * 1024 * 1024
     return cache
   }()
   private let lock = NSLock()
-  init(_ project: Project, _ size: CGSize, preview: Bool = false) {
+  init(_ project: Project, _ size: CGSize, preview: Bool = false, audioSignals: [UUID: AudioSignalTrack] = [:]) {
     self.project = project
     self.size = size
     self.preview = preview
+    self.audioSignals = audioSignals
     trackDepth = project.visualTrackDepth()
     var artworkByGroup: [UUID: [Clip]] = [:]
     for clip in project.clips where !clip.kind.isMedia {
@@ -302,21 +390,22 @@ final class FramePainter {
       motionPreview = FramePainter(
         project,
         CGSize(width: (size.width * scale).rounded(), height: (size.height * scale).rounded()),
-        preview: true)
+        preview: true, audioSignals: audioSignals)
     } else {
       motionPreview = nil
     }
   }
-  private func image(for c: Clip, at frame: Int) -> CGImage? {
+  private func image(for c: Clip, at frame: Int, waitingForReveal: Bool = false) -> CGImage? {
     let text = c.displayedText(at: frame)
     lock.lock()
     defer { lock.unlock() }
-    if let cached = artworks[c.id], cached.text == text { return cached.image }
+    if let cached = artworks[c.id], cached.text == text, cached.waiting == waitingForReveal { return cached.image }
     if artworks.count >= 48 { artworks.removeAll(keepingCapacity: true) }
     var drawing = c
     drawing.text = text
-    guard let result = artwork(drawing, size: size, style: project.captionStyle) else { return nil }
-    artworks[c.id] = (text, result)
+    guard let result = artwork(drawing, size: size, style: project.captionStyle,
+                               waitingForReveal: waitingForReveal) else { return nil }
+    artworks[c.id] = (text, waitingForReveal, result)
     return result
   }
   private func layout(for c: Clip, appearance: TextAppearance, at frame: Int) -> FixedText {
@@ -328,22 +417,35 @@ final class FramePainter {
         return cached.layout
       }
       if textLayouts.count >= 48 { textLayouts.removeAll(keepingCapacity: true) }
-      let layout = FixedText(text, appearance: appearance, color: ink(c.color))
+      let layout = FixedText(text, appearance: appearance, color: ink(c.color), relief: c.relief)
       textLayouts[c.id] = (text, appearance, c.color, layout)
       return layout
     }
   }
-  private func footage(_ picture: Picture, clip: Clip, filters: [ClipFilter]) -> CGImage {
+  private func animationLayout(for clip: Clip) -> AnimatedTextLayout {
+    lock.withLock {
+      if let (original, layout) = animatedText[clip.id], original == clip { return layout }
+      if animatedText.count >= 48 { animatedText.removeAll(keepingCapacity: true) }
+      let layout = AnimatedTextLayout(clip, canvas: size)
+      animatedText[clip.id] = (clip, layout)
+      return layout
+    }
+  }
+  private func footage(
+    _ picture: Picture, clip: Clip, filters: [ClipFilter], cacheable: Bool
+  ) -> CGImage {
     let styles = filters.filter { $0.amount > 0 && $0.look != .camera }
     guard !styles.isEmpty else { return picture.image }
     func filtered() -> CGImage {
       styles.reduce(picture.image) { image, filter in
-        filter.look == .prism
-          ? ChromaticRadial.shift(image, amount: filter.amount)
-          : FootageLook.image(image, look: filter.look, amount: filter.amount)
+        switch filter.look {
+        case .prism: return ChromaticRadial.shift(image, amount: filter.amount)
+        case .backgroundKey: return BackgroundKey.image(image, sensitivity: filter.sensitivity, strength: filter.amount)
+        default: return FootageLook.image(image, look: filter.look, amount: filter.amount)
+        }
       }
     }
-    guard picture.still else { return filtered() }
+    guard picture.still, cacheable else { return filtered() }
     let key = clip.id as NSUUID
     if let cached = filteredStills.object(forKey: key) { return cached }
     let rendered = filtered()
@@ -586,6 +688,101 @@ final class FramePainter {
         progress: progress, in: g, scratch: composite, canvas: rect, preview: preview)
     }
   }
+  func paintCaptions(_ g: CGContext, frame: Int, active: [Clip]) {
+    g.saveGState()
+    defer { g.restoreGState() }
+    prepareCanvas(g)
+    for clip in active where clip.kind == .caption { paintArtwork(clip, frame: frame, in: g) }
+  }
+
+  private func prepareCanvas(_ g: CGContext) {
+    g.clip(to: CGRect(origin: .zero, size: size))
+    g.translateBy(x: 0, y: size.height)
+    g.scaleBy(x: 1, y: -1)
+    g.interpolationQuality = .medium
+  }
+
+  private func paintArtwork(_ c: Clip, frame: Int, in g: CGContext) {
+    let W = size.width
+    let H = size.height
+    let sample = bound(frame, c.start, c.end - 1)
+    let placement = c.placement(at: sample, canvas: size)
+    g.saveGState()
+    g.translateBy(x: placement.center.x, y: placement.center.y)
+    g.rotate(by: c.angle * .pi / 180)
+    g.setAlpha(c.opacity)
+    g.scaleBy(x: placement.scale, y: -placement.scale)
+    let unit = min(W, H) / 1080
+    if let style = c.audioVisualization, c.kind == .audioVisual {
+      if let source = style.source, let track = audioSignals[source] {
+        let levels = track.levels(at: sample, style: style)
+        let w = c.w * W, h = c.h * H
+        AudioVisualPaint.draw(levels, style: style, color: c.color,
+                              in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h), context: g)
+      }
+    } else if let spec = c.editorial, c.kind == .editorial {
+      let w = c.w * W, h = c.h * H
+      let rect = CGRect(x: -w / 2, y: -h / 2, width: w, height: h)
+      let progress = spec.progress(frame: sample, clip: c)
+      let opacity = c.opacity * spec.exitOpacity(frame: sample, clip: c)
+      let waiting = progress == 0 && spec.activeMetricReveal != nil
+      if opacity > 0, progress >= 1 || waiting, let image = image(for: c, at: sample, waitingForReveal: waiting) {
+        g.setAlpha(opacity)
+        g.draw(image, in: rect)
+      } else if opacity > 0 {
+        g.setAlpha(opacity)
+        if opacity < 1 { g.beginTransparencyLayer(auxiliaryInfo: nil) }
+        EditorialPaint.draw(spec, title: c.text, accent: c.color, in: rect, progress: progress, context: g)
+        if opacity < 1 { g.endTransparencyLayer() }
+      }
+    } else if let chart = c.chart, c.kind == .chart {
+      let w = c.w * W, h = c.h * H
+      paintChart(c, spec: chart, progress: chart.progress(at: sample, in: c),
+                 frame: CGRect(x: -w / 2, y: -h / 2, width: w, height: h), in: g)
+    } else if c.kind == .text, let animation = c.textAnimation, animation.enabled {
+      animationLayout(for: c).draw(c, animation: animation, frame: sample, in: g)
+    } else if (c.kind == .text || c.kind == .timer), var appearance = c.textAppearance, appearance.usesFixedSize {
+      if c.kind != .text { appearance.duotone = nil }
+      layout(for: c, appearance: appearance, at: sample)
+        .draw(appearance, unit: unit, relief: c.relief, color: ink(c.color), in: g)
+    } else if let image = image(for: c, at: sample) {
+      if let shadow = c.textAppearance?.shadow, shadow.enabled && shadow.opacity > 0 {
+        setTextShadow(shadow, unit: unit, in: g)
+      }
+      let w = c.w * W
+      let h = artHeight(c, size: size, style: project.captionStyle)
+      g.draw(image, in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
+    }
+    g.restoreGState()
+  }
+
+  private func paintChart(_ c: Clip, spec: ChartSpec, progress: Double, frame: CGRect, in g: CGContext) {
+    let aspect = Double(frame.width / frame.height)
+    let layout = lock.withLock {
+      if let cached = chartLayouts[c.id], cached.spec == spec, cached.aspect == aspect,
+        cached.color == c.color, cached.appearance == c.chartAppearance
+      {
+        return cached.layout
+      }
+      if chartLayouts.count >= 8 { chartLayouts.removeAll(keepingCapacity: true) }
+      let layout = ChartLayout(spec, color: c.color, aspect: aspect, appearance: c.chartAppearance)
+      chartLayouts[c.id] = (spec, aspect, c.color, c.chartAppearance, layout)
+      return layout
+    }
+    if progress >= 1 {
+      if let image = finishedCharts.object(forKey: layout.id) {
+        g.draw(image, in: layout.fitted(to: frame))
+        return
+      }
+      if let image = layout.snapshot() {
+        finishedCharts.setObject(image, forKey: layout.id, cost: image.bytesPerRow * image.height)
+        g.draw(image, in: layout.fitted(to: frame))
+        return
+      }
+    }
+    layout.draw(in: frame, progress: progress, context: g)
+  }
+
   private func paintScene(_ g: CGContext, frame: Int, active: [Clip], source: (UUID, CGSize) -> Picture?) {
     let W = size.width
     let H = size.height
@@ -594,23 +791,33 @@ final class FramePainter {
     defer { g.restoreGState() }
     g.setFillColor(ink(project.background))
     g.fill(r)
-    g.clip(to: r)
-    g.translateBy(x: 0, y: H)
-    g.scaleBy(x: 1, y: -1)
-    g.interpolationQuality = .medium
+    prepareCanvas(g)
     func paintVideo(_ c: Clip) {
       guard let p = source(c.id, size) else { return }
       g.saveGState()
-      let m = c.motionOffset(at: frame, size: size)
-      let filters = c.filters
-      let im = footage(p, clip: c, filters: filters)
+      var cacheable = true
+      let filters = c.filters.map { filter in
+        var current = filter
+        current.amount = c.filterIntensity(filter, at: frame)
+        if filter.look != .camera && current.amount != filter.amount { cacheable = false }
+        return current
+      }
+      let im = footage(p, clip: c, filters: filters, cacheable: cacheable)
       let src = CGRect(x: 0, y: 0, width: im.width, height: im.height)
       let oriented = src.applying(p.transform)
       let layout = VisualGeometry(clip: c, canvas: size, aspect: oriented.width / oriented.height)
-      g.translateBy(x: c.x * W + m.x, y: c.y * H + m.y)
+      let placement = c.placement(at: frame, canvas: size, geometry: layout)
+      g.translateBy(x: placement.center.x, y: placement.center.y)
       g.rotate(by: c.angle * .pi / 180)
+      g.scaleBy(x: placement.scale, y: placement.scale)
       g.setAlpha(c.opacity)
-      g.clip(to: layout.visible)
+      if let inset = c.pictureInset {
+        g.addPath(inset.shape.path(layout.visible))
+        g.clip()
+      } else { g.clip(to: layout.visible) }
+      let matteOverlays = filters.contains { $0.look == .backgroundKey && $0.amount > 0 }
+        && filters.contains { $0.look == .vhs && $0.amount > 0 }
+      if matteOverlays { g.beginTransparencyLayer(auxiliaryInfo: nil) }
       g.saveGState()
       g.translateBy(x: layout.full.minX, y: layout.full.minY)
       g.scaleBy(x: layout.full.width / oriented.width, y: layout.full.height / oriented.height)
@@ -621,38 +828,24 @@ final class FramePainter {
       g.draw(im, in: src)
       g.restoreGState()
       for filter in filters {
+        if matteOverlays && filter.look == .vhs { g.setBlendMode(.sourceAtop) }
         FootageLook.drawOverlay(
           filter.look, amount: filter.amount, in: g, rect: layout.visible,
           frame: max(0, frame - c.start))
+        if matteOverlays && filter.look == .vhs { g.setBlendMode(.normal) }
       }
+      if matteOverlays { g.endTransparencyLayer() }
       if let border = c.visualBorder, border.style != .none {
         let line = min(
           border.width * min(W, H) / 1080, min(layout.visible.width, layout.visible.height))
         g.setStrokeColor(ink(border.color))
         g.setLineWidth(line)
         if border.style == .dashed { g.setLineDash(phase: 0, lengths: [4 * line, 2.5 * line]) }
-        g.stroke(layout.visible.insetBy(dx: line / 2, dy: line / 2))
-      }
-      g.restoreGState()
-    }
-    func paintArt(_ c: Clip) {
-      let sample = bound(frame, c.start, c.end - 1)
-      let m = c.motionOffset(at: sample, size: size)
-      g.saveGState()
-      g.translateBy(x: c.x * W + m.x, y: c.y * H + m.y)
-      g.rotate(by: c.angle * .pi / 180)
-      g.setAlpha(c.opacity)
-      g.scaleBy(x: 1, y: -1)
-      let unit = min(W, H) / 1080
-      if (c.kind == .text || c.kind == .timer), let appearance = c.textAppearance, appearance.usesFixedSize {
-        layout(for: c, appearance: appearance, at: sample).draw(appearance, unit: unit, in: g)
-      } else if let image = image(for: c, at: sample) {
-        if let shadow = c.textAppearance?.shadow, shadow.enabled && shadow.opacity > 0 {
-          setTextShadow(shadow, unit: unit, in: g)
-        }
-        let w = c.w * W
-        let h = artHeight(c, size: size, style: project.captionStyle)
-        g.draw(image, in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
+        let frame = layout.visible.insetBy(dx: line / 2, dy: line / 2)
+        if let inset = c.pictureInset {
+          g.addPath(inset.shape.path(frame))
+          g.strokePath()
+        } else { g.stroke(frame) }
       }
       g.restoreGState()
     }
@@ -671,7 +864,10 @@ final class FramePainter {
         g.scaleBy(x: 1, y: -1)
         g.draw(patch.image, in: patch.destination)
         g.restoreGState()
-        let stroke = max(1, min(W, H) * 0.0035)
+        let stroke = min(
+          min(box.width, box.height) / 2,
+          clip.lensBorderWidth.map { $0 * min(W, H) / 1080 } ?? max(1, min(W, H) * 0.0035))
+        guard stroke > 0 else { continue }
         g.saveGState()
         g.addPath(path)
         g.clip()
@@ -683,9 +879,11 @@ final class FramePainter {
       }
     }
     func paintHighlights(_ lights: [Clip]) {
-      guard let darkness = lights.map(\.opacity).max(), darkness > 0 else { return }
+      let active = lights.map { ($0, $0.highlightOpacity(at: bound(frame, $0.start, $0.end - 1))) }
+        .filter { $0.1 > 0 }
+      guard let darkness = active.map({ $0.1 }).max() else { return }
       g.saveGState()
-      for c in lights {
+      for (c, _) in active {
         g.beginPath()
         g.addRect(r)
         g.addPath(
@@ -705,17 +903,22 @@ final class FramePainter {
         case .zoom: paintLenses([clip])
         case .highlight: paintHighlights([clip])
         case .audio, .caption: break
-        default: paintArt(clip)
+        default: paintArtwork(clip, frame: frame, in: g)
         }
       }
     } else {
-      for clip in active where clip.kind == .video { paintVideo(clip) }
+      for clip in active where clip.kind == .video && clip.pictureInset == nil { paintVideo(clip) }
       for clip in active where clip.kind.isArt && !clip.kind.isRegion && clip.kind != .caption {
-        paintArt(clip)
+        paintArtwork(clip, frame: frame, in: g)
       }
       paintLenses(active.filter { $0.kind == .zoom })
-      paintHighlights(active.filter { $0.kind == .highlight })
+      let lights = active.filter { $0.kind == .highlight }
+      paintHighlights(lights.filter { $0.highlightFadeIn != true && $0.highlightFadeOut != true })
+      for light in lights where light.highlightFadeIn == true || light.highlightFadeOut == true {
+        paintHighlights([light])
+      }
+      for clip in active where clip.kind == .video && clip.pictureInset != nil { paintVideo(clip) }
     }
-    for clip in active where clip.kind == .caption { paintArt(clip) }
+    for clip in active where clip.kind == .caption { paintArtwork(clip, frame: frame, in: g) }
   }
 }

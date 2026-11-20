@@ -104,13 +104,28 @@ struct ClipLane: NSViewRepresentable {
               from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
           }
           if box.width > labelX + 25 {
-            let title = p.hasAudio && k == .video ? p.name + " · 含音频" : p.name
+            let title = p.hasAudio && k == .video ? p.name + L(" · 含音频") : p.name
             (title as NSString).draw(
               in: NSRect(x: box.minX + labelX, y: 7, width: box.width - labelX - 5, height: 15),
               withAttributes: Self.label)
           }
         }
         if selected && data.selection.count == 1 && box.width > 18 {
+          if let reveal = p.clip.editorial?.activeMetricReveal, reveal.offsetFrames >= 0 {
+            let leading = pressed?.id == p.clip.id && edge < 0 ? full.minX - delta : full.minX
+            let x = leading + Double(reveal.offsetFrames) * data.per
+            if x >= box.minX && x < box.maxX {
+              let y = box.maxY - 4
+              let cue = NSBezierPath()
+              cue.move(to: CGPoint(x: x, y: y - 3))
+              cue.line(to: CGPoint(x: x + 3, y: y))
+              cue.line(to: CGPoint(x: x, y: y + 3))
+              cue.line(to: CGPoint(x: x - 3, y: y))
+              cue.close()
+              NSColor(UI.mint).setFill()
+              cue.fill()
+            }
+          }
           NSColor.white.setFill()
           for x in [box.minX + 3, box.maxX - 5] {
             NSBezierPath(
@@ -159,10 +174,10 @@ struct ClipLane: NSViewRepresentable {
         button.setAccessibilityRole(.button)
         button.setAccessibilityParent(self)
         button.setAccessibilityFrame(window.convertToScreen(convert(box, to: nil)))
-        let audio = p.hasAudio ? (p.clip.volume == 0 ? "，已静音" : "，含音频") : ""
-        let group = p.clip.groupID == nil ? "" : "，已编组"
+        let audio = p.hasAudio ? (p.clip.volume == 0 ? L("，已静音") : L("，含音频")) : ""
+        let group = p.clip.groupID == nil ? "" : L("，已编组")
         button.setAccessibilityLabel(p.name + "  " + tc(p.clip.start) + " – " + tc(p.clip.end) + audio + group)
-        button.setAccessibilityValue(d.selection.contains(p.clip.id) ? "已选" : "")
+        button.setAccessibilityValue(d.selection.contains(p.clip.id) ? L("已选") : "")
         button.select = { [weak editor] in
           editor?.selected = p.clip.id
           editor?.seek(p.clip.start)
@@ -194,16 +209,16 @@ struct ClipLane: NSViewRepresentable {
       }
       if let clip {
         editor.selectForClipMenu(clip.id)
-        add("剪切", #selector(cutClips), shortcut: "x")
-        add("复制", #selector(copyClips), shortcut: "c")
+        add(L("剪切"), #selector(cutClips), shortcut: "x")
+        add(L("复制"), #selector(copyClips), shortcut: "c")
       }
-      add("粘贴", #selector(pasteClips), shortcut: "v", enabled: editor.canPasteClips)
+      add(L("粘贴"), #selector(pasteClips), shortcut: "v", enabled: editor.canPasteClips)
       if let clip {
-        add("删除", #selector(deleteClips))
+        add(L("删除"), #selector(deleteClips))
         menu.addItem(.separator())
-        add("复制属性", #selector(copyProperties(_:)))
+        add(L("复制属性"), #selector(copyProperties(_:)))
         menu.items.last?.representedObject = clip.id
-        add("粘贴属性", #selector(pasteProperties), enabled: editor.hasCopiedProperties)
+        add(L("粘贴属性"), #selector(pasteProperties), enabled: editor.hasCopiedProperties)
       }
       return menu
     }

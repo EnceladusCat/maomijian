@@ -18,6 +18,7 @@ final class ShelfState: ObservableObject {
   }
   @Published var transitionSection = TransitionSection.effects
   @Published var dropTargets: [TransitionTarget] = []
+  let chartDataEdits = PassthroughSubject<UUID, Never>()
 }
 final class PanelUpdates: ObservableObject {
   private var subscriptions = Set<AnyCancellable>()
@@ -32,12 +33,21 @@ final class PanelUpdates: ObservableObject {
       let previous = editor.p
       switch tab {
       case .captions:
-        if next.captionStyle != previous.captionStyle { changed() }
+        if next.captionStyle != previous.captionStyle || next.captionTerms != previous.captionTerms
+          || next.clips != previous.clips || next.assets != previous.assets { changed() }
       case .filters:
         if previous.clips.filter({ $0.kind == .video }) != next.clips.filter({ $0.kind == .video })
         {
           changed()
         }
+      case .charts:
+        if previous.clips.filter({ $0.kind == .chart }) != next.clips.filter({ $0.kind == .chart }) {
+          changed()
+        }
+      case .quickEdit:
+        if next.clips != previous.clips { changed() }
+      case .annotations:
+        if next.assets != previous.assets || next.clips != previous.clips { changed() }
       case .media:
         if next.assets != previous.assets { changed() }
       case .transitions:
@@ -56,7 +66,7 @@ final class PanelUpdates: ObservableObject {
       editor.$libraryIDs.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
       editor.$thumbnails.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
     }
-    if tab == .filters {
+    if tab == .filters || tab == .captions || tab == .charts || tab == .quickEdit || tab == .annotations {
       editor.$selectedIDs.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
     }
     if tab == .transitions {
@@ -75,7 +85,7 @@ final class PanelUpdates: ObservableObject {
 }
 final class PreviewStatus: ObservableObject {
   @Published var busy = false
-  @Published var message = "就绪"
+  @Published var message = L("就绪")
 }
 final class Editor: ObservableObject {
   private static let timelineClipboardType = NSPasteboard.PasteboardType("local.framecut.timeline-clips.v1")
@@ -96,13 +106,18 @@ final class Editor: ObservableObject {
   @Published var drawShape = RegionShape.rectangle
   @Published var regionTool: Kind?
   @Published var cropID: UUID?
+  @Published private(set) var pathDrawingID: UUID?
   @Published private(set) var mediaSizes = [UUID: CGSize]()
   private var pendingAudition: Range<Int>?
   private var auditionEnd: Int?
   private var scrubSession: UUID?
   private var scrubFrame: Int?
   private var seekInFlight = false
-  @Published var selectedIDs: [UUID] = []
+  @Published var selectedIDs: [UUID] = [] {
+    didSet {
+      if let pathDrawingID, selectedIDs != [pathDrawingID] { cancelPathDrawing() }
+    }
+  }
   @Published var libraryIDs: [UUID] = []
   var libraryFocus = false
   private var timelineAnchor: UUID?, libraryAnchor: UUID?
@@ -142,7 +157,7 @@ final class Editor: ObservableObject {
     guard item.setData(data, forType: Self.timelineClipboardType) else { return false }
     clipboard.clearContents()
     guard clipboard.writeObjects([item]) else { return false }
-    status = "已复制 \(payload.clips.count) 个片段"
+    status = L("已复制 \(payload.clips.count) 个片段")
     return true
   }
   func cutClips() {
@@ -171,7 +186,7 @@ final class Editor: ObservableObject {
   func copyProperties(from id: UUID) {
     guard let source = p.clips.first(where: { $0.id == id }) else { return }
     copiedProperties = (source, source.kind.isMedia && p.asset(source.asset)?.audio == true)
-    status = "已复制片段属性"
+    status = L("已复制片段属性")
   }
   var hasCopiedProperties: Bool { copiedProperties != nil }
   func pasteProperties() {
@@ -188,7 +203,7 @@ final class Editor: ObservableObject {
         matched += 1
       }
     }
-    status = matched > 0 ? "已粘贴 \(matched) 个片段的属性" : "所选片段没有可以共用的属性"
+    status = matched > 0 ? L("已粘贴 \(matched) 个片段的属性") : L("所选片段没有可以共用的属性")
   }
   var isWholeGroupSelected: Bool {
     guard let id = selectedClips.first?.groupID else { return false }
@@ -281,6 +296,7 @@ final class Editor: ObservableObject {
   }
   @Published var url: URL?
   @Published var error: String?
+  weak var workspaceWindow: NSWindow?
   let previewStatus = PreviewStatus()
   var status: String {
     get { previewStatus.message }
@@ -296,10 +312,12 @@ final class Editor: ObservableObject {
   private var exportSettings = ExportSettings()
   @Published var thumbnails = [UUID: NSImage]()
   let waveforms = WaveformStore()
+  let automaticCaptions = AutomaticCaptions()
   let transport = Transport(), player = AVPlayer()
   let liveCanvas = LiveCanvasPreview()
   private var baseline = Project(), undoStack = [Project](), redoStack = [Project](),
     observer: Any?, itemObservation: NSKeyValueObservation?
+  private let recovery = ProjectRecovery()
   private var graphSnapshot: Project?, previewGraph: MediaGraph?
   private var previewComposition: Composition?
   private var buildTicket: Progress?
@@ -390,6 +408,7 @@ final class Editor: ObservableObject {
       toleranceAfter: .zero)
   }
   func play() {
+    cancelPathDrawing()
     liveCanvas.clear()
     if scrubSession != nil { seek(transport.frame) }
     if transport.playing {
@@ -410,6 +429,7 @@ final class Editor: ObservableObject {
   func change(keepingCanvasFrame: Bool = false, _ body: (inout Project) -> Void) {
     var next = p
     body(&next)
+    next.syncAudioVisualizations()
     guard next != p else { return }
     do { _ = try next.checked() } catch {
       self.error = error.localizedDescription
@@ -421,7 +441,9 @@ final class Editor: ObservableObject {
     install(next, keepingCanvasFrame: keepingCanvasFrame)
   }
   private func install(_ project: Project, keepingCanvasFrame: Bool = false) {
+    cancelPathDrawing()
     pause()
+    let previousProjectWasDirty = dirty
     var next = project
     let previous = p.assets == next.assets ? [:] : Dictionary(
       uniqueKeysWithValues: p.assets.map { ($0.id, $0) })
@@ -444,6 +466,13 @@ final class Editor: ObservableObject {
     if selectedIDs != selection { selectedIDs = selection }
     if !libraryIDs.allSatisfy(assets.contains) { libraryIDs.removeAll { !assets.contains($0) } }
     if transport.frame > p.duration { transport.frame = p.duration }
+    if dirty {
+      recovery.schedule(
+        RecoveryDraft(project: p, original: url, frame: transport.frame, savedAt: Date())
+      ) { [weak self] _ in self?.status = L("无法自动保存草稿，请手动保存工程") }
+    } else if previousProjectWasDirty {
+      recovery.discard()
+    }
     rebuild(keepingCanvasFrame: keepingCanvasFrame)
     if !previous.isEmpty {
       for asset in next.assets where previous[asset.id] != asset { loadWaveform(asset) }
@@ -477,7 +506,7 @@ final class Editor: ObservableObject {
       liveCanvas.clear()
       player.replaceCurrentItem(with: nil)
       busy = false
-      status = "就绪"
+      status = L("就绪")
       return
     }
     let reuse = graphSnapshot.flatMap { previous -> MediaGraph? in
@@ -488,7 +517,7 @@ final class Editor: ObservableObject {
         ? previewGraph : nil
     }
     busy = true
-    if reuse == nil { status = "正在准备预览" }
+    if reuse == nil { status = L("正在准备预览") }
     let existingItem = reuse == nil ? nil : player.currentItem
     let playback = transport.playback
     let work = DispatchWorkItem { [weak self] in
@@ -519,13 +548,13 @@ final class Editor: ObservableObject {
             if item.status == .failed {
               DispatchQueue.main.async {
                 guard let self, self.revision == n else { return }
-                self.status = "预览失败"
-                self.error = item.error?.localizedDescription ?? "系统无法解码该媒体。"
+                self.status = L("预览失败")
+                self.error = item.error?.localizedDescription ?? L("系统无法解码该媒体。")
               }
             }
           }
           self.position()
-          self.status = "就绪"
+          self.status = L("就绪")
           self.didPrepare()
         case .failure(let e):
           self.previewGraph = nil
@@ -534,7 +563,7 @@ final class Editor: ObservableObject {
           self.liveCanvas.clear()
           self.pause()
           self.player.replaceCurrentItem(with: nil)
-          self.status = "预览未就绪"
+          self.status = L("预览未就绪")
           self.error = e.localizedDescription
         }
       }
@@ -547,7 +576,7 @@ final class Editor: ObservableObject {
       playWhenReady = false
       player.play()
     } else if let range = pendingAudition {
-      previewTransition(range)
+      previewRange(range)
     }
   }
   func edit(_ id: UUID, _ body: (inout Clip) -> Void) {
@@ -578,6 +607,7 @@ final class Editor: ObservableObject {
   }
   func beginCrop(_ c: Clip) {
     guard c.kind == .video else { return }
+    cancelPathDrawing()
     regionTool = nil
     if cropID == c.id {
       cropID = nil
@@ -587,9 +617,42 @@ final class Editor: ObservableObject {
     if !(c.start..<c.end).contains(transport.frame) { seek(c.start) }
     cropID = c.id
   }
+  func beginPathDrawing(for id: UUID) {
+    guard selectedIDs == [id], let c = clip, c.supportsMotion, c.length > 1 else { return }
+    regionTool = nil
+    cropID = nil
+    seek(c.start)
+    pathDrawingID = id
+  }
+
+  func cancelPathDrawing() {
+    if pathDrawingID != nil { pathDrawingID = nil }
+  }
+
+  func finishPathDrawing(for id: UUID, stroke: [CGPoint], canvas: CGSize) {
+    guard pathDrawingID == id, selectedIDs == [id], let first = stroke.first,
+      let path = MotionPath(stroke: stroke, in: canvas) else { return }
+    cancelPathDrawing()
+    edit(id) { clip in
+      if clip.motion == .slide { clip.slideFrames = clip.entranceFrames }
+      clip.motion = .path
+      clip.motionPath = path
+      clip.x = bound(first.x / canvas.width, 0, 1)
+      clip.y = bound(first.y / canvas.height, 0, 1)
+    }
+  }
+
+  func previewPath(_ c: Clip) { previewRange(c.start..<c.end) }
+
   func addFilter(_ look: FootageFilter) {
     guard look != .none else { return }
-    editSelectedFilters { $0.append(ClipFilter(look: look)) }
+    editSelectedFilters { filters in
+      if look == .backgroundKey {
+        if !filters.contains(where: { $0.look == .backgroundKey }) { filters.insert(ClipFilter(look: look), at: 0) }
+      } else {
+        filters.append(ClipFilter(look: look))
+      }
+    }
   }
 
   func editSelectedFilters(_ edit: (inout [ClipFilter]) -> Void) {
@@ -611,6 +674,8 @@ final class Editor: ObservableObject {
     }
   }
   func add(_ kind: Kind) {
+    guard kind != .chart && kind != .editorial && kind != .audioVisual else { return }
+    cancelPathDrawing()
     if cropID != nil { cropID = nil }
     pause()
     if regionTool != nil { regionTool = nil }
@@ -618,9 +683,146 @@ final class Editor: ObservableObject {
       regionTool = kind
       return
     }
-    let start = transport.frame
-    var c = Clip.annotation(kind, at: start)
-    c.length = min(c.length, maxFrames - start)
+    insertAnnotation(Clip.annotation(kind, at: min(transport.frame, maxFrames - 1)))
+  }
+  func addChart(_ chart: ChartSpec, appearance: ChartAppearance?, color: String) {
+    guard chart.valid else { return }
+    pause()
+    cropID = nil
+    regionTool = nil
+    var clip = Clip.annotation(.chart, at: min(transport.frame, maxFrames - 1))
+    let size = p.canvas.size(540)
+    clip.h = min(0.72, clip.w * size.width / size.height * 0.72)
+    clip.chart = chart
+    clip.chartAppearance = appearance
+    clip.color = color
+    insertAnnotation(clip)
+  }
+  var audioVisualizationSource: Clip? {
+    guard let clip, clip.kind.isMedia, p.asset(clip.asset)?.audio == true else { return nil }
+    return clip
+  }
+  func addAudioVisualization(_ style: AudioVisualStyle) {
+    guard let source = audioVisualizationSource else { return }
+    var next = p
+    guard let id = next.addAudioVisualization(for: source.id, style: style) else { return }
+    cropID = nil
+    regionTool = nil
+    change { $0 = next }
+    selected = id
+    if !(source.start..<source.end).contains(transport.frame) { seek(source.start) }
+  }
+  func addEditorial(_ style: EditorialStyle) {
+    pause()
+    cropID = nil
+    regionTool = nil
+    insertAnnotation(style.clip(at: min(transport.frame, maxFrames - 1)))
+  }
+
+  func useQuickMetricStyle(reveal: Bool) {
+    pause()
+    cropID = nil
+    regionTool = nil
+    let frame = min(transport.frame, maxFrames - 1)
+    let single = selectedIDs.count == 1 ? selected : nil
+    var id: UUID?
+    change { project in id = project.useQuickMetricStyle(reveal: reveal, selected: single, at: frame) }
+    selected = id
+  }
+
+  func alignMetricRevealToPlayhead(_ id: UUID) {
+    let frame = transport.frame
+    guard let clip = p.clips.first(where: { $0.id == id }), clip.editorial?.activeMetricReveal != nil else { return }
+    guard (clip.start..<clip.end).contains(frame) else {
+      status = L("请把播放头移到数字片段内。")
+      return
+    }
+    edit(id) { $0.editorial?.metricReveal?.offsetFrames = frame - clip.start }
+    status = L("已对齐揭晓时刻 \(tc(frame))")
+  }
+  var pictureInsetSelection: (host: Clip, backdrop: Clip?)? {
+    guard let clip, clip.kind == .video, clip.pictureInset == nil else { return nil }
+    if selectedIDs.count == 1 { return (clip, nil) }
+    if selectedIDs.count == 2, let other = selectedClips.first(where: {
+      $0.id != clip.id && $0.kind == .video && $0.start < clip.end && clip.start < $0.end
+    }) { return (clip, other) }
+    return nil
+  }
+  func enablePictureInset() {
+    guard let selection = pictureInsetSelection else { return }
+    cropID = nil
+    var next = p
+    guard let id = next.applyPictureInset(to: selection.host.id, over: selection.backdrop?.id),
+      let inset = next.clips.first(where: { $0.id == id })
+    else { return }
+    change { $0 = next }
+    selected = id
+    if !(inset.start..<inset.end).contains(transport.frame) { seek(inset.start) }
+  }
+  func applyDataStory() {
+    if selectedIDs.count == 1, let clip, clip.kind == .chart {
+      if !(clip.start..<clip.end).contains(transport.frame) { seek(clip.start) }
+      edit(clip.id) { $0.applyDataStoryStyle() }
+      return
+    }
+    let points = [18.0, 23, 17, 28, 25, 34, 31, 46].enumerated().map {
+      ChartPoint(label: String($0.offset + 1), y: $0.element)
+    }
+    let spec = ChartSpec(kind: .line, title: L("示例走势"), points: points,
+                         marker: ChartMarker(row: 5, title: L("关键节点")))
+    addChart(spec, appearance: ChartAppearance(backgroundOpacity: 0.87, areaFill: true),
+             color: "#B29BFF")
+  }
+  func editChartData(_ clip: Clip) {
+    guard let chart = p.clips.first(where: { $0.id == clip.id })?.chart, let window = sheetWindow else { return }
+    pause()
+    let sheet = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 540, height: 420),
+                        styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+    sheet.minSize = CGSize(width: 390, height: 280)
+    sheet.appearance = NSAppearance(named: .darkAqua)
+    sheet.title = L("编辑图表数据")
+    let close = { [weak window, weak sheet] in if let sheet { window?.endSheet(sheet) } }
+    let generation = generation
+    sheet.contentView = NSHostingView(rootView: ChartDataEditor(chart: chart, cancel: close) { [weak self] updated in
+      close()
+      guard let self, self.generation == generation, updated != chart else { return }
+      self.edit(clip.id) { $0.chart = updated }
+      self.shelf.chartDataEdits.send(clip.id)
+    })
+    window.beginSheet(sheet) { _ in sheet.contentView = nil }
+  }
+  func editEditorialCards(_ clip: Clip) {
+    guard let clip = p.clips.first(where: { $0.id == clip.id }),
+      let spec = clip.editorial, spec.style == .cards, let window = sheetWindow else { return }
+    pause()
+    let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 840, height: 517),
+                        styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+    panel.minSize = CGSize(width: 675, height: 480)
+    panel.appearance = NSAppearance(named: .darkAqua)
+    panel.title = L("编辑三张卡片")
+    let close = { [weak window, weak panel] in if let panel { window?.endSheet(panel) } }
+    let generation = generation
+    let size = p.canvas.size(540)
+    panel.contentView = NSHostingView(rootView: EditorialCardEditor(
+      spec: spec, title: clip.text, accent: clip.color,
+      aspect: (size.width * clip.w) / (size.height * clip.h), background: p.background, cancel: close,
+      chooseImage: { [weak panel] complete in
+        guard let panel else { complete(nil); return }
+        let picker = NSOpenPanel()
+        picker.allowedContentTypes = [.image]
+        picker.allowsMultipleSelection = false
+        picker.beginSheetModal(for: panel) { response in complete(response == .OK ? picker.url : nil) }
+      }
+    ) { [weak self] cards in
+      close()
+      guard let self, self.generation == generation, cards != spec.cards else { return }
+      self.edit(clip.id) { $0.editorial?.cards = cards }
+    })
+    window.beginSheet(panel) { _ in panel.contentView = nil }
+  }
+  private func insertAnnotation(_ clip: Clip) {
+    var c = clip
+    c.length = min(c.length, maxFrames - c.start)
     change { $0.clips.append(c) }
     selected = c.id
   }
@@ -631,7 +833,7 @@ final class Editor: ObservableObject {
     var clips: [Clip] = []
     for asset in assets {
       guard asset.frames <= maxFrames - cursor else {
-        error = "素材超出工程时长上限。"
+        error = L("素材超出工程时长上限。")
         return
       }
       clips.append(
@@ -652,7 +854,7 @@ final class Editor: ObservableObject {
   }
   func insertSound(_ sound: BuiltInSound) {
     guard let url = sound.url else {
-      error = "找不到内置音效 " + sound.rawValue
+      error = L("找不到内置音效 ") + sound.name
       return
     }
     let asset =
@@ -662,10 +864,10 @@ final class Editor: ObservableObject {
     append(asset, at: transport.frame)
   }
   var canBatchCut: Bool {
-    !selectedIDs.isEmpty && selectedClips.allSatisfy { $0.kind.isMedia }
+    !selectedIDs.isEmpty
   }
   func batchCut() {
-    guard canBatchCut, let window = NSApp.keyWindow, window.attachedSheet == nil else { return }
+    guard canBatchCut, let window = sheetWindow else { return }
     pause()
     let snapshot = p
     let clips = selectedClips.sorted { $0.start < $1.start }
@@ -675,12 +877,12 @@ final class Editor: ObservableObject {
       styleMask: [.titled, .resizable], backing: .buffered, defer: false)
     sheet.minSize = CGSize(width: 840, height: 480)
     sheet.appearance = NSAppearance(named: .darkAqua)
-    sheet.title = "批量切割"
+    sheet.title = L("批量切割")
     let cancel = { [weak window, weak sheet] in if let sheet { window?.endSheet(sheet) } }
     sheet.contentView = NSHostingView(
       rootView: BatchCutPanel(draft: draft, cancel: cancel) { plan in
         guard self.p == snapshot else {
-          draft.message = "工程已改动，请重新打开批量切割。"
+          draft.message = L("工程已改动，请重新打开批量切割。")
           return
         }
         do {
@@ -698,7 +900,7 @@ final class Editor: ObservableObject {
     let f = transport.frame
     let ids = selectedClips.filter { $0.start < f && f < $0.end }.map(\.id)
     guard !ids.isEmpty else {
-      status = "请把播放头移到所选片段的中间"
+      status = L("请把播放头移到所选片段的中间")
       return
     }
     var pieces: [UUID] = selectedIDs.filter { !ids.contains($0) }
@@ -759,6 +961,11 @@ final class Editor: ObservableObject {
     let id = c.id
     c.id = UUID()
     c.kind = .audio
+    if c.motion == .path {
+      c.motion = .none
+      c.motionPath = nil
+    }
+    c.pictureInset = nil
     c.from = nil
     change { p in
       if let i = p.clips.firstIndex(where: { $0.id == id }) {
@@ -815,7 +1022,7 @@ final class Editor: ObservableObject {
     }
     let targets = TransitionTarget.cardTargets(for: selectedClips)
     guard !targets.isEmpty else {
-      status = "把效果拖到时间线上的视频或图片"
+      status = L("把效果拖到时间线上的视频或图片")
       return
     }
     placeTransition(style, on: targets)
@@ -832,16 +1039,16 @@ final class Editor: ObservableObject {
     switch target {
     case .join(let id):
       guard let join = p.joins.first(where: { $0.id == id && $0.active }) else { return }
-      previewTransition(
+      previewRange(
         max(join.before.start, join.range.lowerBound - 7)..<min(join.after.end, join.range.upperBound + 9))
     case .edge(let edge):
       guard let clip = p.clips.first(where: { $0.id == edge.clipID }),
         let range = clip.transitionRange(at: edge.end)
       else { return }
-      previewTransition(max(0, range.lowerBound - 7)..<min(p.duration, range.upperBound + 9))
+      previewRange(max(0, range.lowerBound - 7)..<min(p.duration, range.upperBound + 9))
     }
   }
-  private func previewTransition(_ range: Range<Int>) {
+  private func previewRange(_ range: Range<Int>) {
     if busy {
       pendingAudition = range
       return
@@ -867,11 +1074,16 @@ final class Editor: ObservableObject {
   func move(_ c: Clip, by delta: Int, edge: Int) {
     let range = dragRange(for: c, edge: edge)
     let shift = bound(delta, range.lowerBound, range.upperBound)
+    guard shift != 0 else { return }
     if edge == 0, selectedIDs.count > 1, selectedIDs.contains(c.id) {
       let ids = Set(selectedIDs)
+      let selectedAudio = Set(selectedClips.filter { $0.kind.isMedia }.map(\.audioFamily))
       change { project in
         for index in project.clips.indices where ids.contains(project.clips[index].id) {
           project.clips[index].start += shift
+          if let source = project.clips[index].audioVisualization?.source, !selectedAudio.contains(source) {
+            project.clips[index].audioVisualization?.followsSource = false
+          }
         }
       }
       return
@@ -879,13 +1091,17 @@ final class Editor: ObservableObject {
     let asset = p.asset(c.asset)
     let timedSource = c.kind.isMedia && asset?.isStill != true
     edit(c.id) { v in
+      v.audioVisualization?.followsSource = false
       if edge < 0 {
         v.start = c.start + shift
         v.length = c.length - shift
         if c.kind == .timer { v.timerPhase = (c.timerPhase ?? 0) + shift }
+        v.editorial?.shiftReveal(by: -shift)
+        if shift > 0 { v.motionPath = c.pathMotion(in: v.start..<v.end) }
         if timedSource { v.setSource(c.sourceFrame(at: c.start + shift), c.sourceEnd) }
       } else if edge > 0 {
         v.length = c.length + shift
+        if shift < 0 { v.motionPath = c.pathMotion(in: v.start..<v.end) }
         if timedSource {
           v.setSource(c.sourceIn, c.sourceIn + Double(v.length) * c.effectiveRate)
         }
@@ -990,7 +1206,7 @@ final class Editor: ObservableObject {
       guard replacement.isStill == m.isStill, replacement.isStill || replacement.frames >= needed,
         !m.video || replacement.video,
         !m.audio || replacement.audio
-      else { throw EditError.message("替代素材需要包含原有轨道，且时长要覆盖所有剪辑。") }
+      else { throw EditError.message(L("替代素材需要包含原有轨道，且时长要覆盖所有剪辑。")) }
       change { p in
         if let i = p.assets.firstIndex(where: { $0.id == m.id }) { p.assets[i] = replacement }
       }
@@ -1008,12 +1224,139 @@ final class Editor: ObservableObject {
       seek(list[0].start)
     } catch { self.error = error.localizedDescription }
   }
+  var captionAudioSelection: Clip? {
+    guard selectedIDs.count == 1, let clip, clip.kind.isMedia, clip.volume > 0,
+      let media = p.asset(clip.asset), !media.isStill, media.audio || clip.kind == .audio
+    else { return nil }
+    return clip
+  }
+
+  private func captionAudio(_ id: UUID?) -> (Project, Int)? {
+    var clips = p.clips.filter {
+      $0.kind.isMedia && $0.volume > 0 && (id == nil || $0.id == id)
+        && p.asset($0.asset)?.isStill == false
+    }
+    guard !clips.isEmpty else { return nil }
+    let offset = id == nil ? 0 : clips[0].start
+    for index in clips.indices { clips[index].start -= offset }
+    let ids = Set(clips.compactMap(\.asset))
+    var audio = Project()
+    audio.assets = p.assets.filter { ids.contains($0.id) }
+    audio.clips = clips
+    return (audio, offset)
+  }
+
+  func generateCaptions(language: CaptionLanguage, selection: Bool, replacing: Bool) {
+    let id = selection ? captionAudioSelection?.id : nil
+    guard !selection || id != nil, let (audio, offset) = captionAudio(id) else { return }
+    let terms = (p.captionTerms ?? "").split(whereSeparator: { ",，、;；\n".contains($0) })
+      .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    let generation = generation
+    automaticCaptions.start(project: audio, offset: offset, language: language, terms: Array(terms.prefix(100))) {
+      [weak self] result in
+      guard let self, self.generation == generation else { return }
+      switch result {
+      case .success(let captions):
+        guard let (current, anchor) = self.captionAudio(id), current == audio, offset == anchor else {
+          self.error = L("音频时间线已更改，请重新生成字幕。")
+          return
+        }
+        guard !captions.isEmpty else {
+          self.error = L("这段音频里没有识别出可用的口播。")
+          return
+        }
+        let end = offset + audio.duration
+        var existing = self.p.clips.filter { $0.kind == .caption }
+        if replacing {
+          existing.removeAll { $0.start >= offset && $0.end <= end }
+        }
+        let additions = captions.filter { caption in
+          !existing.contains { $0.start < caption.end && caption.start < $0.end }
+        }
+        let removed = Set(self.p.clips.filter {
+          replacing && $0.kind == .caption && $0.start >= offset && $0.end <= end
+        }.map(\.id))
+        self.change { project in
+          project.clips.removeAll { removed.contains($0.id) }
+          project.clips.append(contentsOf: additions)
+        }
+        self.status = L("已添加 \(additions.count) 条自动字幕")
+          + (captions.count > additions.count ? L("，跳过 \(captions.count - additions.count) 条重叠字幕") : "")
+      case .failure(let error):
+        self.error = L("自动字幕失败。") + error.localizedDescription
+      }
+    }
+  }
+
+  func reviewSubtitles() {
+    guard canExportSubtitles, let window = sheetWindow else { return }
+    let sheet = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 680, height: 476),
+      styleMask: [.titled], backing: .buffered, defer: false)
+    sheet.title = L("批量校对字幕")
+    sheet.appearance = NSAppearance(named: .darkAqua)
+    let generation = generation
+    let view = CaptionReview(
+      captions: p.clips.filter { $0.kind == .caption },
+      seek: { [weak self] in self?.seek($0) },
+      cancel: { [weak window, weak sheet] in if let sheet { window?.endSheet(sheet) } }
+    ) { [weak self, weak window, weak sheet] edited in
+      guard let self, let sheet else { return }
+      window?.endSheet(sheet)
+      guard self.generation == generation else { return }
+      let text = Dictionary(uniqueKeysWithValues: edited.map { ($0.id, $0.text) })
+      self.change { project in
+        for index in project.clips.indices where project.clips[index].kind == .caption {
+          if let replacement = text[project.clips[index].id] { project.clips[index].text = replacement }
+        }
+      }
+    }
+    sheet.contentView = NSHostingView(rootView: view)
+    window.beginSheet(sheet) { _ in sheet.contentView = nil }
+  }
+
+  var canExportSubtitles: Bool { p.clips.contains { $0.kind == .caption } }
+  var canExportAudio: Bool {
+    p.clips.contains { $0.kind.isMedia && $0.volume > 0 && p.asset($0.asset)?.isStill != true }
+  }
+
   func subtitleExport() {
-    let panel = NSSavePanel()
-    panel.nameFieldStringValue = "字幕.srt"
-    guard panel.runModal() == .OK, let u = panel.url else { return }
-    do { try SRT.write(p.clips).write(to: u, atomically: true, encoding: .utf8) } catch {
-      self.error = error.localizedDescription
+    guard canExportSubtitles, let window = exportWindow else { return }
+    chooseExportDestination(on: window, ext: "srt", type: UTType(filenameExtension: "srt") ?? .plainText) {
+      [weak self] destination in
+      guard let self else { return }
+      do {
+        try ExportJob.writeSubtitles(self.p, to: destination)
+        self.status = L("已导出 ") + destination.lastPathComponent
+      } catch { self.error = error.localizedDescription }
+    }
+  }
+
+  func audioExport() {
+    guard canExportAudio, let window = exportWindow else { return }
+    chooseExportDestination(on: window, ext: "m4a", type: .mpeg4Audio) { [weak self] destination in
+      self?.startExport { task, project, report in
+        try task.runAudio(project, to: destination, progress: report)
+        return [destination]
+      }
+    }
+  }
+
+  func audioAndSubtitleExport() {
+    guard canExportAudio, canExportSubtitles, let window = exportWindow else { return }
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.canCreateDirectories = true
+    panel.appearance = NSAppearance(named: .darkAqua)
+    panel.prompt = L("导出到此处")
+    panel.message = L("选择音频和字幕的保存文件夹。")
+    panel.beginSheetModal(for: window) { [weak self] response in
+      guard response == .OK, let folder = panel.url, let self else { return }
+      let name = self.exportName
+      self.startExport { task, project, report in
+        try task.runAudioAndSubtitles(project, in: folder, name: name, progress: report)
+      }
     }
   }
   @discardableResult func save(as copy: Bool = false) -> Bool {
@@ -1021,7 +1364,7 @@ final class Editor: ObservableObject {
     if copy || dest == nil {
       let panel = NSSavePanel()
       panel.allowedContentTypes = [UTType(filenameExtension: "framecut") ?? .json]
-      panel.nameFieldStringValue = url?.lastPathComponent ?? "未命名.framecut"
+      panel.nameFieldStringValue = url?.lastPathComponent ?? L("未命名.framecut")
       guard panel.runModal() == .OK, let u = panel.url else { return false }
       dest = u.pathExtension.isEmpty ? u.appendingPathExtension("framecut") : u
     }
@@ -1029,7 +1372,8 @@ final class Editor: ObservableObject {
       try p.write(to: dest!)
       url = dest
       baseline = p
-      status = "工程已保存"
+      recovery.discard()
+      status = L("工程已保存")
       return true
     } catch {
       self.error = error.localizedDescription
@@ -1038,23 +1382,26 @@ final class Editor: ObservableObject {
   }
   func mayLeave() -> Bool {
     if progress != nil {
-      error = "正在导出。请等待完成或先取消导出。"
+      error = L("正在导出。请等待完成或先取消导出。")
       return false
     }
     guard dirty else { return true }
     let a = NSAlert()
-    a.messageText = "保存当前工程？"
-    a.informativeText = "关闭前可以将这次剪辑保存为工程文件。"
-    a.addButton(withTitle: "保存")
-    a.addButton(withTitle: "取消")
-    a.addButton(withTitle: "放弃更改")
+    a.messageText = L("保存当前工程？")
+    a.informativeText = L("关闭前可以将这次剪辑保存为工程文件。")
+    a.addButton(withTitle: L("保存"))
+    a.addButton(withTitle: L("取消"))
+    a.addButton(withTitle: L("放弃更改"))
     switch a.runModal() {
     case .alertFirstButtonReturn: return save()
-    case .alertThirdButtonReturn: return true
+    case .alertThirdButtonReturn:
+      recovery.discard()
+      return true
     default: return false
     }
   }
-  private func reset(_ next: Project, _ file: URL?) {
+  private func reset(_ next: Project, _ file: URL?, saved: Project? = nil, frame: Int = 0) {
+    automaticCaptions.cancel()
     timelineMarquee.cancel()
     libraryMarquee.cancel()
     graphSnapshot = nil
@@ -1075,10 +1422,39 @@ final class Editor: ObservableObject {
     shelf.dropTargets = []
     lastTransitionStyle = .dissolve
     url = file
-    baseline = next
-    transport.frame = 0
+    baseline = saved ?? next
+    transport.frame = frame
     install(next)
     next.assets.forEach { loadThumb($0) }
+  }
+  func offerRecovery() -> Bool {
+    let draft: RecoveryDraft
+    do {
+      guard let recovered = try recovery.load() else { return false }
+      draft = recovered
+    } catch {
+      self.error = L("无法读取自动保存的草稿。") + error.localizedDescription
+      return false
+    }
+    let saved = draft.original.flatMap { try? Project.read(from: $0) }
+    if saved == draft.project {
+      recovery.discard()
+      return false
+    }
+    let alert = NSAlert()
+    alert.messageText = L("恢复自动保存的草稿？")
+    let name = draft.original?.lastPathComponent ?? L("未命名工程")
+    let date = DateFormatter.localizedString(from: draft.savedAt, dateStyle: .medium, timeStyle: .short)
+    alert.informativeText = L("\(name) 有一份在 \(date) 保存的恢复草稿。恢复后可以继续编辑并手动保存。")
+    alert.addButton(withTitle: L("恢复草稿"))
+    alert.addButton(withTitle: L("放弃草稿"))
+    let choice = alert.runModal()
+    guard choice == .alertFirstButtonReturn else {
+      if choice == .alertSecondButtonReturn { recovery.discard() }
+      return false
+    }
+    reset(draft.project, saved == nil ? nil : draft.original, saved: saved ?? Project(), frame: draft.frame)
+    return true
   }
   func new() { if mayLeave() { reset(Project(), nil) } }
   func open() {
@@ -1092,19 +1468,25 @@ final class Editor: ObservableObject {
       if mayLeave() { reset(next, u) }
     } catch { self.error = error.localizedDescription }
   }
+  private var exportName: String { url?.deletingPathExtension().lastPathComponent ?? L("剪辑") }
+  private var sheetWindow: NSWindow? {
+    guard NSApp.modalWindow == nil, let window = workspaceWindow ?? NSApp.keyWindow,
+      window.sheetParent == nil, window.attachedSheet == nil else { return nil }
+    return window
+  }
+  private var exportWindow: NSWindow? { progress == nil ? sheetWindow : nil }
+
   func export() {
-    guard progress == nil, p.duration > 0, let window = NSApp.keyWindow,
-      window.sheetParent == nil, window.attachedSheet == nil
-    else { return }
+    guard p.duration > 0, let window = exportWindow else { return }
     pause()
     var initial = exportSettings
     if initial.short != exportShort { initial.customMbps = nil }
     initial.short = exportShort
     let options = ExportOptions(settings: initial, project: p)
     let sheet = NSPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 466, height: 252),
+      contentRect: NSRect(x: 0, y: 0, width: 466, height: 286),
       styleMask: [.titled], backing: .buffered, defer: false)
-    sheet.title = "导出设置"
+    sheet.title = L("导出设置")
     sheet.appearance = NSAppearance(named: .darkAqua)
     let end: (NSApplication.ModalResponse) -> Void = { [weak window, weak sheet] response in
       guard let sheet else { return }
@@ -1118,33 +1500,37 @@ final class Editor: ObservableObject {
       options.cancelSample()
       sheet.contentView = nil
       guard response == .OK, let self, let window else { return }
-      self.chooseExportDestination(on: window, settings: options.settings)
+      let settings = options.settings
+      self.chooseExportDestination(on: window, ext: "mp4", type: .mpeg4Movie) { [weak self] destination in
+        guard let self else { return }
+        self.exportSettings = settings
+        self.exportShort = settings.short
+        self.startExport { task, project, report in
+          try task.run(project, to: destination, settings: settings, progress: report)
+          return [destination]
+        }
+      }
     }
   }
 
-  private func chooseExportDestination(on window: NSWindow, settings: ExportSettings) {
+  private func chooseExportDestination(
+    on window: NSWindow, ext: String, type: UTType, perform: @escaping (URL) -> Void
+  ) {
     let panel = NSSavePanel()
-    panel.allowedContentTypes = [.mpeg4Movie]
+    panel.allowedContentTypes = [type]
     panel.appearance = NSAppearance(named: .darkAqua)
-    panel.prompt = "导出"
-    panel.nameFieldStringValue = (url?.deletingPathExtension().lastPathComponent ?? "剪辑") + ".mp4"
-    panel.beginSheetModal(for: window) { [weak self] response in
+    panel.prompt = L("导出")
+    panel.nameFieldStringValue = exportName + "." + ext
+    panel.beginSheetModal(for: window) { response in
       guard response == .OK, let dest = panel.url else { return }
-      self?.startExport(to: dest, settings: settings)
+      perform(dest)
     }
   }
 
-  private func startExport(to dest: URL, settings: ExportSettings) {
-    guard
-      !p.assets.contains(where: {
-        URL(fileURLWithPath: $0.path).standardizedFileURL == dest.standardizedFileURL
-      })
-    else {
-      error = "请选择与原素材不同的导出文件名。"
-      return
-    }
-    exportSettings = settings
-    exportShort = settings.short
+  private func startExport(
+    _ operation: @escaping (ExportJob, Project, @escaping (Double) -> Void) throws -> [URL]
+  ) {
+    guard progress == nil else { return }
     pause()
     let task = ExportJob()
     let snap = p
@@ -1152,7 +1538,7 @@ final class Editor: ObservableObject {
     progress = 0
     DispatchQueue.global(qos: .userInitiated).async {
       let result = Result {
-        try task.run(snap, to: dest, settings: settings) { v in
+        try operation(task, snap) { v in
           DispatchQueue.main.async { self.progress = v }
         }
       }
@@ -1160,11 +1546,11 @@ final class Editor: ObservableObject {
         self.progress = nil
         self.job = nil
         switch result {
-        case .success:
-          self.status = "已导出 " + dest.lastPathComponent
-          NSWorkspace.shared.activateFileViewerSelecting([dest])
+        case .success(let files):
+          self.status = L("已导出 ") + files.map(\.lastPathComponent).joined(separator: "、")
+          NSWorkspace.shared.activateFileViewerSelecting(files)
         case .failure(let e):
-          if task.cancelled { self.status = "已取消导出" } else { self.error = e.localizedDescription }
+          if task.cancelled { self.status = L("已取消导出") } else { self.error = e.localizedDescription }
         }
       }
     }

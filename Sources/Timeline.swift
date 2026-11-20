@@ -1,18 +1,59 @@
+import Combine
+import QuartzCore
 import SwiftUI
 
-private struct Needle: View {
-  @ObservedObject var t: Transport
+private struct Needle: NSViewRepresentable {
+  let t: Transport
   let first: Double, per: Double
-  var body: some View {
-    GeometryReader { g in
-      let x = (Double(t.frame) - first) * per
-      if x >= 0 && x <= g.size.width {
-        Path { p in
-          p.move(to: CGPoint(x: x, y: 0))
-          p.addLine(to: CGPoint(x: x, y: g.size.height))
-        }.stroke(UI.accent, lineWidth: 1.4)
+
+  func makeNSView(context: Context) -> Surface { Surface() }
+
+  func updateNSView(_ view: Surface, context: Context) {
+    view.configure(t, first: first, per: per)
+  }
+
+  final class Surface: NSView {
+    private let marker = CALayer()
+    private weak var transport: Transport?
+    private var observer: AnyCancellable?
+    private var frameNumber = 0
+    private var first = 0.0, per = 1.0
+
+    override init(frame: NSRect) {
+      super.init(frame: frame)
+      wantsLayer = true
+      marker.backgroundColor = NSColor(UI.accent).cgColor
+      layer?.addSublayer(marker)
+    }
+    required init?(coder: NSCoder) { nil }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func configure(_ next: Transport, first: Double, per: Double) {
+      self.first = first
+      self.per = per
+      if transport !== next {
+        transport = next
+        observer = next.$frame.removeDuplicates().sink { [weak self] frame in
+          self?.frameNumber = frame
+          self?.moveMarker()
+        }
       }
-    }.allowsHitTesting(false)
+      moveMarker()
+    }
+
+    override func layout() {
+      super.layout()
+      moveMarker()
+    }
+
+    private func moveMarker() {
+      let x = (Double(frameNumber) - first) * per
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      marker.isHidden = x < 0 || x > bounds.width
+      marker.frame = CGRect(x: x - 0.7, y: 0, width: 1.4, height: bounds.height)
+      CATransaction.commit()
+    }
   }
 }
 private final class AlignmentState: ObservableObject {
@@ -47,7 +88,7 @@ struct Timeline: View {
   @State private var laneFrames = [String: CGRect]()
   @GestureState private var trackDrop: TrackDrop?
   private let marqueeSpace = "timelineMarquee"
-  let head = 78.0
+  let head = AppLanguage.current == .english ? 122.0 : 78.0
 
   private struct TrackDrop {
     let destination: String, after: Bool
@@ -62,13 +103,13 @@ struct Timeline: View {
   @ViewBuilder private func trackHeader(_ track: TimelineTrack, order: [String]) -> some View {
     let label = HStack(spacing: 4) {
       Image(systemName: track.kind.icon).foregroundStyle(UI.color(track.kind)).frame(width: 13)
-      Text(track.name).font(.system(size: 11)).lineLimit(1).fixedSize()
+      Text(track.name).font(.system(size: 11)).lineLimit(1).minimumScaleFactor(0.88).layoutPriority(1)
       Spacer(minLength: 0)
       Image(systemName: track.pinned ? "lock" : "line.3.horizontal")
         .font(.system(size: 8)).foregroundStyle(UI.muted.opacity(0.7))
     }.padding(.horizontal, 8).frame(width: head).frame(maxHeight: .infinity).contentShape(Rectangle())
     if let index = order.firstIndex(of: track.id) {
-      label.help("拖动轨道标题调整层级")
+      label.help(L("拖动轨道标题调整层级"))
         .gesture(DragGesture(minimumDistance: 4, coordinateSpace: .named(marqueeSpace))
           .updating($trackDrop) { value, state, _ in
             state = trackDestination(track.id, y: value.location.y, order: order)
@@ -78,13 +119,13 @@ struct Timeline: View {
             }
           })
         .contextMenu {
-          Button("上移轨道") { e.change { $0.moveTrack(track.id, to: order[index - 1]) } }
+          Button(L("上移轨道")) { e.change { $0.moveTrack(track.id, to: order[index - 1]) } }
             .disabled(index == 0)
-          Button("下移轨道") { e.change { $0.moveTrack(track.id, to: order[index + 1]) } }
+          Button(L("下移轨道")) { e.change { $0.moveTrack(track.id, to: order[index + 1]) } }
             .disabled(index + 1 == order.count)
         }
     } else {
-      label.help("字幕固定在最上方")
+      label.help(L("字幕固定在最上方"))
     }
   }
   var body: some View {
@@ -102,38 +143,38 @@ struct Timeline: View {
       let movedLeft = left - groupOffset / per
       VStack(spacing: 0) {
         HStack(spacing: 9) {
-          Text("时间线").font(.headline)
+          Text(L("时间线")).font(.headline)
           Divider().frame(height: 15)
-          Tool(symbol: "scissors", label: "在播放头分割（⌘B）", act: e.split).disabled(e.clip == nil)
-          Tool(symbol: "square.split.2x2", label: "批量切割（⇧⌘B）", act: e.batchCut)
+          Tool(symbol: "scissors", label: L("在播放头分割（⌘B）"), act: e.split).disabled(e.clip == nil)
+          Tool(symbol: "square.split.2x2", label: L("批量切割（⇧⌘B）"), act: e.batchCut)
             .disabled(!e.canBatchCut)
-          Tool(symbol: "link", label: "编组（⌘G）", act: e.groupSelection).disabled(!e.canGroup)
-          Tool(symbol: "rectangle.on.rectangle.slash", label: "取消编组（⇧⌘G）", act: e.ungroupSelection)
+          Tool(symbol: "link", label: L("编组（⌘G）"), act: e.groupSelection).disabled(!e.canGroup)
+          Tool(symbol: "rectangle.on.rectangle.slash", label: L("取消编组（⇧⌘G）"), act: e.ungroupSelection)
             .disabled(!e.canUngroup)
           Tool(
-            symbol: "trash", label: e.selectedTransition == nil ? "删除所选片段" : "移除所选转场",
+            symbol: "trash", label: e.selectedTransition == nil ? L("删除所选片段") : L("移除所选转场"),
             act: e.remove
           ).disabled(e.clip == nil && e.selectedTransition == nil)
           Tool(
-            symbol: "arrow.right.and.line.vertical.and.arrow.left", label: "删除所选时段并合拢所有轨道（⇧Delete）",
+            symbol: "arrow.right.and.line.vertical.and.arrow.left", label: L("删除所选时段并合拢所有轨道（⇧Delete）"),
             act: e.ripple
           ).disabled(e.clip == nil)
           Spacer()
-          Tool(symbol: "minus.magnifyingglass", label: "缩小时间线") {
+          Tool(symbol: "minus.magnifyingglass", label: L("缩小时间线")) {
             zoom = max(1, zoom / 2)
             first = min(first, max(0, total - seen * 2))
           }
-          Tool(symbol: "plus.magnifyingglass", label: "放大时间线") {
+          Tool(symbol: "plus.magnifyingglass", label: L("放大时间线")) {
             zoom = min(zoom * 2, max(1, 32 * total / width))
             first = max(0, Double(e.transport.frame) - seen / 8)
           }
-          Tool(symbol: "arrow.left.and.right", label: "适应整个工程") {
+          Tool(symbol: "arrow.left.and.right", label: L("适应整个工程")) {
             zoom = 1
             first = 0
           }
         }.padding(.horizontal, 13).frame(height: 34)
         HStack(spacing: 0) {
-          Text("分:秒:帧").font(.caption2).foregroundStyle(UI.muted).frame(width: head)
+          Text(L("分:秒:帧")).font(.caption2).foregroundStyle(UI.muted).frame(width: head)
           ZStack(alignment: .topLeading) {
             SwiftUI.Canvas { ctx, sz in
               let steps = [
@@ -153,11 +194,12 @@ struct Timeline: View {
                 ctx.stroke(path, with: .color(UI.muted.opacity(0.55)))
               }
             }
-            Needle(t: e.transport, first: left, per: per)
+            Needle(t: e.transport, first: left, per: per).allowsHitTesting(false)
           }.contentShape(Rectangle()).gesture(
             DragGesture(minimumDistance: 0).onChanged {
               e.scrub(Int((left + $0.location.x / per).rounded()))
             }.onEnded {
+              finishWorkspaceTextEditing()
               e.seek(Int((left + $0.location.x / per).rounded()))
             })
         }.frame(height: 22).padding(.trailing, 12).background(UI.deep)
@@ -199,7 +241,7 @@ struct Timeline: View {
                           editor: e, target: .join(join.id),
                           effect: join.active ? ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend) : nil,
                           range: join.active ? join.range : nil, anchor: join.frame,
-                          title: "接缝转场 " + tc(join.frame), first: origin, per: per, width: width)
+                          title: L("接缝转场 ") + tc(join.frame), first: origin, per: per, width: width)
                       }
                     }
                     if lane.kind == .video {
@@ -216,7 +258,7 @@ struct Timeline: View {
                             TransitionMarker(
                               editor: e, target: .edge(EdgeTarget(clipID: clip.id, end: side)),
                               effect: effect, range: range, anchor: side == .head ? clip.start : clip.end,
-                              title: side.rawValue + "转场 " + e.p.name(clip),
+                              title: LKey(side.rawValue) + L("转场 ") + e.p.name(clip),
                               first: origin, per: per, width: width)
                           }
                         }
@@ -224,7 +266,7 @@ struct Timeline: View {
                       TransitionDropHighlight(
                         shelf: e.shelf, joins: laneJoins, clips: lane.clips, first: left, per: per, width: width)
                     }
-                    Needle(t: e.transport, first: left, per: per)
+                    Needle(t: e.transport, first: left, per: per).allowsHitTesting(false)
                   }.clipped()
                     .background(MarqueeTarget(id: lane.id, space: marqueeSpace))
                     .background {
@@ -266,7 +308,7 @@ struct Timeline: View {
         }
         if limit > 0.5 {
           HStack {
-            Text("平移").font(.caption2).foregroundStyle(UI.muted).frame(width: head)
+            Text(L("平移")).font(.caption2).foregroundStyle(UI.muted).frame(width: head)
             Slider(value: Binding(get: { left }, set: { first = $0 }), in: 0...limit).controlSize(
               .mini)
           }.padding(.trailing, 12).frame(height: 18)

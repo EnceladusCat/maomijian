@@ -60,26 +60,29 @@ enum EditError: LocalizedError {
   }
 }
 enum Kind: String, Codable, CaseIterable {
-  case video, audio, text, arrow, rectangle, ellipse, highlight, zoom, caption, timer
+  case video, audio, text, arrow, rectangle, ellipse, highlight, zoom, caption, timer, chart, editorial, audioVisual
   var title: String {
     switch self {
-    case .video: return "视频"
-    case .audio: return "音频"
-    case .text: return "文字"
-    case .arrow: return "箭头"
-    case .rectangle: return "矩形"
-    case .ellipse: return "椭圆"
-    case .highlight: return "高亮"
-    case .zoom: return "局部放大"
-    case .caption: return "字幕"
-    case .timer: return "计时器"
+    case .video: return L("视频")
+    case .audio: return L("音频")
+    case .text: return L("文字")
+    case .arrow: return L("箭头")
+    case .rectangle: return L("矩形")
+    case .ellipse: return L("椭圆")
+    case .highlight: return L("高亮")
+    case .zoom: return L("局部放大")
+    case .caption: return L("字幕")
+    case .timer: return L("计时器")
+    case .chart: return L("图表")
+    case .editorial: return L("快剪图形")
+    case .audioVisual: return L("音频可视化")
     }
   }
   var icon: String {
     switch self {
     case .video: return "film"
     case .audio: return "waveform"
-    case .text: return "textformat"
+    case .text: return "text.alignleft"
     case .arrow: return "arrow.up.right"
     case .rectangle: return "rectangle"
     case .ellipse: return "circle"
@@ -87,16 +90,26 @@ enum Kind: String, Codable, CaseIterable {
     case .zoom: return "plus.magnifyingglass"
     case .caption: return "captions.bubble"
     case .timer: return "stopwatch"
+    case .chart: return "chart.bar.xaxis"
+    case .editorial: return "rectangle.on.rectangle"
+    case .audioVisual: return "waveform.path"
     }
   }
   var isMedia: Bool { self == .video || self == .audio }
   var isRegion: Bool { self == .highlight || self == .zoom }
   var isArt: Bool { !isMedia && self != .zoom }
+  var supportsShapeAppearance: Bool { self == .rectangle || self == .ellipse }
+  var supportsRelief: Bool { [.text, .timer, .rectangle, .ellipse, .arrow].contains(self) }
 }
 enum Motion: String, CaseIterable, Codable {
   case none = "无"
   case shake = "摇晃"
   case slide = "滑入"
+  case pushIn = "拉近"
+  case pullOut = "拉远"
+  case path = "自定义路径"
+
+  var isZoom: Bool { self == .pushIn || self == .pullOut }
 }
 enum Canvas: String, CaseIterable, Codable {
   case wide = "16∶9"
@@ -118,6 +131,10 @@ enum BuiltInSound: String, CaseIterable {
   case meow = "MEOW"
   case shatter = "SHATTER"
   case glitch = "GLITCH"
+  case legacyWoosh = "WOOSH"
+  case woosh = "WOOSH_SHORT"
+  static var library: [Self] { allCases.filter { $0 != .legacyWoosh } }
+  var name: String { self == .woosh ? "WOOSH" : rawValue }
   var frames: Int {
     switch self {
     case .pop: return 8
@@ -126,16 +143,19 @@ enum BuiltInSound: String, CaseIterable {
     case .meow: return 25
     case .shatter: return 37
     case .glitch: return 15
+    case .legacyWoosh: return 24
+    case .woosh: return 12
     }
   }
   var title: String {
     switch self {
-    case .pop: return "气泡"
-    case .warning: return "警报"
-    case .splash: return "水花"
-    case .meow: return "猫叫"
-    case .shatter: return "碎裂"
-    case .glitch: return "电子故障"
+    case .pop: return L("气泡")
+    case .warning: return L("警报")
+    case .splash: return L("水花")
+    case .meow: return L("猫叫")
+    case .shatter: return L("碎裂")
+    case .glitch: return L("电子故障")
+    case .legacyWoosh, .woosh: return L("转场风声")
     }
   }
   var url: URL? { Bundle.main.url(forResource: "FX_" + rawValue, withExtension: "wav") }
@@ -150,7 +170,8 @@ struct Media: Identifiable, Codable, Equatable {
   var still: Bool?
   var isStill: Bool { still == true }
   var name: String {
-    soundID ?? URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+    if let soundID { return BuiltInSound(rawValue: soundID)?.name ?? soundID }
+    return URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
   }
 }
 enum RegionShape: String, Codable, CaseIterable {
@@ -250,11 +271,23 @@ enum FootageFilter: String, Codable, CaseIterable {
   case vhs = "VHS"
   case neon = "TikTok 式霓虹"
   case prism = "色差放射"
+  case edgeBlur = "边缘失焦"
+  case backgroundKey = "去除背景"
 }
 struct ClipFilter: Codable, Equatable {
   var look: FootageFilter
   var amount = 1.0
-  var valid: Bool { look != .none && (0...1).contains(amount) }
+  var fadeInFrames: Int?
+  var fadeOutFrames: Int?
+  var keySensitivity: Double?
+  var sensitivity: Double { keySensitivity ?? BackgroundKey.defaultSensitivity }
+  var entryFrames: Int { fadeInFrames ?? 0 }
+  var exitFrames: Int { fadeOutFrames ?? 0 }
+  var valid: Bool {
+    look != .none && (0...1).contains(amount)
+      && (0...1).contains(sensitivity)
+      && (0...maxFrames).contains(entryFrames) && (0...maxFrames).contains(exitFrames)
+  }
 }
 struct SourceCrop: Codable, Equatable {
   var left = 0.0, top = 0.0, right = 0.0, bottom = 0.0
@@ -282,14 +315,65 @@ struct TextShadow: Codable, Equatable {
       && (-2160...2160).contains(x) && (-2160...2160).contains(y)
   }
 }
+struct TextDuotone: Codable, Equatable {
+  var enabled = true
+  var firstColor = "#F59C50"
+  var secondColor = "#FFFFFF"
+  var angle = 0.0
+  var position = 0.5
+  var valid: Bool { (-180...180).contains(angle) && (0...1).contains(position) }
+}
 struct TextAppearance: Codable, Equatable {
   var font = "", bold = true
   var size = 52.0
   var outline = VisualBorder(width: 3, color: "#10141D")
   var fixedSize: Bool?
   var shadow: TextShadow?
+  var duotone: TextDuotone?
+  var activeDuotone: TextDuotone? { duotone?.enabled == true ? duotone : nil }
   var usesFixedSize: Bool { fixedSize == true || size > 240 }
-  var valid: Bool { size.isFinite && size >= 8 && outline.valid && shadow?.valid != false }
+  var valid: Bool {
+    size.isFinite && size >= 8 && outline.valid && shadow?.valid != false && duotone?.valid != false
+  }
+}
+struct TextAnimation: Codable, Equatable {
+  var underline = false
+  var characters = false
+  var entryFrames = 12
+  var exitFrames = 12
+  var enabled: Bool { underline || characters }
+  var valid: Bool { (0...maxFrames).contains(entryFrames) && (0...maxFrames).contains(exitFrames) }
+}
+enum ShapeFill: String, Codable, CaseIterable {
+  case hollow, solid
+
+  var title: String { self == .hollow ? L("空心") : L("实心") }
+}
+enum ShapeEdge: String, Codable, CaseIterable {
+  case smooth, rough
+
+  var title: String { self == .smooth ? L("平滑") : L("粗犷") }
+}
+struct ShapeAppearance: Codable, Equatable {
+  var fill: ShapeFill?
+  var edge = ShapeEdge.smooth
+  var outlineWidth: Double?
+  var roughness = 0.70
+  var valid: Bool {
+    (0...1).contains(roughness) && outlineWidth.map { (1...64).contains($0) } != false
+  }
+}
+enum ReliefStyle: String, Codable, CaseIterable {
+  case flat, extrusion, chrome, neon
+
+  var title: String {
+    switch self {
+    case .flat: return L("平面")
+    case .extrusion: return L("立体挤出")
+    case .chrome: return L("镀铬")
+    case .neon: return L("霓虹立体")
+    }
+  }
 }
 enum TimerDirection: String, Codable, CaseIterable {
   case up = "正计时"
@@ -338,10 +422,20 @@ struct VisualGeometry {
   let full: CGRect
   let visible: CGRect
   init(clip: Clip, canvas: CGSize, aspect: Double) {
+    let crop = (clip.sourceCrop ?? SourceCrop()).rect
+    if let inset = clip.pictureInset {
+      let height = min(canvas.width, canvas.height) * clip.displayScale
+      let width = height * inset.shape.aspect
+      visible = CGRect(x: -width / 2, y: -height / 2, width: width, height: height)
+      let fullHeight = max(width / (crop.width * aspect), height / crop.height)
+      let fullWidth = fullHeight * aspect
+      full = CGRect(x: -crop.midX * fullWidth, y: -crop.midY * fullHeight,
+                    width: fullWidth, height: fullHeight)
+      return
+    }
     let width = min(canvas.width, canvas.height * aspect) * clip.displayScale
     let height = width / aspect
     full = CGRect(x: -width / 2, y: -height / 2, width: width, height: height)
-    let crop = (clip.sourceCrop ?? SourceCrop()).rect
     visible = CGRect(
       x: full.minX + crop.minX * width, y: full.minY + crop.minY * height,
       width: crop.width * width, height: crop.height * height)
@@ -359,13 +453,24 @@ struct Clip: Identifiable, Codable, Equatable {
   var sourceSpan: Double?
   var speed: Double?
   var pitchSemitones: Double?
+  var audioLink: UUID?
+  var audioVisualization: AudioVisualization?
   var visualScale: Double?
   var sourceCrop: SourceCrop?
   var visualBorder: VisualBorder?
+  var pictureInset: PictureInset?
   var footageFilter: FootageFilter?
   var filterAmount: Double?
   var filterStack: [ClipFilter]?
   var textAppearance: TextAppearance?
+  var textAnimation: TextAnimation?
+  var chart: ChartSpec?
+  var chartAppearance: ChartAppearance?
+  var editorial: EditorialSpec?
+  var reliefStyle: ReliefStyle?
+  var relief: ReliefStyle? { reliefStyle == .flat ? nil : reliefStyle }
+  var shapeAppearance: ShapeAppearance?
+  var shapeFill: ShapeFill { shapeAppearance?.fill ?? (relief == nil ? .hollow : .solid) }
   var timerSettings: TimerSettings?
   var timerPhase: Int?
   var displayScale: Double { visualScale ?? 1 }
@@ -405,6 +510,10 @@ struct Clip: Identifiable, Codable, Equatable {
     var piece = self
     piece.start = range.lowerBound
     piece.length = range.count
+    if range != start..<end {
+      piece.audioVisualization?.followsSource = false
+      piece.motionPath = pathMotion(in: range)
+    }
     if kind.isMedia && timedSource {
       piece.setSource(sourceFrame(at: range.lowerBound), sourceFrame(at: range.upperBound))
     }
@@ -413,6 +522,7 @@ struct Clip: Identifiable, Codable, Equatable {
       piece.startEffect = nil
       piece.id = UUID()
       if kind == .timer { piece.timerPhase = (timerPhase ?? 0) + range.lowerBound - start }
+      piece.editorial?.shiftReveal(by: start - range.lowerBound)
       piece.from = nil
       piece.fixedCutOffset = nil
       piece.transitionFollowers = nil
@@ -429,11 +539,11 @@ struct Clip: Identifiable, Codable, Equatable {
   }
   mutating func retime(_ newRate: Double) throws {
     guard kind.isMedia, (0.25...4).contains(newRate) else {
-      throw EditError.message("倍速范围为 0.25 至 4。")
+      throw EditError.message(L("倍速范围为 0.25 至 4。"))
     }
     let span = sourceLength
     let count = max(1, Int((span / newRate).rounded()))
-    guard count <= maxFrames - start else { throw EditError.message("片段变速后会超出工程时长上限。") }
+    guard count <= maxFrames - start else { throw EditError.message(L("片段变速后会超出工程时长上限。")) }
     length = count
     speed = newRate == 1 ? nil : newRate
     setSource(sourceIn, sourceIn + span)
@@ -454,8 +564,12 @@ struct Clip: Identifiable, Codable, Equatable {
   var color = "#FFD465"
   var regionShape: RegionShape?
   var borderColor: String?
+  var lensBorderWidth: Double?
+  var highlightFadeIn: Bool?
+  var highlightFadeOut: Bool?
   var shape: RegionShape { regionShape ?? .rectangle }
   var border: String { borderColor ?? "#FFFFFF" }
+  static let defaultLensBorderWidth = 3.78
   var volume = 1.0
   var scale = 1.65
   var zoomInFrames: Int?
@@ -466,11 +580,35 @@ struct Clip: Identifiable, Codable, Equatable {
   // Endpoint samples coincide with the unmodified scene. A short clip shares its
   // available intervals between both ramps, keeping the requested timing ratio.
   func zoomAmount(at frame: Int) -> Double {
+    fadeAmount(at: frame, entry: entryFrames, exit: exitFrames)
+  }
+
+  func highlightOpacity(at frame: Int) -> Double {
+    opacity * fadeAmount(at: frame, entry: highlightFadeIn == true ? 9 : 0,
+                         exit: highlightFadeOut == true ? 9 : 0)
+  }
+
+  func textAnimationProgress(_ animation: TextAnimation, at frame: Int) -> Double {
+    guard (start..<end).contains(frame) else { return 0 }
+    return length <= 2 ? 1 : fadeAmount(
+      at: frame, entry: animation.entryFrames, exit: animation.exitFrames, eased: false)
+  }
+
+  func filterIntensity(_ filter: ClipFilter, at frame: Int) -> Double {
+    guard filter.entryFrames > 0 || filter.exitFrames > 0 else { return filter.amount }
+    let sample = bound(frame, start, end - 1)
+    return filter.amount * (length <= 2 ? 1
+      : fadeAmount(at: sample, entry: filter.entryFrames, exit: filter.exitFrames))
+  }
+
+  private func fadeAmount(
+    at frame: Int, entry requestedEntry: Int, exit requestedExit: Int, eased: Bool = true
+  ) -> Double {
     let local = frame - start
     guard local >= 0, local < length else { return 0 }
     let span = length - 1
-    var entry = entryFrames
-    var exit = exitFrames
+    var entry = requestedEntry
+    var exit = requestedExit
     if entry + exit > span {
       if span < 2 && entry > 0 && exit > 0 { return 0 }
       if entry == 0 {
@@ -483,15 +621,19 @@ struct Clip: Identifiable, Codable, Equatable {
         exit = span - entry
       }
     }
-    if span == 0 { return entryFrames + exitFrames == 0 ? 1 : 0 }
+    if span == 0 { return requestedEntry + requestedExit == 0 ? 1 : 0 }
     let up = entry == 0 ? 1.0 : Double(local) / Double(entry)
     let down = exit == 0 ? 1.0 : Double(span - local) / Double(exit)
     let t = min(1.0, min(up, down))
-    return t * t * (3 - 2 * t)
+    return eased ? t * t * (3 - 2 * t) : t
   }
   var motion = Motion.none
   var motionFrames = 15
   var motionContinuous: Bool?
+  var shakeAmplitude: Double?
+  var shakeFrequency: Double?
+  var motionZoom: Double?
+  var motionPath: MotionPath?
   var slideFrames: Int?
   var entranceFrames: Int { slideFrames ?? (motion == .slide ? motionFrames : 0) }
   var supportsMotion: Bool { kind == .video || (kind.isArt && !kind.isRegion) }
@@ -506,11 +648,19 @@ struct Clip: Identifiable, Codable, Equatable {
       let t = min(1, age / Double(entranceFrames))
       result.x = size.width * (t * t * (3 - 2 * t) - 1)
     }
+    if motion == .path, let motionPath {
+      let offset = motionPath.at(pathProgress(at: frame))
+      result.x += offset.x * size.width
+      result.y += offset.y * size.height
+    }
     if motion == .shake {
       let t = age / Double(max(1, motionFrames))
-      let amplitude = motionContinuous == true ? 1 : max(0, 1 - t)
-      result.x += sin(t * .pi * 8) * size.width * 0.018 * amplitude
-      result.y += sin(t * .pi * 10) * size.height * 0.012 * amplitude
+      let envelope = motionContinuous == true ? 1 : max(0, 1 - t)
+      let xPhase = shakeFrequency.map { age / Double(fps) * $0 * 2 * .pi } ?? (t * .pi * 8)
+      let yPhase = shakeFrequency == nil ? t * .pi * 10 : xPhase * 1.25
+      let amplitude = shakeAmplitude ?? 0.018
+      result.x += sin(xPhase) * size.width * amplitude * envelope
+      result.y += sin(yPhase) * size.height * (0.012 * (amplitude / 0.018)) * envelope
     }
     return result
   }
@@ -554,7 +704,7 @@ struct Clip: Identifiable, Codable, Equatable {
     var c = Clip(kind: k, start: f, length: 90)
     switch k {
     case .text:
-      c.text = "文字"
+      c.text = L("文字")
       c.color = "#FFFFFF"
       c.w = 0.6
       c.h = 0.10
@@ -566,7 +716,7 @@ struct Clip: Identifiable, Codable, Equatable {
       c.h = 0.13
       c.length = 300
     case .caption:
-      c.text = "字幕"
+      c.text = L("字幕")
       c.y = 0.87
       c.w = 0.84
       c.h = 0.085
@@ -575,6 +725,11 @@ struct Clip: Identifiable, Codable, Equatable {
       c.w = 0.30
       c.h = 0.08
       c.angle = -22
+    case .chart:
+      c.color = "#8CE2C1"
+      c.w = 0.78
+      c.h = 0.72
+      c.length = 150
     case .highlight:
       c.w = 0.35
       c.h = 0.12
@@ -582,6 +737,7 @@ struct Clip: Identifiable, Codable, Equatable {
     case .rectangle, .ellipse:
       c.color = "#85CEF3"
       c.h = 0.25
+      c.shapeAppearance = ShapeAppearance(fill: .hollow)
     case .zoom:
       c.length = 60
       c.scale = 2
@@ -619,6 +775,7 @@ struct CaptionPreset: Identifiable, Codable, Equatable {
 }
 struct Project: Codable, Equatable {
   var captionStyle: CaptionStyle?
+  var captionTerms: String?
   var trackOrder: [String]?
   var backgroundColor: String?
   var background: String { backgroundColor ?? "#000000" }
@@ -630,6 +787,8 @@ struct Project: Codable, Equatable {
   func asset(_ id: UUID?) -> Media? { assets.first { $0.id == id } }
   func name(_ c: Clip) -> String {
     if c.kind.isMedia { return asset(c.asset)?.name ?? c.kind.title }
+    if let visual = c.audioVisualization { return L("音频可视化 · \(visual.style.title)") }
+    if let chart = c.chart { return chart.title.isEmpty ? chart.kind.title : chart.title }
     return c.text.isEmpty ? c.kind.title : c.text
   }
   func expandingGroups(_ ids: [UUID]) -> [UUID] {
@@ -657,11 +816,11 @@ struct Project: Codable, Equatable {
   func checked() throws -> Project {
     guard version == 1, Set(assets.map(\.id)).count == assets.count,
       Set(clips.map(\.id)).count == clips.count
-    else { throw EditError.message("工程版本或素材编号无效。") }
-    if let style = captionStyle, !style.valid { throw EditError.message("字幕样式超出范围。") }
+    else { throw EditError.message(L("工程版本或素材编号无效。")) }
+    if let style = captionStyle, !style.valid { throw EditError.message(L("字幕样式超出范围。")) }
     for a in assets {
       guard a.frames > 0, a.frames <= maxFrames, a.path.hasPrefix("/") else {
-        throw EditError.message("工程素材记录无效。")
+        throw EditError.message(L("工程素材记录无效。"))
       }
     }
     for c in clips {
@@ -672,21 +831,32 @@ struct Project: Codable, Equatable {
         (0.01...2).contains(c.w), (0.01...2).contains(c.h), (0...1).contains(c.opacity),
         (0...3).contains(c.volume), (1...5).contains(c.scale), (-360...360).contains(c.angle),
         (0...maxFrames).contains(c.entryFrames), (0...maxFrames).contains(c.exitFrames),
+        (0...64).contains(c.lensBorderWidth ?? Clip.defaultLensBorderWidth),
         (0...300).contains(c.entranceFrames), (1...300).contains(c.motionFrames),
+        c.shakeAmplitude.map({ (0...0.1).contains($0) }) != false,
+        c.shakeFrequency.map({ (0.1...12).contains($0) }) != false,
+        c.motionZoom.map({ (1...3).contains($0) }) != false,
+        c.motion == .path ? (c.supportsMotion && c.motionPath?.valid == true) : c.motionPath == nil,
         (0.05...8).contains(c.displayScale), (0...1).contains(c.filterAmount ?? 1),
         c.filters.allSatisfy(\.valid),
         c.sourceCrop?.valid != false, c.visualBorder?.valid != false,
-        c.textAppearance?.valid != false, c.timerSettings?.valid != false,
+        c.pictureInset?.valid != false, c.kind != .editorial || c.editorial?.valid == true,
+        c.kind != .audioVisual || c.audioVisualization?.valid == true,
+        c.textAppearance?.valid != false, c.textAnimation?.valid != false, c.timerSettings?.valid != false,
+        c.shapeAppearance?.valid != false,
         (-maxFrames...2 * maxFrames).contains(c.timerPhase ?? 0),
         [c.startEffect, c.endEffect].compactMap { $0 }.allSatisfy { (2...90).contains($0.frames) },
         (0...90).contains(c.blend), (0...maxFrames).contains(c.fixedCutOffset ?? 0)
-      else { throw EditError.message("片段的时间或属性超出范围。") }
+      else { throw EditError.message(L("片段的时间或属性超出范围。")) }
+      if c.kind == .chart, c.chart?.valid != true || c.chartAppearance?.valid == false {
+        throw EditError.message(L("工程图表数据无效。"))
+      }
       if c.kind.isMedia {
         guard let a = asset(c.asset), (0.25...4).contains(c.rate), (-12...12).contains(c.pitch),
           (0..<1.0).contains(c.sourceFraction ?? 0), c.sourceLength > 0,
           a.isStill || c.sourceEnd <= Double(a.frames) + 1e-7,
           c.kind == .video ? a.video : a.audio
-        else { throw EditError.message("素材与片段不匹配。") }
+        else { throw EditError.message(L("素材与片段不匹配。")) }
       }
     }
     return self
@@ -728,7 +898,7 @@ struct Project: Codable, Equatable {
     for i in p.assets.indices {
       if let sound = p.assets[i].soundID {
         guard let u = BuiltInSound(rawValue: sound)?.url else {
-          throw EditError.message("找不到内置音效「" + sound + "」。")
+          throw EditError.message(L("找不到内置音效「\(sound)」。"))
         }
         p.assets[i].path = u.path
         continue
@@ -784,15 +954,16 @@ struct Project: Codable, Equatable {
       let explicit = next.from.flatMap { byID[$0] }
       let left =
         explicit.flatMap { $0.start < next.start && $0.end > next.start ? $0 : nil }
-        ?? ending[next.start]?.last
+        ?? ending[next.start]?.last(where: { ($0.pictureInset == nil) == (next.pictureInset == nil) })
       guard let left, left.length >= 3, next.length >= 3 else { return nil }
       return Join(before: left, after: next)
     }
   }
   // A connected chain occupies one editing lane over its combined time range.
   // Unrelated overlapping video remains independently selectable on another lane.
-  func videoLanes(_ joins: [Join]) -> [[Clip]] {
-    let clips = self.clips.filter { $0.kind == .video }.sorted { $0.start < $1.start }
+  func videoLanes(_ joins: [Join], insets: Bool = false) -> [[Clip]] {
+    let clips = self.clips.filter { $0.kind == .video && ($0.pictureInset != nil) == insets }
+      .sorted { $0.start < $1.start }
     let heads = Dictionary(uniqueKeysWithValues: joins.map { ($0.after.id, $0.before.id) })
     var chains = [[Clip]]()
     var indices = [UUID: Int]()
@@ -817,7 +988,7 @@ struct Project: Codable, Equatable {
         ends.append(finish)
       }
     }
-    return rows.isEmpty ? [[]] : rows
+    return rows.isEmpty && !insets ? [[]] : rows
   }
   var videoVisibility: [UUID: Range<Int>] {
     var spans = Dictionary(
@@ -907,11 +1078,11 @@ struct Project: Codable, Equatable {
   mutating func setEdgeEffect(_ target: EdgeTarget, frames: Int, style: TransitionLook?) throws {
     guard let index = clips.firstIndex(where: { $0.id == target.clipID }),
       clips[index].kind == .video
-    else { throw EditError.message("请选择图片或视频片段的首端或末端。") }
+    else { throw EditError.message(L("请选择图片或视频片段的首端或末端。")) }
     let c = clips[index]
     let available = transitionFrameLimit(.edge(target))
     if frames > 0 && available < 2 {
-      throw EditError.message("片段太短，请先延长片段或移除另一端的转场。")
+      throw EditError.message(L("片段太短，请先延长片段或移除另一端的转场。"))
     }
     let next =
       frames <= 0
@@ -929,10 +1100,10 @@ struct Project: Codable, Equatable {
   mutating func setTransition(_ id: UUID, frames: Int, style: TransitionLook? = nil) throws {
     guard let join = joins.first(where: { $0.id == id }),
       let i = clips.firstIndex(where: { $0.id == id })
-    else { throw EditError.message("请先让两个视频片段首尾相接。") }
+    else { throw EditError.message(L("请先让两个视频片段首尾相接。")) }
     let cut = join.frame
     let n = frames == 0 ? 0 : min(max(2, frames), transitionFrameLimit(.join(id)))
-    guard frames == 0 || n >= 2 else { throw EditError.message("这两个片段没有足够长度添加转场。") }
+    guard frames == 0 || n >= 2 else { throw EditError.message(L("这两个片段没有足够长度添加转场。")) }
     // Keep the authored media and all other tracks fixed. Retain the cut location
     // when disabling a legacy overlap so the existing edit becomes a hard cut.
     let keepLink = n > 0 || join.before.end > join.after.start
@@ -964,18 +1135,18 @@ enum SRT {
     for b in blocks where !b.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
       let lines = b.trimmingCharacters(in: .newlines).components(separatedBy: "\n")
       guard let t = lines.firstIndex(where: { $0.contains("-->") }), t + 1 < lines.count else {
-        throw EditError.message("第 \(result.count+1) 条字幕缺少时间码或正文。")
+        throw EditError.message(L("第 \(result.count+1) 条字幕缺少时间码或正文。"))
       }
       let pair = lines[t].components(separatedBy: "-->")
       guard pair.count == 2, let start = frame(pair[0][...]), let end = frame(pair[1][...]),
         end > start, end <= maxFrames
-      else { throw EditError.message("第 \(result.count+1) 条字幕时间码无效。") }
+      else { throw EditError.message(L("第 \(result.count+1) 条字幕时间码无效。")) }
       var c = Clip.annotation(.caption, at: start)
       c.length = end - start
       c.text = lines[(t + 1)...].joined(separator: "\n")
       result.append(c)
     }
-    guard !result.isEmpty else { throw EditError.message("字幕文件为空。") }
+    guard !result.isEmpty else { throw EditError.message(L("字幕文件为空。")) }
     return result
   }
   static func write(_ clips: [Clip]) -> String {

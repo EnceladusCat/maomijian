@@ -1,3 +1,4 @@
+import Accelerate
 import AppKit
 import CoreImage
 import CoreText
@@ -9,7 +10,7 @@ enum FootageLook {
   ])
 
   static func image(_ image: CGImage, look: FootageFilter, amount: Double) -> CGImage {
-    guard amount > 0, look == .neon || look == .vhs else { return image }
+    guard amount > 0, look == .neon || look == .vhs || look == .edgeBlur else { return image }
     let source = CIImage(cgImage: image)
     let result: CIImage
     if look == .neon {
@@ -35,6 +36,11 @@ enum FootageLook {
         parameters: [
           kCIInputTargetImageKey: glow, kCIInputTimeKey: amount * 0.87,
         ])
+    } else if look == .edgeBlur {
+      guard let edge = edgeBlur(source, amount: amount) else {
+        return softwareEdgeBlur(image, amount: amount)
+      }
+      result = edge
     } else {
       result = source.applyingFilter(
         "CIColorControls",
@@ -63,7 +69,74 @@ enum FootageLook {
       parameters: [kCIInputBackgroundImageKey: matte])
     return context.createCGImage(output, from: source.extent)
       ?? cpu.createCGImage(output, from: source.extent)
-      ?? softwareColor(image, look: look, amount: amount)
+      ?? (look == .edgeBlur ? softwareEdgeBlur(image, amount: amount) : softwareColor(image, look: look, amount: amount))
+  }
+
+  private static func edgeBlur(_ source: CIImage, amount: Double) -> CIImage? {
+    let rect = source.extent
+    let short = min(rect.width, rect.height)
+    guard short > 0 else { return source }
+    let scale = min(1, 720 / short)
+    let blur = source.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+      .clampedToExtent().applyingFilter(
+        "CIGaussianBlur", parameters: [kCIInputRadiusKey: max(1, short * scale * 0.027)])
+      .transformed(by: CGAffineTransform(scaleX: 1 / scale, y: 1 / scale)).cropped(to: rect)
+    let mask = CIFilter(name: "CIRadialGradient", parameters: [
+      kCIInputCenterKey: CIVector(x: 0, y: 0),
+      "inputRadius0": short * 0.31, "inputRadius1": short * 0.59,
+      "inputColor0": CIColor(red: 0, green: 0, blue: 0),
+      "inputColor1": CIColor(red: amount, green: amount, blue: amount),
+    ])?.outputImage
+    guard let mask else { return nil }
+    let ellipse = mask.transformed(by: CGAffineTransform(
+      a: rect.width / short, b: 0, c: 0, d: rect.height / short, tx: rect.midX, ty: rect.midY))
+    return blur.applyingFilter("CIBlendWithMask", parameters: [
+      kCIInputBackgroundImageKey: source, kCIInputMaskImageKey: ellipse.cropped(to: rect),
+    ])
+  }
+
+  private static func softwareEdgeBlur(_ image: CGImage, amount: Double) -> CGImage {
+    let scale = min(1, 720 / Double(min(image.width, image.height)))
+    let w = max(1, Int((Double(image.width) * scale).rounded()))
+    let h = max(1, Int((Double(image.height) * scale).rounded()))
+    guard let small = bitmap(w, h), let soft = bitmap(w, h),
+      let front = bitmap(image.width, image.height), let back = bitmap(image.width, image.height),
+      let original = front.data?.assumingMemoryBound(to: UInt8.self),
+      let blurred = back.data?.assumingMemoryBound(to: UInt8.self)
+    else { return image }
+    small.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+    var input = vImage_Buffer(
+      data: small.data, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: small.bytesPerRow)
+    var output = vImage_Buffer(
+      data: soft.data, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: soft.bytesPerRow)
+    let width = UInt32(max(3, Int(Double(min(w, h)) * 0.09))) | 1
+    guard vImageBoxConvolve_ARGB8888(
+      &input, &output, nil, 0, 0, width, width, nil, vImage_Flags(kvImageEdgeExtend)) == kvImageNoError,
+      let softened = soft.makeImage()
+    else { return image }
+    let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+    front.draw(image, in: bounds)
+    back.draw(softened, in: bounds)
+    let xSquared = (0..<image.width).map { pow((Double($0) + 0.5) / Double(image.width) - 0.5, 2) }
+    for y in 0..<image.height {
+      let dy = (Double(y) + 0.5) / Double(image.height) - 0.5
+      let row = original.advanced(by: y * front.bytesPerRow)
+      let softRow = blurred.advanced(by: y * back.bytesPerRow)
+      for x in 0..<image.width {
+        let radius2 = xSquared[x] + dy * dy
+        let offset = x * 4
+        let alpha = Int(row[offset + 3])
+        let softAlpha = Int(softRow[offset + 3])
+        guard radius2 > 0.31 * 0.31, alpha > 0, softAlpha > 0 else { continue }
+        let t = bound((sqrt(radius2) - 0.31) / 0.28, 0, 1)
+        let weight = Int((256 * amount * t * t * (3 - 2 * t)).rounded())
+        for channel in offset..<offset + 3 {
+          let color = Int(softRow[channel]) * alpha / softAlpha
+          row[channel] = UInt8(bound((Int(row[channel]) * (256 - weight) + color * weight) >> 8, 0, alpha))
+        }
+      }
+    }
+    return front.makeImage() ?? image
   }
 
   private static func softwareColor(_ src: CGImage, look: FootageFilter, amount: Double) -> CGImage

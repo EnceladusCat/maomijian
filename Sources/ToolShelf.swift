@@ -9,7 +9,20 @@ enum ToolTab: String, CaseIterable, Identifiable {
   case captions = "字幕"
   case sounds = "音效"
   case filters = "滤镜"
+  case charts = "图表"
+  case quickEdit = "快剪"
   var id: Self { self }
+  var tint: Color {
+    switch self {
+    case .media: return UI.color(.video)
+    case .annotations: return UI.coral
+    case .transitions, .filters: return UI.accent
+    case .captions: return UI.buttonTint
+    case .sounds: return UI.mint
+    case .charts: return UI.mint
+    case .quickEdit: return UI.buttonTint
+    }
+  }
   var symbol: String {
     switch self {
     case .filters: return "camera.filters"
@@ -18,16 +31,20 @@ enum ToolTab: String, CaseIterable, Identifiable {
     case .media: return "film.stack"
     case .annotations: return "pencil.tip"
     case .transitions: return "rectangle.2.swap"
+    case .charts: return "chart.bar.xaxis"
+    case .quickEdit: return "bolt"
     }
   }
   @ViewBuilder func content(_ e: Editor) -> some View {
     switch self {
     case .filters: FilterPanel(editor: e, updates: e.panelUpdates(self))
     case .sounds: SoundPanel(e: e, shelf: e.shelf)
-    case .captions: CaptionPanel(e: e, updates: e.panelUpdates(self))
+    case .captions: CaptionPanel(e: e, updates: e.panelUpdates(self), automatic: e.automaticCaptions)
     case .media: Library(e: e, updates: e.panelUpdates(self))
-    case .annotations: AnnotationPanel(e: e)
+    case .annotations: AnnotationPanel(e: e, updates: e.panelUpdates(self))
     case .transitions: TransitionPanel(shelf: e.shelf, e: e, updates: e.panelUpdates(self))
+    case .charts: ChartPanel(editor: e, updates: e.panelUpdates(self))
+    case .quickEdit: QuickEditPanel(editor: e, updates: e.panelUpdates(self))
     }
   }
 }
@@ -44,7 +61,7 @@ struct ToolShelf: NSViewRepresentable {
     private var buttons = [ToolTab: ToolButton]()
     private var hosts = [ToolTab: NSView]()
     private var observation: AnyCancellable?
-    private let railWidth: CGFloat = 48
+    private let railWidth: CGFloat = AppLanguage.current == .english ? 72 : 48
     private let rowHeight: CGFloat = 43
 
     init(_ editor: Editor) {
@@ -57,7 +74,7 @@ struct ToolShelf: NSViewRepresentable {
       rail.hasVerticalScroller = true
       rail.scrollerStyle = .overlay
       rail.autohidesScrollers = true
-      rail.setAccessibilityLabel("工具栏")
+      rail.setAccessibilityLabel(L("工具栏"))
       rail.documentView = strip
       div.wantsLayer = true
       div.layer?.backgroundColor = NSColor(UI.muted).withAlphaComponent(0.16).cgColor
@@ -127,7 +144,6 @@ private final class ToolStrip: NSView {
 }
 private final class ToolButton: NSButton {
   let tab: ToolTab
-  private let mark = CALayer()
   private var active = false
 
   init(tab: ToolTab, target: AnyObject, action: Selector) {
@@ -139,38 +155,30 @@ private final class ToolButton: NSButton {
     imagePosition = .imageAbove
     image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: nil)?
       .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
-    toolTip = tab.rawValue + "面板"
-    setAccessibilityLabel(tab.rawValue)
+    toolTip = LKey(tab.rawValue) + L("面板")
+    setAccessibilityLabel(LKey(tab.rawValue))
     setButtonType(.momentaryChange)
     focusRingType = .exterior
     wantsLayer = true
-    layer?.cornerRadius = 5
-    mark.cornerRadius = 1
-    mark.backgroundColor = NSColor(UI.accent).cgColor
-    layer?.addSublayer(mark)
+    layer?.cornerRadius = 10
     updateStyle()
   }
   required init?(coder: NSCoder) { fatalError() }
-  override func layout() {
-    super.layout()
-    mark.frame = CGRect(x: 0, y: (bounds.height - 18) / 2, width: 2, height: 18)
-  }
   func markSelected(_ next: Bool) {
     guard next != active else { return }
     active = next
     updateStyle()
   }
   private func updateStyle() {
-    let color = NSColor(active ? UI.accent : UI.muted)
+    let color = NSColor(active ? UI.deep : UI.muted)
     contentTintColor = color
     attributedTitle = NSAttributedString(
-      string: tab.rawValue,
+      string: LKey(tab.rawValue),
       attributes: [
         .font: NSFont.systemFont(ofSize: 10.5, weight: .medium), .foregroundColor: color,
       ])
-    layer?.backgroundColor = active ? color.withAlphaComponent(0.13).cgColor : nil
-    mark.isHidden = !active
-    setAccessibilityValue(active ? "已选" : nil)
+    layer?.backgroundColor = active ? NSColor(tab.tint).cgColor : nil
+    setAccessibilityValue(active ? L("已选") : nil)
   }
 }
 struct DropBand: Equatable {
@@ -351,10 +359,10 @@ struct TransitionPanel: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
-      Picker("效果类型", selection: $shelf.transitionSection) {
-        Text("转场").tag(TransitionSection.effects)
-        Text("滑入").tag(TransitionSection.slide)
-      }.pickerStyle(.segmented).labelsHidden().padding(12)
+      PanelSegments(
+        title: L("效果类型"), options: [TransitionSection.effects, .slide],
+        selection: $shelf.transitionSection
+      ) { $0 == .effects ? L("转场") : L("滑入") }.padding(12)
       Divider()
       ScrollView {
         if shelf.transitionSection == .slide {
@@ -363,7 +371,7 @@ struct TransitionPanel: View {
         } else {
           let current = e.selectedTransition.flatMap { e.p.transitionEffect($0)?.style }
           VStack(alignment: .leading, spacing: 5) {
-            Text("把效果拖到素材首端、末端或接缝。拖到素材中间可在两端添加。")
+            Text(L("把效果拖到素材首端、末端或接缝。拖到素材中间可在两端添加。"))
               .font(.caption).foregroundStyle(UI.muted).fixedSize(horizontal: false, vertical: true)
               .padding(.bottom, 5)
             ForEach(TransitionLook.allCases, id: \.self) { look in
@@ -378,7 +386,7 @@ struct TransitionPanel: View {
   private func card(_ look: TransitionLook, active: Bool) -> some View {
     HStack(spacing: 7) {
       TransitionSwatch(look: look)
-      Text(look.rawValue).font(.system(size: 12, weight: .semibold))
+      Text(LKey(look.rawValue)).font(.system(size: 12, weight: .semibold))
         .fixedSize(horizontal: false, vertical: true)
       Spacer(minLength: 0)
       Image(systemName: active ? "checkmark" : "line.3.horizontal").font(.system(size: 10))
@@ -388,8 +396,8 @@ struct TransitionPanel: View {
       in: RoundedRectangle(cornerRadius: 5)
     )
     .contentShape(Rectangle()).overlay { TransitionCardDrag(e: e, look: look) }
-    .help("拖到时间线，或点按应用到选中的素材或转场")
-    .accessibilityElement(children: .ignore).accessibilityLabel(look.rawValue + "效果卡")
+    .help(L("拖到时间线，或点按应用到选中的素材或转场"))
+    .accessibilityElement(children: .ignore).accessibilityLabel(LKey(look.rawValue) + L("效果卡"))
     .accessibilityAddTraits(.isButton).accessibilityAction { e.applyTransitionCard(look) }
   }
 }
@@ -409,27 +417,27 @@ private struct SlideEntrancePanel: View {
   }
   var body: some View {
     if let c = target {
-      SectionName(name: "目标片段")
+      SectionName(name: L("目标片段"))
       let choices = items
       MenuField(
-        title: "滑入目标", choices: choices.map { tc($0.start) + "  " + e.p.name($0) },
+        title: L("滑入目标"), choices: choices.map { tc($0.start) + "  " + e.p.name($0) },
         selectedIndex: choices.firstIndex { $0.id == c.id } ?? 0
       ) { e.selected = choices[$0].id }
       .frame(height: 21)
       NumberRow(
-        label: "滑入时长", value: Double(frames) / 30, range: 1.0 / 30...10, unit: "秒", precision: 2
+        label: L("滑入时长"), value: Double(frames) / 30, range: 1.0 / 30...10, unit: L("秒"), precision: 2
       ) { frames = max(1, Int(($0 * 30).rounded())) }
-      Button(c.entranceFrames > 0 ? "更新滑入" : "添加滑入") {
+      Button(c.entranceFrames > 0 ? L("更新滑入") : L("添加滑入")) {
         e.selected = c.id
         e.edit(c.id) { $0.setSlide(frames) }
         e.seek(c.start)
       }.buttonStyle(PrimaryButton()).onAppear { update(c) }.onChange(of: c.id) { _ in update(c) }
       if c.entranceFrames > 0 {
-        Button("移除滑入") { e.edit(c.id) { $0.setSlide(0) } }
+        Button(L("移除滑入")) { e.edit(c.id) { $0.setSlide(0) } }
       }
-      Text("片段从画面左侧滑入。可以与摇晃同时使用。").font(.caption).foregroundStyle(UI.muted)
+      Text(L("片段从画面左侧滑入。可以与摇晃同时使用。")).font(.caption).foregroundStyle(UI.muted)
     } else {
-      Text("请先添加视频、文字、图形或字幕。").foregroundStyle(UI.muted)
+      Text(L("请先添加视频、文字、图形或字幕。")).foregroundStyle(UI.muted)
     }
   }
 }

@@ -51,12 +51,12 @@ struct TransitionMarker: View {
       }.buttonStyle(.plain)
         .position(x: (left + right) / 2, y: active ? 10 : 8)
         .onHover { hovering = $0 }
-        .accessibilityLabel((active ? "编辑" : "添加") + (effect?.style.rawValue ?? "") + title)
-        .help(active ? "点击选中转场，拖动边缘调整时长" : "添加转场，也可从转场面板拖放")
+        .accessibilityLabel(effect.map { L("编辑\(LKey($0.style.rawValue))，\(title)") } ?? L("添加\(title)"))
+        .help(active ? L("点击选中转场，拖动边缘调整时长") : L("添加转场，也可从转场面板拖放"))
         .contextMenu {
           if active {
-            Button("预览转场") { editor.previewTransition(target) }
-            Button("移除转场") { editor.editTransition(target, frames: 0) }
+            Button(L("预览转场")) { editor.previewTransition(target) }
+            Button(L("移除转场")) { editor.editTransition(target, frames: 0) }
           }
         }
       if let effect, let span, let initial = range {
@@ -70,7 +70,7 @@ struct TransitionMarker: View {
         }
       }
       if let resizing {
-        Text(String(format: "%.2f 秒", Double(resizing) / Double(fps)))
+        Text(String(format: L("%.2f 秒"), Double(resizing) / Double(fps)))
           .font(.caption2.monospacedDigit())
           .padding(.horizontal, 4).padding(.vertical, 2)
           .background(UI.deep, in: RoundedRectangle(cornerRadius: 3))
@@ -111,8 +111,8 @@ struct TransitionMarker: View {
             resizing = nil
             NSCursor.arrow.set()
           })
-      .help("拖动调整转场时长")
-      .accessibilityLabel("调整转场时长")
+      .help(L("拖动调整转场时长"))
+      .accessibilityLabel(L("调整转场时长"))
   }
 }
 
@@ -158,24 +158,24 @@ struct TransitionProperties: View {
   private var name: String {
     switch target {
     case .join(let id):
-      guard let join = editor.p.joins.first(where: { $0.id == id }) else { return "接缝转场" }
+      guard let join = editor.p.joins.first(where: { $0.id == id }) else { return L("接缝转场") }
       return editor.p.name(join.before) + " → " + editor.p.name(join.after)
     case .edge(let edge):
-      guard let clip = editor.p.clips.first(where: { $0.id == edge.clipID }) else { return "素材转场" }
-      return editor.p.name(clip) + " " + edge.end.rawValue
+      guard let clip = editor.p.clips.first(where: { $0.id == edge.clipID }) else { return L("素材转场") }
+      return editor.p.name(clip) + " " + LKey(edge.end.rawValue)
     }
   }
 
   var body: some View {
-    Text(effect.style.rawValue).font(.headline)
+    Text(LKey(effect.style.rawValue)).font(.headline)
     Text(name).font(.caption).foregroundStyle(UI.muted).lineLimit(2)
     NumberRow(
-      label: "转场时长", value: Double(effect.frames) / Double(fps),
+      label: L("转场时长"), value: Double(effect.frames) / Double(fps),
       range: 2.0 / Double(fps)...Double(max(2, editor.p.transitionFrameLimit(target))) / Double(fps),
-      unit: "秒", precision: 2
+      unit: L("秒"), precision: 2
     ) { editor.editTransition(target, frames: Int(($0 * Double(fps)).rounded())) }
-    Button("预览转场") { editor.previewTransition(target) }
-    Button("移除转场") { editor.editTransition(target, frames: 0) }
+    Button(L("预览转场")) { editor.previewTransition(target) }
+    Button(L("移除转场")) { editor.editTransition(target, frames: 0) }
   }
 }
 

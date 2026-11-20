@@ -8,31 +8,31 @@ struct FilterPanel: View {
     let clips = editor.selectedClips.filter { $0.kind == .video }
     ScrollView {
       VStack(alignment: .leading, spacing: 8) {
-        Text("滤镜").font(.headline)
+        Text(L("滤镜")).font(.headline)
         if clips.isEmpty {
-          Text("在时间线上选择图片或视频。").foregroundStyle(UI.muted).font(.caption)
+          Text(L("在时间线上选择图片或视频。")).foregroundStyle(UI.muted).font(.caption)
         }
         ForEach(FootageFilter.allCases.filter { $0 != .none }, id: \.self) { filter in
           Button {
             editor.addFilter(filter)
           } label: {
-            HStack(spacing: 9) {
-              FilterSwatch(filter: filter).frame(width: 54, height: 35)
-              Text(filter.rawValue).font(.system(size: 12, weight: .medium))
-                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 7) {
+              FilterSwatch(filter: filter).frame(width: 47, height: 35)
+              Text(LKey(filter.rawValue)).font(.system(size: 12, weight: .medium))
+                .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
               Spacer(minLength: 0)
               Image(systemName: "plus").font(.caption).foregroundStyle(UI.accent).accessibilityHidden(true)
             }.padding(5).frame(maxWidth: .infinity, alignment: .leading)
               .background(UI.well, in: RoundedRectangle(cornerRadius: 5))
               .contentShape(Rectangle())
-          }.buttonStyle(.plain).disabled(clips.isEmpty).help("添加滤镜")
+          }.buttonStyle(.plain).disabled(clips.isEmpty).help(L("添加滤镜"))
         }
         if let clip = clips.first, clips.count == 1, !clip.filters.isEmpty {
           Divider()
           FilterStackRows(editor: editor, clip: clip)
         }
         if clips.contains(where: { !$0.filters.isEmpty }) {
-          Button("清空滤镜") { editor.editSelectedFilters { $0.removeAll() } }
+          Button(L("清空滤镜")) { editor.editSelectedFilters { $0.removeAll() } }
         }
       }.padding(12)
     }
@@ -45,23 +45,40 @@ struct FilterStackRows: View {
 
   var body: some View {
     let filters = clip.filters
-    SectionName(name: "滤镜堆叠")
+    SectionName(name: L("滤镜堆叠"))
     ForEach(Array(filters.enumerated()), id: \.offset) { index, filter in
       VStack(spacing: 4) {
         HStack(spacing: 5) {
-          Text(filter.look.rawValue).font(.caption.weight(.medium)).lineLimit(1)
+          Text(LKey(filter.look.rawValue)).font(.caption.weight(.medium))
+            .fixedSize(horizontal: false, vertical: true).layoutPriority(1)
           Spacer(minLength: 0)
-          Tool(symbol: "chevron.up", label: "上移滤镜 \(index + 1)") { move(index, by: -1) }
+          Tool(symbol: "chevron.up", label: L("上移滤镜 \(index + 1)"), size: 20) { move(index, by: -1) }
             .disabled(index == 0)
-          Tool(symbol: "chevron.down", label: "下移滤镜 \(index + 1)") { move(index, by: 1) }
+          Tool(symbol: "chevron.down", label: L("下移滤镜 \(index + 1)"), size: 20) { move(index, by: 1) }
             .disabled(index == filters.count - 1)
-          Tool(symbol: "xmark", label: "移除滤镜 \(index + 1)") {
+          Tool(symbol: "xmark", label: L("移除滤镜 \(index + 1)"), size: 20) {
             edit(index) { $0.remove(at: index) }
           }
         }
-        NumberRow(label: "强度", value: filter.amount * 100, range: 0...100, unit: "%") { value in
-          edit(index) { $0[index].amount = value / 100 }
+        if filter.look == .backgroundKey {
+          NumberRow(label: L("敏感度"), value: filter.sensitivity * 100, range: 0...100, unit: "%") { value in
+            edit(index) { $0[index].keySensitivity = value / 100 }
+          }.help(L("从素材边缘自动取色。提高敏感度会去除更多相近颜色。"))
+        } else {
+          NumberRow(label: L("强度"), value: filter.amount * 100, range: 0...100, unit: "%") { value in
+            edit(index) { $0[index].amount = value / 100 }
+          }
         }
+        DisclosureGroup(L("缓入缓出")) {
+          VStack(spacing: 6) {
+            duration(L("缓入时长"), frames: filter.entryFrames) { value in
+              edit(index) { $0[index].fadeInFrames = value }
+            }
+            duration(L("缓出时长"), frames: filter.exitFrames) { value in
+              edit(index) { $0[index].fadeOutFrames = value }
+            }
+          }.padding(.top, 6)
+        }.font(.caption)
       }.padding(7).background(UI.well, in: RoundedRectangle(cornerRadius: 5))
     }
   }
@@ -77,6 +94,12 @@ struct FilterStackRows: View {
   private func move(_ index: Int, by delta: Int) {
     edit(index) { filters in
       if filters.indices.contains(index + delta) { filters.swapAt(index, index + delta) }
+    }
+  }
+  private func duration(_ label: String, frames: Int, apply: @escaping (Int) -> Void) -> some View {
+    NumberRow(label: label, value: Double(frames) / Double(fps),
+              range: 0...Double(max(clip.length, frames)) / Double(fps), unit: L("秒"), precision: 2) {
+      apply(Int(($0 * Double(fps)).rounded()))
     }
   }
 }
@@ -132,6 +155,28 @@ private struct FilterSwatch: View {
           let r = CGRect(x: 14 + offset, y: 7 + offset, width: 26, height: 21)
           context.stroke(Path(ellipseIn: r), with: .color(color), lineWidth: 2)
         }
+      case .edgeBlur:
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        context.drawLayer { layer in
+          layer.addFilter(.blur(radius: 2.5))
+          for x in [rect.minX + 6, rect.maxX - 6] {
+            layer.fill(Path(ellipseIn: CGRect(x: x - 7, y: center.y - 10, width: 14, height: 20)),
+                       with: .color(UI.accent.opacity(0.82)))
+          }
+        }
+        let focus = CGRect(x: center.x - 7, y: center.y - 8, width: 14, height: 16)
+        context.stroke(Path(roundedRect: focus, cornerRadius: 3), with: .color(UI.accent), lineWidth: 2)
+      case .backgroundKey:
+        for row in 0..<5 {
+          for column in 0..<7 where (row + column).isMultiple(of: 2) {
+            context.fill(Path(CGRect(x: column * 7, y: row * 7, width: 7, height: 7)),
+                         with: .color(UI.muted.opacity(0.24)))
+          }
+        }
+        let center = rect.midX
+        context.fill(Path(ellipseIn: CGRect(x: center - 5, y: 7, width: 10, height: 10)), with: .color(UI.mint))
+        context.fill(Path(roundedRect: CGRect(x: center - 10, y: 19, width: 20, height: 10), cornerRadius: 5),
+                     with: .color(UI.mint))
       case .none: break
       }
     }.clipShape(RoundedRectangle(cornerRadius: 3)).accessibilityHidden(true)
