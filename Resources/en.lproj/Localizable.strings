@@ -801,3 +801,9 @@
 "有未保存的更改" = "Unsaved Changes";
 "开始剪辑" = "Start Editing";
 "空格" = "Space";
+"正在读取替代素材…" = "Reading replacement media…";
+"已重新链接素材" = "Media relinked";
+"正在读取字幕…" = "Reading subtitles…";
+"已导入 {0} 条字幕" = "Imported {0} captions";
+"正在读取工程…" = "Reading project…";
+"编辑译文" = "Edit Translation";

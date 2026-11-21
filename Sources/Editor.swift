@@ -93,7 +93,20 @@ final class PreviewStatus: ObservableObject {
 final class Editor: ObservableObject {
   private static let timelineClipboardType = NSPasteboard.PasteboardType("local.framecut.timeline-clips.v1")
   private var copiedProperties: (clip: Clip, hasAudio: Bool)?
-  @Published var p = Project()
+  @Published private(set) var p = Project() {
+    didSet {
+      cachedTimelineLayout = nil
+      timelineDuration = p.duration
+    }
+  }
+  private var cachedTimelineLayout: TimelineLayout?
+  private(set) var timelineDuration = 0
+  var timelineLayout: TimelineLayout {
+    if let cachedTimelineLayout { return cachedTimelineLayout }
+    let layout = TimelineLayout(p)
+    cachedTimelineLayout = layout
+    return layout
+  }
   let shelf = ShelfState()
   private var panelObservers = [ToolTab: PanelUpdates]()
   func panelUpdates(_ tab: ToolTab) -> PanelUpdates {
@@ -118,6 +131,13 @@ final class Editor: ObservableObject {
   private var scrubSession: UUID?
   private var scrubFrame: Int?
   private var seekInFlight = false
+  private var submittedScrubFrame: Int?
+  private var scrubSources: [UUID: ScrubPreview.Source] = [:]
+  private var exactScrubSeek: UUID?
+  private var currentScrubFrame: Int?
+  private var lastScrubTick: CFTimeInterval?
+  private var scrubRefresh: DispatchWorkItem?
+  private var scrubVelocity = 0.0
   @Published var selectedIDs: [UUID] = [] {
     didSet {
       if let pathDrawingID, selectedIDs != [pathDrawingID] { cancelPathDrawing() }
@@ -244,9 +264,13 @@ final class Editor: ObservableObject {
   func pickClip(_ id: UUID, lane: [UUID], modifiers: NSEvent.ModifierFlags) {
     deselectTransition()
     libraryFocus = false
-    let order =
-      timelineAnchor.map(lane.contains) == true
-      ? lane : p.clips.sorted { $0.start < $1.start }.map(\.id)
+    let order: [UUID]
+    if modifiers.contains(.shift) {
+      order = timelineAnchor.map(lane.contains) == true
+        ? lane : p.clips.sorted { $0.start < $1.start }.map(\.id)
+    } else {
+      order = []
+    }
     let next: [UUID]
     if modifiers.contains(.command), !modifiers.contains(.shift), selectedIDs.contains(id) {
       let members = Set(p.expandingGroups([id]))
@@ -322,6 +346,7 @@ final class Editor: ObservableObject {
   let recentProjects = RecentProjects()
   let transport = Transport(), player = AVPlayer()
   let liveCanvas = LiveCanvasPreview()
+  let scrubPreview = ScrubPreview()
   private var baseline = Project(), undoStack = [Project](), redoStack = [Project](),
     observer: Any?, itemObservation: NSKeyValueObservation?
   private let recovery = ProjectRecovery()
@@ -331,6 +356,9 @@ final class Editor: ObservableObject {
   private var playWhenReady = false
   private var revision = 0, generation = UUID(), pending: DispatchWorkItem?, job: ExportJob?
   private let queue = DispatchQueue(label: "framecut.preview", qos: .userInitiated)
+  private let fileReads = DispatchQueue(label: "framecut.import", qos: .userInitiated, attributes: .concurrent)
+  private var openingProject: UUID?
+  private var pendingRelinks = [UUID: UUID]()
   var clip: Clip? { p.clips.first { $0.id == selected } }
   var dirty: Bool { p != baseline }
   var canUndo: Bool { !undoStack.isEmpty }
@@ -346,23 +374,37 @@ final class Editor: ObservableObject {
         self.seek(end)
         return
       }
-      self.transport.frame = bound(f, 0, self.p.duration)
-      if self.player.rate == 0 && f >= self.p.duration - 2 { self.transport.playing = false }
+      let next = bound(f, 0, self.timelineDuration)
+      if self.transport.frame != next { self.transport.frame = next }
+      if self.player.rate == 0 && f >= self.timelineDuration - 2 { self.transport.playing = false }
     }
     NotificationCenter.default.addObserver(
       forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
     ) { [weak self] note in
       if let self, let item = note.object as? AVPlayerItem, item === self.player.currentItem {
         self.transport.playing = false
-        self.transport.frame = self.p.duration
+        self.transport.frame = self.timelineDuration
       }
     }
   }
   func pause() {
+    stopTransport(keepScrubImage: false)
+  }
+
+  private func stopTransport(keepScrubImage: Bool) {
     playWhenReady = false
+    exactScrubSeek = nil
+    if keepScrubImage { scrubPreview.stopKeepingImage() } else { scrubPreview.clear() }
+    if scrubSession != nil { transport.playback.setScrubbing(false) }
     scrubSession = nil
     scrubFrame = nil
     seekInFlight = false
+    submittedScrubFrame = nil
+    currentScrubFrame = nil
+    lastScrubTick = nil
+    scrubRefresh?.cancel()
+    scrubRefresh = nil
+    scrubVelocity = 0
     auditionEnd = nil
     pendingAudition = nil
     if player.rate != 0 || transport.playing { player.pause() }
@@ -371,9 +413,24 @@ final class Editor: ObservableObject {
   func seek(_ f: Int) {
     cancelBackgroundColorPick()
     liveCanvas.clear()
-    pause()
-    transport.frame = bound(f, 0, p.duration)
-    position()
+    let keepPreview = scrubSession != nil && scrubPreview.frame != nil
+    stopTransport(keepScrubImage: keepPreview)
+    let next = bound(f, 0, timelineDuration)
+    if transport.frame != next { transport.frame = next }
+    if keepPreview {
+      let id = UUID()
+      exactScrubSeek = id
+      let frame = min(next, max(0, timelineDuration - 1))
+      player.seek(to: time(frame), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60) {
+          guard let self, self.exactScrubSeek == id else { return }
+          self.exactScrubSeek = nil
+          self.scrubPreview.clear()
+        }
+      }
+    } else {
+      position()
+    }
   }
   // Keep a single decode in flight while dragging. A release or a transport
   // command invalidates its callback and seeks the exact requested frame.
@@ -385,21 +442,95 @@ final class Editor: ObservableObject {
     }
     if scrubSession == nil {
       liveCanvas.clear()
-      pause()
+      let keepPreview = exactScrubSeek != nil && scrubPreview.frame != nil
+      stopTransport(keepScrubImage: keepPreview)
+      player.currentItem?.cancelPendingSeeks()
       scrubSession = UUID()
+      transport.playback.setScrubbing(true)
     }
-    let next = bound(frame, 0, p.duration)
+    let next = bound(frame, 0, timelineDuration)
     if transport.frame != next { transport.frame = next }
-    scrubFrame = min(next, max(0, p.duration - 1))
+    let target = min(next, max(0, timelineDuration - 1))
+    let now = CACurrentMediaTime()
+    if let previous = currentScrubFrame, let tick = lastScrubTick, now > tick, now - tick < 0.15 {
+      scrubVelocity = 0.55 * scrubVelocity + 0.45 * Double(target - previous) / max(0.008, now - tick)
+    } else {
+      scrubVelocity = 0
+    }
+    currentScrubFrame = target
+    lastScrubTick = now
+    scrubRefresh?.cancel()
+    scrubRefresh = nil
+    if let session = scrubSession, let request = fastScrubRequest(target) {
+      if target != submittedScrubFrame {
+        submittedScrubFrame = target
+        scrubFrame = nil
+        updateScrubPreview(request, session: session, predictsMotion: true)
+      }
+      if abs(scrubVelocity) * scrubPreview.decodeDelay > 3 {
+        // A stopped pointer gets its original target back without waiting
+        // for mouse-up, even if the last decoded request used motion lead.
+        let refresh = DispatchWorkItem { [weak self] in
+          guard let self, self.scrubSession == session, self.lastScrubTick == now else { return }
+          self.scrubVelocity = 0
+          self.updateScrubPreview(request, session: session, predictsMotion: false)
+        }
+        scrubRefresh = refresh
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.085, execute: refresh)
+      }
+      return
+    }
+    scrubPreview.clear()
+    scrubFrame = target == submittedScrubFrame ? nil : target
     if !seekInFlight { seekLatestScrub() }
   }
+
+  private func updateScrubPreview(_ request: ScrubPreview.Request, session: UUID, predictsMotion: Bool) {
+    scrubPreview.update(request, session: session, latest: { [weak self] frame in
+      guard predictsMotion, let self, self.scrubSession == session, self.currentScrubFrame == frame else {
+        return nil
+      }
+      // Compensate for decode time on sustained motion, within the current slice.
+      let lead = Int(bound(self.scrubVelocity * self.scrubPreview.decodeDelay, -900, 900).rounded())
+      let predicted = bound(frame + lead, request.bounds.lowerBound, request.bounds.upperBound - 1)
+      return request.moving(to: predicted)
+    }) { [weak self] rejected in
+      guard let self, self.scrubSession == session, self.submittedScrubFrame == rejected else { return }
+      self.scrubPreview.stopKeepingImage()
+      self.scrubFrame = rejected
+      if !self.seekInFlight { self.seekLatestScrub() }
+    }
+  }
+
+  private func fastScrubRequest(_ frame: Int) -> ScrubPreview.Request? {
+    guard !busy, let composition = previewComposition, let painter = composition.scrubPainter,
+      let slice = composition.instruction(at: frame) as? Slice, slice.sources.count == 1,
+      let clip = slice.clips.first(where: { $0.kind == .video }),
+      !slice.clips.contains(where: { slice.stills[$0.id] != nil }),
+      (clip.start..<clip.end).contains(frame), let id = clip.asset,
+      let sourceMap = slice.sources[clip.id], sourceMap.opaque,
+      let media = p.asset(id), !media.isStill else { return nil }
+    let range = slice.timeRange
+    let start = max(clip.start, Int((range.start.seconds * Double(fps)).rounded()))
+    let end = min(clip.end, Int((range.end.seconds * Double(fps)).rounded()))
+    guard start <= frame, frame < end else { return nil }
+    if scrubSources.count >= 4 && scrubSources[id] == nil { scrubSources.removeAll(keepingCapacity: true) }
+    let source = scrubSources[id] ?? ScrubPreview.Source(media.path, size: painter.size)
+    scrubSources[id] = source
+    return .init(frame: frame, slice: slice, clip: clip, source: source, transform: sourceMap.transform,
+                 bounds: start..<end, painter: painter)
+  }
+
   private func seekLatestScrub() {
     guard let session = scrubSession, let item = player.currentItem, let frame = scrubFrame else {
       return
     }
     scrubFrame = nil
     seekInFlight = true
-    player.seek(to: time(frame), toleranceBefore: .zero, toleranceAfter: .zero) {
+    submittedScrubFrame = frame
+    let tolerance = previewComposition?.scrubTolerance(at: frame)
+    player.seek(to: time(frame), toleranceBefore: tolerance?.before ?? .zero,
+                toleranceAfter: tolerance?.after ?? .zero) {
       [weak self, weak item] _ in
       DispatchQueue.main.async {
         guard let self, self.scrubSession == session, self.player.currentItem === item else {
@@ -413,7 +544,7 @@ final class Editor: ObservableObject {
   }
   private func position() {
     player.seek(
-      to: time(min(transport.frame, max(0, p.duration - 1))), toleranceBefore: .zero,
+      to: time(min(transport.frame, max(0, timelineDuration - 1))), toleranceBefore: .zero,
       toleranceAfter: .zero)
   }
   func play() {
@@ -500,6 +631,7 @@ final class Editor: ObservableObject {
     install(next)
   }
   func rebuild(keepingCanvasFrame: Bool = false) {
+    scrubSources.removeAll(keepingCapacity: true)
     if !keepingCanvasFrame { liveCanvas.clear() }
     pause()
     pending?.cancel()
@@ -585,6 +717,14 @@ final class Editor: ObservableObject {
   }
   private func didPrepare() {
     prepareBackgroundColorPick()
+    // Start after the initial player seek so priming does not contend with
+    // the frame the editor needs to paint as soon as an item opens.
+    let revision = revision
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) { [weak self] in
+      guard let self, self.revision == revision, self.scrubSession == nil,
+        let request = self.fastScrubRequest(self.transport.frame) else { return }
+      self.scrubPreview.warm(request.source, at: request.clip.sourceFrame(at: request.frame))
+    }
     if playWhenReady {
       playWhenReady = false
       player.play()
@@ -1295,31 +1435,59 @@ final class Editor: ObservableObject {
     let panel = NSOpenPanel()
     panel.allowedContentTypes = [.movie, .audio, .image]
     guard panel.runModal() == .OK, let u = panel.url else { return }
-    do {
-      var replacement = try inspect(u)
-      replacement.id = m.id
-      let needed =
-        p.clips.filter { $0.asset == m.id }.map { Int(ceil($0.sourceEnd - 1e-8)) }.max() ?? 0
-      guard replacement.isStill == m.isStill, replacement.isStill || replacement.frames >= needed,
-        !m.video || replacement.video,
-        !m.audio || replacement.audio
-      else { throw EditError.message(L("替代素材需要包含原有轨道，且时长要覆盖所有剪辑。")) }
-      change { p in
-        if let i = p.assets.firstIndex(where: { $0.id == m.id }) { p.assets[i] = replacement }
+    let request = UUID()
+    let generation = generation
+    pendingRelinks[m.id] = request
+    status = L("正在读取替代素材…")
+    fileReads.async { [weak self] in
+      let result = Result { try inspect(u) }
+      DispatchQueue.main.async {
+        guard let self, self.generation == generation, self.pendingRelinks[m.id] == request else { return }
+        self.pendingRelinks.removeValue(forKey: m.id)
+        guard let original = self.p.asset(m.id), original.path == m.path else { return }
+        do {
+          var replacement = try result.get()
+          replacement.id = m.id
+          let needed = self.p.clips.lazy.filter { $0.asset == m.id }
+            .map { Int(ceil($0.sourceEnd - 1e-8)) }.max() ?? 0
+          guard replacement.isStill == original.isStill, replacement.isStill || replacement.frames >= needed,
+            !original.video || replacement.video, !original.audio || replacement.audio
+          else { throw EditError.message(L("替代素材需要包含原有轨道，且时长要覆盖所有剪辑。")) }
+          self.change { p in
+            if let i = p.assets.firstIndex(where: { $0.id == m.id }) { p.assets[i] = replacement }
+          }
+          self.loadThumb(replacement, refresh: true)
+          self.status = L("已重新链接素材")
+        } catch {
+          self.status = L("就绪")
+          self.error = error.localizedDescription
+        }
       }
-      loadThumb(replacement, refresh: true)
-    } catch { self.error = error.localizedDescription }
+    }
   }
   func subtitleImport() {
     let panel = NSOpenPanel()
     panel.allowedContentTypes = [UTType(filenameExtension: "srt") ?? .plainText]
     guard panel.runModal() == .OK, let u = panel.url else { return }
-    do {
-      let list = try SRT.parse(String(contentsOf: u, encoding: .utf8))
-      change { $0.clips += list }
-      selected = list.first?.id
-      seek(list[0].start)
-    } catch { self.error = error.localizedDescription }
+    let generation = generation
+    status = L("正在读取字幕…")
+    fileReads.async { [weak self] in
+      let result = Result { try SRT.parse(String(contentsOf: u, encoding: .utf8)) }
+      DispatchQueue.main.async {
+        guard let self, self.generation == generation else { return }
+        switch result {
+        case .success(let list):
+          guard let first = list.first else { return }
+          self.change { $0.clips += list }
+          self.selected = first.id
+          self.seek(first.start)
+          self.status = L("已导入 \(list.count) 条字幕")
+        case .failure(let error):
+          self.status = L("就绪")
+          self.error = error.localizedDescription
+        }
+      }
+    }
   }
   var captionAudioSelection: Clip? {
     guard selectedIDs.count == 1, let clip, clip.kind.isMedia, clip.volume > 0,
@@ -1537,6 +1705,8 @@ final class Editor: ObservableObject {
     liveCanvas.clear()
     regionTool = nil
     generation = UUID()
+    openingProject = nil
+    pendingRelinks.removeAll()
     undoStack = []
     redoStack = []
     thumbnails = [:]
@@ -1590,13 +1760,23 @@ final class Editor: ObservableObject {
     if panel.runModal() == .OK, let u = panel.url { open(u) }
   }
   func open(_ u: URL) {
-    do {
-      let next = try Project.read(from: u)
-      if mayLeave() {
-        reset(next, u)
-        recentProjects.record(u)
+    let request = UUID()
+    openingProject = request
+    status = L("正在读取工程…")
+    fileReads.async { [weak self] in
+      let result = Result { try Project.read(from: u) }
+      DispatchQueue.main.async {
+        guard let self, self.openingProject == request else { return }
+        self.status = L("就绪")
+        defer { if self.openingProject == request { self.openingProject = nil } }
+        do {
+          let next = try result.get()
+          guard self.mayLeave(), self.openingProject == request else { return }
+          self.reset(next, u)
+          self.recentProjects.record(u)
+        } catch { self.error = error.localizedDescription }
       }
-    } catch { self.error = error.localizedDescription }
+    }
   }
   private var exportName: String { url?.deletingPathExtension().lastPathComponent ?? L("剪辑") }
   private var sheetWindow: NSWindow? {

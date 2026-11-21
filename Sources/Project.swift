@@ -801,7 +801,7 @@ struct Project: Codable, Equatable {
   var canvas = Canvas.wide
   var assets: [Media] = []
   var clips: [Clip] = []
-  var duration: Int { clips.map(\.end).max() ?? 0 }
+  var duration: Int { clips.lazy.map(\.end).max() ?? 0 }
   func asset(_ id: UUID?) -> Media? { assets.first { $0.id == id } }
   func name(_ c: Clip) -> String {
     if c.kind.isMedia { return asset(c.asset)?.name ?? c.kind.title }

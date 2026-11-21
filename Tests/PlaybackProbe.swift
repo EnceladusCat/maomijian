@@ -56,6 +56,8 @@ final class PlaybackProbe {
     tickGaps = [Double](), lastTick = 0.0
   var results = [String: Any](), drags = [[String: Any]](), gesture = 0, lastStep = -1,
     released = 0.0, target = 0, dragOutputs = 0, lastDragFrame = -1, firstDragWall = 0.0
+  private var firstDragTarget: Int?
+  private var followFrameErrors = [Double]()
   private var nextCheckpoint = 0.0
   private var checkpoints = [[String: Any]]()
   private var activity: NSObjectProtocol?
@@ -181,11 +183,6 @@ final class PlaybackProbe {
         stop("playback timeout")
       }
     case "drag":
-      if let f = sample(now), f != lastDragFrame {
-        if dragOutputs == 0 { firstDragWall = now }
-        dragOutputs += 1
-        lastDragFrame = f
-      }
       let step = min(48, Int((now - began) * 60))
       if step > lastStep {
         let path = paths[gesture]
@@ -196,17 +193,33 @@ final class PlaybackProbe {
           released = now
           phase = "settle"
         } else {
+          if firstDragTarget == nil { firstDragTarget = target }
           dragTarget(target)
         }
         lastStep = step
       }
+      if phase == "drag", let f = e.scrubPreview.frame?.number ?? sample(now), f != lastDragFrame,
+        let firstDragTarget
+      {
+        // AVPlayer can deliver a final frame from the previous seek. Only
+        // count the first update near the new sweep as a response to this drag.
+        let near = max(18, abs(target - firstDragTarget))
+        if dragOutputs > 0 || abs(f - target) <= near {
+          if dragOutputs == 0 { firstDragWall = now }
+          dragOutputs += 1
+          lastDragFrame = f
+          followFrameErrors.append(Double(abs(f - target)))
+        }
+      }
     case "settle":
       if let f = sample(now) { lastDragFrame = f }
-      if lastDragFrame == target || now - released > 3 {
+      if (lastDragFrame == target && e.scrubPreview.frame == nil) || now - released > 3 {
         drags.append([
           "sweep": gesture, "target": target, "match": lastDragFrame == target,
           "settleMs": 1000 * (now - released), "updatesDuringDrag": dragOutputs,
           "firstUpdateMs": firstDragWall > 0 ? 1000 * (firstDragWall - began) : -1,
+          "p50FollowingErrorFrames": q(followFrameErrors, 0.50),
+          "p95FollowingErrorFrames": q(followFrameErrors, 0.95),
         ])
         gesture += 1
         if gesture == paths.count { stop("complete") } else { beginDrag(now) }
@@ -221,6 +234,8 @@ final class PlaybackProbe {
     began = now
     lastStep = -1
     firstDragWall = 0
+    firstDragTarget = nil
+    followFrameErrors.removeAll(keepingCapacity: true)
     lastDragFrame = -1
     dragOutputs = 0
     save("scrubbing")

@@ -22,6 +22,7 @@ struct ClipLane: NSViewRepresentable {
       width: max(2, Double(clip.length) * per), height: rowHeight(clip.kind) - 5)
   }
   let editor: Editor, layout: Layout
+  let laneClipIDs: () -> [UUID]
   let showAlignment: (Int?) -> Void
   @Binding var groupOffset: CGFloat
 
@@ -30,6 +31,7 @@ struct ClipLane: NSViewRepresentable {
     view.editor = editor
     view.groupMove = { groupOffset = $0 }
     view.showAlignment = showAlignment
+    view.laneClipIDs = laneClipIDs
     if view.layoutData != layout {
       view.layoutData = layout
       view.needsDisplay = true
@@ -41,6 +43,7 @@ struct ClipLane: NSViewRepresentable {
     var layoutData: Layout?
     var groupMove: ((CGFloat) -> Void)?
     var showAlignment: ((Int?) -> Void)?
+    var laneClipIDs: (() -> [UUID])?
     private var pressed: Clip?, origin: CGFloat = 0, delta: CGFloat = 0, edge = 0
     private var snap: TimelineSnap?
     private var movesSelection = false
@@ -254,7 +257,7 @@ struct ClipLane: NSViewRepresentable {
       e.pause()
       e.libraryFocus = false
       if modified || !e.selectedIDs.contains(c.id) {
-        e.pickClip(c.id, lane: d.pieces.map { $0.clip.id }, modifiers: flags)
+        e.pickClip(c.id, lane: flags.contains(.shift) ? laneClipIDs?() ?? [] : [], modifiers: flags)
       }
       pressed = c
       if e.selectedIDs.count == 1 && Double(c.length) * d.per > 10 {
@@ -284,9 +287,11 @@ struct ClipLane: NSViewRepresentable {
       let dx = convert(event.locationInWindow, from: nil).x - origin
       guard abs(dx) >= 2 || delta != 0 else { return }
       let placement = snap.placement(for: dx / d.per, per: d.per)
-      delta = Double(placement.shift) * d.per
-      if movesSelection { groupMove?(delta) }
       showAlignment?(placement.guide)
+      let next = Double(placement.shift) * d.per
+      guard next != delta else { return }
+      delta = next
+      if movesSelection { groupMove?(delta) }
       needsDisplay = true
     }
     override func mouseUp(with event: NSEvent) {

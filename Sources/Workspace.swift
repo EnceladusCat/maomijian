@@ -140,8 +140,6 @@ struct PlayerSurface: NSViewRepresentable {
 }
 struct Preview: View {
   @ObservedObject var e: Editor
-  @ObservedObject var t: Transport
-  @State private var delta = CGSize.zero
   @State private var zoom = 1.0
   @GestureState private var pinch = 1.0
   @State private var pan = CGSize.zero
@@ -190,76 +188,10 @@ struct Preview: View {
           UI.deep
           ZStack {
             PlayerSurface(player: e.player, background: e.p.background).allowsHitTesting(false)
+            ScrubPreviewOverlay(preview: e.scrubPreview)
             LiveCanvasOverlay(preview: e.liveCanvas)
-            let selectedRegion = (e.selectedIDs.count == 1 ? e.clip : nil).flatMap { c in
-              c.kind.isRegion && c.start <= t.frame && t.frame < c.end ? c : nil
-            }
-            if let colorPick {
-              if let image = colorPick.image {
-                UI.deep
-                Image(decorative: image, scale: 1).resizable().allowsHitTesting(false)
-                BackgroundColorPickSurface(pick: e.useBackgroundSample)
-                  .frame(width: w, height: h)
-                  .accessibilityLabel(L("在画布中吸管取色"))
-              }
-            } else if let id = drawing {
-              MotionPathDrawingSurface { stroke, canvas in e.finishPathDrawing(for: id, stroke: stroke, canvas: canvas) }
-                .frame(width: w, height: h).id(id)
-                .accessibilityLabel(L("绘制运动路径"))
-            } else if regionTool != nil || (!hand && selectedRegion != nil) {
-              RegionControls(e: e, c: selectedRegion, size: canvasSize)
-            } else if !hand, !t.playing, e.selectedIDs.count == 1, let c = e.clip, c.kind == .video,
-              let id = c.asset, let source = e.mediaSizes[id],
-              c.start <= t.frame, t.frame < c.end
-            {
-              MediaHandles(
-                editor: e, clip: c, canvas: CGSize(width: w, height: h),
-                aspect: source.width / source.height, frame: t.frame, cropping: e.cropID == c.id
-              )
-              .id(c.id)
-            } else if !hand, e.selectedIDs.count == 1, let c = e.clip, !c.kind.isMedia,
-              c.start <= t.frame,
-              t.frame < c.end
-            {
-              let placement = c.placement(at: t.frame, canvas: CGSize(width: w, height: h))
-              let bounds = c.kind == .caption ? artworkBounds(c, size: canvasSize, style: e.p.captionStyle)
-                : CGRect(x: -w * c.w / 2, y: -h * c.h / 2, width: w * c.w, height: h * c.h)
-              let ww = bounds.width * placement.scale
-              let hh = bounds.height * placement.scale
-              let angle = c.angle * .pi / 180
-              let lift = bounds.midY * placement.scale
-              RoundedRectangle(cornerRadius: 2).strokeBorder(
-                UI.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3])
-              )
-              .background(Color.white.opacity(0.002)).frame(width: ww, height: hh).rotationEffect(
-                .degrees(c.angle)
-              )
-              .position(x: placement.center.x + delta.width + sin(angle) * lift,
-                        y: placement.center.y + delta.height - cos(angle) * lift)
-              .gesture(
-                DragGesture(minimumDistance: 1, coordinateSpace: .named("canvas")).onChanged { v in
-                  delta = v.translation
-                  var draft = c
-                  draft.x = bound(c.x + v.translation.width / w, 0, 1)
-                  draft.y = bound(c.y + v.translation.height / h, 0, 1)
-                  e.previewCanvas(draft)
-                }.onEnded { v in
-                  var draft = c
-                  draft.x = bound(c.x + v.translation.width / w, 0, 1)
-                  draft.y = bound(c.y + v.translation.height / h, 0, 1)
-                  e.commitCanvas(draft)
-                  delta = .zero
-                })
-              .onDisappear {
-                if e.liveCanvas.activeID == c.id { e.liveCanvas.clear() }
-                delta = .zero
-              }
-            }
-            if drawing == nil, colorPick == nil, !hand, !t.playing, e.cropID == nil, e.regionTool == nil,
-              e.selectedIDs.count == 1, let clip = e.clip, (clip.start..<clip.end).contains(t.frame),
-              let path = clip.motionPath
-            {
-              MotionPathGuide(path: path, clip: clip, canvas: canvasSize)
+            if e.selectedIDs.count == 1 || drawing != nil || colorPick != nil || regionTool != nil {
+              CanvasControls(e: e, t: e.transport, size: canvasSize, hand: hand)
             }
           }.frame(width: w, height: h).background(Color(cgColor: ink(e.p.background)))
             .coordinateSpace(name: "canvas")
@@ -314,10 +246,98 @@ struct Preview: View {
           Button(L("完成裁剪")) { e.cropID = nil }.controlSize(.small)
         }
       }.padding(.horizontal, 12).frame(height: 31).background(UI.deep)
-      TransportBar(t: t, e: e, duration: e.p.duration)
+      TransportBar(t: e.transport, e: e, duration: e.timelineDuration)
     }.background(UI.panel)
   }
 }
+private struct CanvasControls: View {
+  let e: Editor
+  @ObservedObject var t: Transport
+  let size: CGSize
+  let hand: Bool
+  @State private var delta = CGSize.zero
+
+  var body: some View {
+    let w = size.width
+    let h = size.height
+    let drawing = e.pathDrawingID
+    let colorPick = e.backgroundColorPick
+    let regionTool = e.regionTool
+    let canvasSize = size
+    let single = e.selectedIDs.count == 1 ? e.clip : nil
+    let selectedRegion = single.flatMap { c in
+      c.kind.isRegion && c.start <= t.frame && t.frame < c.end ? c : nil
+    }
+    if let colorPick {
+      if let image = colorPick.image {
+        UI.deep
+        Image(decorative: image, scale: 1).resizable().allowsHitTesting(false)
+        BackgroundColorPickSurface(pick: e.useBackgroundSample)
+          .frame(width: w, height: h)
+          .accessibilityLabel(L("在画布中吸管取色"))
+      }
+    } else if let id = drawing {
+      MotionPathDrawingSurface { stroke, canvas in e.finishPathDrawing(for: id, stroke: stroke, canvas: canvas) }
+        .frame(width: w, height: h).id(id)
+        .accessibilityLabel(L("绘制运动路径"))
+    } else if regionTool != nil || (!hand && selectedRegion != nil) {
+      RegionControls(e: e, c: selectedRegion, size: canvasSize)
+    } else if !hand, !t.playing, let c = single, c.kind == .video,
+      let id = c.asset, let source = e.mediaSizes[id],
+      c.start <= t.frame, t.frame < c.end
+    {
+      MediaHandles(
+        editor: e, clip: c, canvas: CGSize(width: w, height: h),
+        aspect: source.width / source.height, frame: t.frame, cropping: e.cropID == c.id
+      )
+      .id(c.id)
+    } else if !hand, let c = single, !c.kind.isMedia,
+      c.start <= t.frame,
+      t.frame < c.end
+    {
+      let placement = c.placement(at: t.frame, canvas: CGSize(width: w, height: h))
+      let bounds = c.kind == .caption ? artworkBounds(c, size: canvasSize, style: e.p.captionStyle)
+        : CGRect(x: -w * c.w / 2, y: -h * c.h / 2, width: w * c.w, height: h * c.h)
+      let ww = bounds.width * placement.scale
+      let hh = bounds.height * placement.scale
+      let angle = c.angle * .pi / 180
+      let lift = bounds.midY * placement.scale
+      RoundedRectangle(cornerRadius: 2).strokeBorder(
+        UI.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3])
+      )
+      .background(Color.white.opacity(0.002)).frame(width: ww, height: hh).rotationEffect(
+        .degrees(c.angle)
+      )
+      .position(x: placement.center.x + delta.width + sin(angle) * lift,
+                y: placement.center.y + delta.height - cos(angle) * lift)
+      .gesture(
+        DragGesture(minimumDistance: 1, coordinateSpace: .named("canvas")).onChanged { v in
+          delta = v.translation
+          var draft = c
+          draft.x = bound(c.x + v.translation.width / w, 0, 1)
+          draft.y = bound(c.y + v.translation.height / h, 0, 1)
+          e.previewCanvas(draft)
+        }.onEnded { v in
+          var draft = c
+          draft.x = bound(c.x + v.translation.width / w, 0, 1)
+          draft.y = bound(c.y + v.translation.height / h, 0, 1)
+          e.commitCanvas(draft)
+          delta = .zero
+        })
+      .onDisappear {
+        if e.liveCanvas.activeID == c.id { e.liveCanvas.clear() }
+        delta = .zero
+      }
+    }
+    if drawing == nil, colorPick == nil, !hand, !t.playing, e.cropID == nil, e.regionTool == nil,
+      let clip = single, (clip.start..<clip.end).contains(t.frame),
+      let path = clip.motionPath
+    {
+      MotionPathGuide(path: path, clip: clip, canvas: canvasSize)
+    }
+  }
+}
+
 struct Library: View {
   let e: Editor
   @ObservedObject var updates: PanelUpdates
@@ -494,7 +514,7 @@ struct Workspace: View {
         HStack(spacing: 1) {
           ToolShelf(e: e).frame(width: (geo.size.width < 1080 ? 236 : 274)
             + (AppLanguage.current == .english ? 24 : 0))
-          Preview(e: e, t: e.transport).frame(maxWidth: .infinity)
+          Preview(e: e).frame(maxWidth: .infinity)
           InspectorHost(editor: e).frame(width: geo.size.width < 1080 ? 206 : 235)
         }.frame(maxHeight: .infinity)
         Timeline(e: e, waveforms: e.waveforms).frame(height: bound(geo.size.height * 0.35, 215, 360))

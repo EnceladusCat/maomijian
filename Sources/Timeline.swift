@@ -131,16 +131,15 @@ struct Timeline: View {
   var body: some View {
     GeometryReader { geo in
       let width = max(50, geo.size.width - head - 12)
-      let total = max(300, Double(e.p.duration + 30))
+      let layout = e.timelineLayout
+      let total = max(300, Double(layout.duration + 30))
       let per = min(32, max(0.0001, width / total * zoom))
       let seen = width / per
       let limit = max(0, total - seen)
       let left = min(first, limit)
-      let joins = e.p.joins
-      let lanes = e.p.timelineTracks(joins: joins)
-      let order = lanes.filter { !$0.pinned }.map(\.id)
+      let lanes = layout.lanes
+      let order = layout.movableIDs
       let selected = Set(e.selectedIDs)
-      let movedLeft = left - groupOffset / per
       VStack(spacing: 0) {
         HStack(spacing: 9) {
           Text(L("时间线")).font(.headline)
@@ -206,77 +205,14 @@ struct Timeline: View {
         GeometryReader { viewport in
           ScrollView(.vertical) {
             VStack(spacing: 1) {
-              ForEach(lanes) { lane in
-                let transitionClips = lane.clips.filter { $0.kind.supportsTransitions }
-                let ids = Set(transitionClips.map(\.id))
-                let laneJoins = joins.filter { ids.contains($0.after.id) && ids.contains($0.before.id) }
+              ForEach(lanes) { entry in
+                let lane = entry.track
                 HStack(spacing: 0) {
                   trackHeader(lane, order: order)
-                  ZStack(alignment: .topLeading) {
-                    Color.white.opacity(0.035)
-                    ClipLane(
-                      editor: e,
-                      layout: .init(
-                        pieces: lane.clips.map {
-                          let media = e.p.asset($0.asset)
-                          let wave = $0.asset.flatMap { waveforms.values[$0] }
-                          return .init(
-                            clip: $0, name: e.p.name($0),
-                            hasAudio: media?.audio == true || wave != nil, waveform: wave)
-                        },
-                        selection: selected, first: left, per: per,
-                        groupOffset: groupOffset
-                      ),
-                      showAlignment: alignment.show, groupOffset: $groupOffset)
-                    ForEach(
-                      laneJoins.filter { $0.active || Double(min($0.before.length, $0.after.length)) * per >= 15 }
-                    ) { join in
-                      let beforeMoves = selected.contains(join.before.id)
-                      let afterMoves = selected.contains(join.after.id)
-                      let origin = beforeMoves && afterMoves ? movedLeft : left
-                      if (groupOffset == 0 || beforeMoves == afterMoves)
-                        && Double(join.range.upperBound) >= origin
-                        && Double(join.range.lowerBound) <= origin + seen
-                      {
-                        TransitionMarker(
-                          editor: e, target: .join(join.id),
-                          effect: join.active ? ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend) : nil,
-                          range: join.active ? join.range : nil, anchor: join.frame,
-                          title: L("接缝转场 ") + tc(join.frame), first: origin, per: per, width: width)
-                      }
-                    }
-                    if !transitionClips.isEmpty {
-                      ForEach(
-                        transitionClips.filter {
-                          let origin = selected.contains($0.id) ? movedLeft : left
-                          return ($0.startEffect != nil || $0.endEffect != nil)
-                            && Double($0.end) >= origin && Double($0.start) <= origin + seen
-                        }
-                      ) { clip in
-                        let origin = selected.contains(clip.id) ? movedLeft : left
-                        ForEach(ClipEnd.allCases, id: \.self) { side in
-                          if let effect = clip.effect(at: side), let range = clip.transitionRange(at: side) {
-                            TransitionMarker(
-                              editor: e, target: .edge(EdgeTarget(clipID: clip.id, end: side)),
-                              effect: effect, range: range, anchor: side == .head ? clip.start : clip.end,
-                              title: LKey(side.rawValue) + L("转场 ") + e.p.name(clip),
-                              first: origin, per: per, width: width)
-                          }
-                        }
-                      }
-                      TransitionDropHighlight(
-                        shelf: e.shelf, joins: laneJoins, clips: transitionClips, first: left, per: per, width: width)
-                    }
-                    Needle(t: e.transport, first: left, per: per).allowsHitTesting(false)
-                  }.clipped()
-                    .background(MarqueeTarget(id: lane.id, space: marqueeSpace))
-                    .background {
-                      if !transitionClips.isEmpty {
-                        DropBandReader(
-                          first: left, per: per, joins: laneJoins, clips: transitionClips,
-                          viewport: viewport.frame(in: .named(DropBandKey.coordinateSpace)))
-                      }
-                    }
+                  TimelineLaneContents(
+                    e: e, entry: entry, waveforms: waveforms, selected: selected, first: left, per: per,
+                    seen: seen, width: width, viewport: viewport.frame(in: .named(DropBandKey.coordinateSpace)),
+                    marqueeSpace: marqueeSpace, groupOffset: $groupOffset, showAlignment: alignment.show)
                 }.frame(height: ClipLane.rowHeight(lane.kind)).padding(.trailing, 12)
                   .overlay(alignment: trackDrop?.after == true ? .bottom : .top) {
                     if trackDrop?.destination == lane.id {
@@ -286,7 +222,7 @@ struct Timeline: View {
               }
               MarqueeBlank(selection: e.timelineMarquee) { e.selected = nil }
                 .frame(height: max(0, viewport.size.height - lanes.reduce(0) {
-                  $0 + ClipLane.rowHeight($1.kind) + 1
+                  $0 + ClipLane.rowHeight($1.track.kind) + 1
                 }))
                 .padding(.leading, head).padding(.trailing, 12)
             }
@@ -295,7 +231,7 @@ struct Timeline: View {
               box, flags in
               let hits = lanes.flatMap { lane -> [UUID] in
                 guard let frame = laneFrames[lane.id], frame.intersects(box) else { return [] }
-                return lane.clips.compactMap { clip in
+                return lane.track.clips.compactMap { clip in
                   let rect = ClipLane.clipBox(clip, first: left, per: per)
                     .offsetBy(dx: frame.minX, dy: frame.minY).intersection(frame)
                   return rect.intersection(box).isEmpty ? nil : clip.id
@@ -318,6 +254,93 @@ struct Timeline: View {
         if e.transport.playing && (Double(f) < left || Double(f) > left + seen) {
           first = bound(Double(f) - seen * 0.1, 0, limit)
         }
+      }
+    }
+  }
+}
+
+
+private struct TimelineLaneContents: View {
+  let e: Editor
+  let entry: TimelineLayout.Lane
+  let waveforms: WaveformStore
+  let selected: Set<UUID>
+  let first: Double, per: Double, seen: Double, width: Double
+  let viewport: CGRect
+  let marqueeSpace: String
+  @Binding var groupOffset: CGFloat
+  let showAlignment: (Int?) -> Void
+
+  private var movedFirst: Double { first - groupOffset / per }
+  private var visible: [TimelineLayout.Piece] {
+    entry.visible(in: (first - 2 / per)...(first + seen), selected: selected, shift: groupOffset / per)
+  }
+  private var seams: [Project.Join] {
+    entry.joins.filter { join in
+      let beforeMoves = selected.contains(join.before.id)
+      let afterMoves = selected.contains(join.after.id)
+      let origin = beforeMoves && afterMoves ? movedFirst : first
+      let range = join.range
+      return (groupOffset == 0 || beforeMoves == afterMoves)
+        && Double(range.upperBound) >= origin && Double(range.lowerBound) <= origin + seen
+        && (join.active || Double(min(join.before.length, join.after.length)) * per >= 15)
+    }
+  }
+
+  var body: some View {
+    let clips = visible
+    ZStack(alignment: .topLeading) {
+      Color.white.opacity(0.035)
+      ClipLane(
+        editor: e, layout: .init(pieces: clips.map(waveformPiece), selection: selected, first: first,
+                                 per: per, groupOffset: groupOffset),
+        laneClipIDs: { entry.clipIDs }, showAlignment: showAlignment, groupOffset: $groupOffset)
+      ForEach(seams) { join in seamMarker(join) }
+      if !entry.transitionClips.isEmpty {
+        ForEach(clips.filter(shouldShowEdge), id: \.clip.id) { piece in edgeMarkers(piece) }
+        TransitionDropHighlight(
+          shelf: e.shelf, joins: entry.joins, clips: entry.transitionClips, first: first, per: per, width: width)
+      }
+      Needle(t: e.transport, first: first, per: per).allowsHitTesting(false)
+    }.clipped()
+      .background(MarqueeTarget(id: entry.id, space: marqueeSpace))
+      .background {
+        if !entry.transitionClips.isEmpty {
+          DropBandReader(first: first, per: per, joins: entry.joins, clips: entry.transitionClips,
+                         viewport: viewport)
+        }
+      }
+  }
+
+  private func waveformPiece(_ piece: TimelineLayout.Piece) -> ClipLane.Piece {
+    let wave = piece.clip.asset.flatMap { waveforms.values[$0] }
+    return .init(clip: piece.clip, name: piece.name, hasAudio: piece.hasAudio || wave != nil, waveform: wave)
+  }
+
+  private func seamMarker(_ join: Project.Join) -> some View {
+    let moves = selected.contains(join.before.id) && selected.contains(join.after.id)
+    let effect = join.active ? ClipEdgeEffect(style: join.after.transitionStyle, frames: join.after.blend) : nil
+    return TransitionMarker(
+      editor: e, target: .join(join.id), effect: effect, range: join.active ? join.range : nil, anchor: join.frame,
+      title: L("接缝转场 ") + tc(join.frame), first: moves ? movedFirst : first, per: per, width: width)
+  }
+
+  private func shouldShowEdge(_ piece: TimelineLayout.Piece) -> Bool {
+    let clip = piece.clip
+    let origin = selected.contains(clip.id) ? movedFirst : first
+    return (clip.startEffect != nil || clip.endEffect != nil) && Double(clip.end) >= origin
+  }
+
+  private func edgeMarkers(_ piece: TimelineLayout.Piece) -> some View {
+    let clip = piece.clip
+    let origin = selected.contains(clip.id) ? movedFirst : first
+    return ForEach(ClipEnd.allCases, id: \.self) { side in
+      if let effect = clip.effect(at: side), let range = clip.transitionRange(at: side) {
+        TransitionMarker(
+          editor: e, target: .edge(EdgeTarget(clipID: clip.id, end: side)),
+          effect: effect, range: range, anchor: side == .head ? clip.start : clip.end,
+          title: LKey(side.rawValue) + L("转场 ") + piece.name,
+          first: origin, per: per, width: width)
       }
     }
   }

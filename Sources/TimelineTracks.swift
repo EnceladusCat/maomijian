@@ -9,6 +9,105 @@ struct TimelineTrack: Identifiable {
   var pinned: Bool { kind == .caption }
 }
 
+/// Immutable timeline geometry for a project revision. Scrolling and dragging
+/// query visible clips without packing every track or resolving media again.
+struct TimelineLayout {
+  struct Piece {
+    let clip: Clip
+    let name: String
+    let hasAudio: Bool
+  }
+
+  struct Lane: Identifiable {
+    let track: TimelineTrack
+    let joins: [Project.Join]
+    let transitionClips: [Clip]
+    private let pieces: [Piece]
+    private let furthestEnds: [Int]
+
+    var id: String { track.id }
+    var clipIDs: [UUID] { track.clips.map(\.id) }
+
+    init(track: TimelineTrack, joins: [Project.Join], pieces: [Piece]) {
+      self.track = track
+      self.joins = joins
+      self.pieces = pieces
+      transitionClips = track.clips.filter { $0.kind.supportsTransitions }
+      var end = 0
+      furthestEnds = pieces.map {
+        end = max(end, $0.clip.end)
+        return end
+      }
+    }
+
+    private func candidates(in viewport: ClosedRange<Double>) -> Range<Int> {
+      let start = insertionIndex { Double(furthestEnds[$0]) < viewport.lowerBound }
+      let end = insertionIndex { Double(pieces[$0].clip.start) <= viewport.upperBound }
+      return start..<max(start, end)
+    }
+
+    private func insertionIndex(before: (Int) -> Bool) -> Int {
+      var lower = 0
+      var upper = pieces.count
+      while lower < upper {
+        let mid = (lower + upper) / 2
+        if before(mid) { lower = mid + 1 } else { upper = mid }
+      }
+      return lower
+    }
+
+    func visible(in viewport: ClosedRange<Double>, selected: Set<UUID>, shift: Double) -> [Piece] {
+      let regular = candidates(in: viewport)
+      if shift == 0 {
+        return regular.compactMap { index in
+          let piece = pieces[index]
+          return Double(piece.clip.end) >= viewport.lowerBound ? piece : nil
+        }
+      }
+      let shifted = (viewport.lowerBound - shift)...(viewport.upperBound - shift)
+      let moved = candidates(in: shifted)
+      // Keep painting and overlapping-clip hit testing in the original lane order.
+      var indices = IndexSet(integersIn: regular)
+      indices.insert(integersIn: moved)
+      return indices.compactMap { index in
+        let piece = pieces[index]
+        let range = selected.contains(piece.clip.id) ? shifted : viewport
+        return Double(piece.clip.end) >= range.lowerBound && Double(piece.clip.start) <= range.upperBound
+          ? piece : nil
+      }
+    }
+  }
+
+  let lanes: [Lane]
+  let movableIDs: [String]
+  let duration: Int
+
+  init(_ project: Project) {
+    let joins = project.joins
+    let tracks = project.timelineTracks(joins: joins)
+    let media = Dictionary(uniqueKeysWithValues: project.assets.map { ($0.id, $0) })
+    var laneByClip = [UUID: Int]()
+    for (index, track) in tracks.enumerated() {
+      for clip in track.clips { laneByClip[clip.id] = index }
+    }
+    var joinsByLane = [[Project.Join]](repeating: [], count: tracks.count)
+    for join in joins {
+      if let index = laneByClip[join.after.id], laneByClip[join.before.id] == index {
+        joinsByLane[index].append(join)
+      }
+    }
+    lanes = tracks.enumerated().map { index, track in
+      return Lane(track: track, joins: joinsByLane[index], pieces: track.clips.map { clip in
+        let asset = clip.asset.flatMap { media[$0] }
+        let name = clip.kind.isMedia ? asset?.name ?? clip.kind.title : project.name(clip)
+        return Piece(clip: clip, name: name, hasAudio: asset?.audio == true)
+      })
+    }
+    movableIDs = tracks.filter { !$0.pinned }.map(\.id)
+    duration = project.duration
+  }
+}
+
 extension Project {
   func timelineTracks(joins: [Join]) -> [TimelineTrack] {
     orderedTracks(defaultTracks(joins: joins))

@@ -92,5 +92,66 @@ enum SubtitleTranslator {
       return converted
     }
   }
+}
 
+struct CaptionTranslationPassage {
+  let indices: Range<Int>
+  let taggedSource: String?
+
+  static func make(from lines: [SubtitleTranslationLine], source: [String]) -> [Self] {
+    var passages: [Self] = []
+    var start = 0
+    while start < lines.count {
+      var end = start + 1
+      var characters = source[start].count
+      while end < lines.count, end - start < 5,
+        lines[end].start - (lines[end - 1].start + lines[end - 1].length) <= 36,
+        characters + source[end].count <= 340
+      {
+        characters += source[end].count
+        end += 1
+      }
+      let indices = start..<end
+      let containsTag = source[indices].contains { marker.firstMatch(
+        in: $0, range: NSRange($0.startIndex..., in: $0)) != nil
+      }
+      let text = indices.count > 1 && !containsTag ? indices.enumerated().map { offset, index in
+        "[\(offset + 101)] " + source[index].split(whereSeparator: \.isNewline).joined(separator: " ")
+      }.joined(separator: "\n") : nil
+      passages.append(Self(indices: indices, taggedSource: text))
+      start = end
+    }
+    return passages
+  }
+
+  private static let marker = try! NSRegularExpression(pattern: #"[\[［〔【]\s*(10[1-5])\s*[\]］〕】]"#)
+
+  func unpack(_ response: String) -> [String]? {
+    let matches = Self.marker.matches(in: response, range: NSRange(response.startIndex..., in: response))
+    guard matches.count == indices.count,
+      let first = matches.first.flatMap({ Range($0.range, in: response) }),
+      response[..<first.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return nil }
+    var results: [String] = []
+    for (index, match) in matches.enumerated() {
+      guard let mark = Range(match.range, in: response), let id = Range(match.range(at: 1), in: response),
+        Int(response[id]) == index + 101 else { return nil }
+      let end = index + 1 < matches.count
+        ? Range(matches[index + 1].range, in: response)?.lowerBound ?? response.endIndex : response.endIndex
+      let text = response[mark.upperBound..<end].trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !text.isEmpty else { return nil }
+      results.append(text)
+    }
+    return results
+  }
+
+  /// The generic engine sometimes interprets corporate guidance as rules.
+  /// Limit the correction to cues whose source uses the term in a financial context.
+  static func refineEnglish(_ value: String, original: String, context: String) -> String {
+    guard original.contains("指引"), !original.contains("指南"),
+      ["季度", "财报", "營收", "营收", "业绩", "業績", "估值", "市场预期", "市場預期"]
+        .contains(where: context.contains) else { return value }
+    return value.replacingOccurrences(
+      of: #"\bguidelines?\b"#, with: "guidance", options: [.regularExpression, .caseInsensitive])
+  }
 }

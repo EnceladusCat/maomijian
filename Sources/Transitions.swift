@@ -21,6 +21,7 @@ struct TransitionMarker: View {
   let title: String
   let first: Double, per: Double, width: Double
   @State private var resizing: Int?
+  @State private var resizeLimit: Int?
   @State private var hovering = false
 
   private var selected: Bool { editor.selectedTransition == target }
@@ -93,7 +94,7 @@ struct TransitionMarker: View {
     let sign = side == .head ? -1.0 : 1.0
     func duration(_ value: CGFloat) -> Int {
       let shift = Int((Double(value) / per * multiplier * sign).rounded())
-      return bound(frames + shift, 2, max(2, editor.p.transitionFrameLimit(target)))
+      return bound(frames + shift, 2, max(2, resizeLimit ?? editor.p.transitionFrameLimit(target)))
     }
     return RoundedRectangle(cornerRadius: 1)
       .fill(color.opacity(selected || hovering || resizing != nil ? 1 : 0.65))
@@ -107,11 +108,15 @@ struct TransitionMarker: View {
       .gesture(
         DragGesture(minimumDistance: 1, coordinateSpace: .global)
           .onChanged { value in
-            resizing = duration(value.translation.width)
+            if resizeLimit == nil { resizeLimit = editor.p.transitionFrameLimit(target) }
+            let next = duration(value.translation.width)
+            if resizing != next { resizing = next }
           }
           .onEnded { value in
-            editor.editTransition(target, frames: duration(value.translation.width))
+            let final = duration(value.translation.width)
+            resizeLimit = nil
             resizing = nil
+            editor.editTransition(target, frames: final)
             NSCursor.arrow.set()
           })
       .help(L("拖动调整转场时长"))

@@ -99,10 +99,15 @@ struct CaptionTranslationPanel: View {
           .lineLimit(2).frame(maxWidth: .infinity, alignment: .center)
           .foregroundStyle(.white)
       }
-      if let translated {
-        Text(translated[previewIndex]).font(.system(size: 14, weight: .semibold))
-          .lineLimit(2).frame(maxWidth: .infinity, alignment: .center)
+      if translated != nil {
+        TextField(L("编辑译文"), text: Binding(
+          get: { translated?[previewIndex] ?? "" },
+          set: { translated?[previewIndex] = $0 }
+        ), axis: .vertical)
+          .font(.system(size: 13, weight: .medium))
+          .lineLimit(1...3)
           .foregroundStyle(UI.mint)
+          .accessibilityLabel(L("编辑译文"))
       } else if job != nil {
         VStack(spacing: 4) {
           ProgressView(value: Double(finished), total: Double(lines.count)).controlSize(.small)
@@ -215,21 +220,44 @@ struct CaptionTranslationPanel: View {
           ? SubtitleTranslator.convertScript(
               lines.map(\.text), pair: .init(source: .traditional, target: .mandarin))
           : lines.map(\.text)
-        var outputs = [UUID: String]()
-        for start in stride(from: 0, to: lines.count, by: 48) {
+        let passages = CaptionTranslationPassage.make(from: lines, source: source)
+        var result = [String](repeating: "", count: lines.count)
+        for start in stride(from: 0, to: passages.count, by: 12) {
           try Task.checkCancellation()
-          let batch = (start..<min(start + 48, lines.count)).map {
-            TranslationSession.Request(sourceText: source[$0], clientIdentifier: lines[$0].id.uuidString)
+          let batch = passages[start..<min(start + 12, passages.count)]
+          let contextual = batch.enumerated().compactMap { offset, passage -> TranslationSession.Request? in
+            guard let text = passage.taggedSource else { return nil }
+            return .init(sourceText: text, clientIdentifier: String(start + offset))
           }
-          for response in try await session.translations(from: batch) {
-            if let key = response.clientIdentifier.flatMap(UUID.init(uuidString:)) {
-              outputs[key] = response.targetText
+          if !contextual.isEmpty {
+            for response in try await session.translations(from: contextual) {
+              guard let index = response.clientIdentifier.flatMap(Int.init), batch.indices.contains(index),
+                let parts = passages[index].unpack(response.targetText) else { continue }
+              for (cue, text) in zip(passages[index].indices, parts) { result[cue] = text }
+            }
+          }
+          let missing = batch.flatMap { $0.indices }.filter { result[$0].isEmpty }
+          if !missing.isEmpty {
+            let requests = missing.map { TranslationSession.Request(
+              sourceText: source[$0], clientIdentifier: String($0)) }
+            for response in try await session.translations(from: requests) {
+              if let index = response.clientIdentifier.flatMap(Int.init), result.indices.contains(index) {
+                result[index] = response.targetText
+              }
             }
           }
           guard job == id, !Task.isCancelled else { return }
-          finished = outputs.count
+          finished = batch.last?.indices.upperBound ?? finished
         }
-        var result = lines.map { outputs[$0.id] ?? "" }
+        if pair.target == .english, pair.source == .mandarin || pair.source == .traditional {
+          for passage in passages {
+            let context = source[passage.indices].joined(separator: " ")
+            for index in passage.indices {
+              result[index] = CaptionTranslationPassage.refineEnglish(
+                result[index], original: source[index], context: context)
+            }
+          }
+        }
         if pair.target == .traditional {
           result = try SubtitleTranslator.convertScript(result, pair: .init(source: .mandarin, target: .traditional))
         }

@@ -12,9 +12,12 @@ struct SourceMap {
 final class PreviewPlayback {
   private let lock = NSLock()
   private var playing = false
+  private var scrubbing = false
 
   var isPlaying: Bool { lock.withLock { playing } }
+  var capturesPausedFrames: Bool { lock.withLock { !playing && !scrubbing } }
   func setPlaying(_ value: Bool) { lock.withLock { playing = value } }
+  func setScrubbing(_ value: Bool) { lock.withLock { scrubbing = value } }
 }
 
 final class Slice: NSObject, AVVideoCompositionInstructionProtocol {
@@ -210,7 +213,7 @@ final class Compositor: NSObject, AVVideoCompositing {
         return
       }
       let frame = Int((request.compositionTime.seconds * 30).rounded())
-      let captures = s.playback?.isPlaying == false ? s.canvasFrames : nil
+      let captures = s.playback?.capturesPausedFrames == true ? s.canvasFrames : nil
       var pictures = [UUID: Picture]()
       func picture(_ id: UUID, canvas: CGSize) -> Picture? {
         if let url = s.stills[id], let im = StillImages.image(url, limit: s.preview ? 2160 : 4096) {
@@ -326,6 +329,7 @@ private var audioLeaseKey: UInt8 = 0
 struct Composition {
   let graph: MediaGraph, video: AVMutableVideoComposition
   var canvasFrames: CanvasFrames? = nil
+  var scrubPainter: FramePainter? = nil
   var asset: AVMutableComposition { graph.asset }
   var audio: AVMutableAudioMix { graph.audio }
   func item() -> AVPlayerItem {
@@ -335,6 +339,31 @@ struct Composition {
     i.audioTimePitchAlgorithm = .spectral
     graph.retainAudio(on: i)
     return i
+  }
+
+  /// Keep transient seek tolerance within the current composite slice so the
+  /// preview cannot jump across a cut, caption or effect boundary.
+  func scrubTolerance(at frame: Int) -> (before: CMTime, after: CMTime) {
+    let requested = time(frame)
+    guard let slice = instruction(at: frame) else { return (.zero, .zero) }
+    let range = slice.timeRange
+    let tolerance = time(12)
+    return (
+      CMTimeMinimum(tolerance, CMTimeMaximum(.zero, requested - range.start)),
+      CMTimeMinimum(tolerance, CMTimeMaximum(.zero, range.end - time(1) - requested))
+    )
+  }
+
+  func instruction(at frame: Int) -> AVVideoCompositionInstructionProtocol? {
+    let requested = time(frame)
+    let slices = video.instructions
+    var low = 0, high = slices.count
+    while low < high {
+      let middle = (low + high) / 2
+      if slices[middle].timeRange.end <= requested { low = middle + 1 } else { high = middle }
+    }
+    guard slices.indices.contains(low), slices[low].timeRange.start <= requested else { return nil }
+    return slices[low]
   }
 
   func canvasFrame(at frame: Int) -> CanvasFrame? {
@@ -588,7 +617,10 @@ func buildComposition(
   vc.customVideoCompositorClass = Compositor.self
   vc.frameDuration = time(1)
   vc.renderSize = size
-  return Composition(graph: graph, video: vc, canvasFrames: canvasFrames)
+  let scrubPainter = playback.map { _ in
+    FramePainter(p, p.canvas.size(min(480, short)), preview: true, audioSignals: signals)
+  }
+  return Composition(graph: graph, video: vc, canvasFrames: canvasFrames, scrubPainter: scrubPainter)
 }
 
 func audioSignals(in project: Project, cancelled: () -> Bool) -> [UUID: AudioSignalTrack] {

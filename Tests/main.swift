@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import CoreText
 import Foundation
@@ -66,6 +67,41 @@ precondition(layout.lines.count == 2)
 CaptionTranslationMode.replace.apply(translationEdits, to: &bilingualProject)
 precondition(bilingualProject.clips[1].text == "簡體與軟件開發" && bilingualProject.clips[1].captionTranslation == nil)
 print("Passed bilingual caption timing, shared render bounds, SRT export, persistence, and translation-only replacement.")
+
+let translationFixture = [
+  (0, "先看英伟达这季度的指引。"), (30, "它比市场预期高了不少，"),
+  (65, "但估值已经反映了这点。"), (130, "打开安装指南。"),
+].map { start, text in
+  var clip = Clip.annotation(.caption, at: start)
+  clip.length = 24
+  clip.text = text
+  return SubtitleTranslationLine(clip)
+}
+let passages = CaptionTranslationPassage.make(from: translationFixture, source: translationFixture.map(\.text))
+precondition(passages.map(\.indices) == [0..<3, 3..<4])
+precondition(passages[0].taggedSource?.contains("[102] 它比市场预期高了不少，") == true)
+precondition(passages[0].unpack("〔101〕 First.\n[102] Second.\n［103］ Third.") == ["First.", "Second.", "Third."])
+precondition(passages[0].unpack("[101] First. [103] Third. [102] Second.") == nil)
+precondition(passages[0].unpack("[101] First. [102] [103] Third.") == nil)
+precondition(CaptionTranslationPassage.refineEnglish("Quarterly guidelines", original: translationFixture[0].text,
+  context: translationFixture[0].text) == "Quarterly guidance")
+precondition(CaptionTranslationPassage.refineEnglish("Installation guidelines", original: translationFixture[3].text,
+  context: translationFixture.map(\.text).joined()) == "Installation guidelines")
+let scrubVideo = AVMutableVideoComposition()
+let beforeScrubBoundary = AVMutableVideoCompositionInstruction()
+beforeScrubBoundary.timeRange = CMTimeRange(start: .zero, duration: time(100))
+let afterScrubBoundary = AVMutableVideoCompositionInstruction()
+afterScrubBoundary.timeRange = CMTimeRange(start: time(100), duration: time(40))
+scrubVideo.instructions = [beforeScrubBoundary, afterScrubBoundary]
+let scrubComposition = Composition(graph: MediaGraph(asset: AVMutableComposition(), audio: AVMutableAudioMix(),
+  sources: [:], clock: 0, pitchFiles: [], stills: [:]), video: scrubVideo)
+let tailTolerance = scrubComposition.scrubTolerance(at: 99)
+precondition(tailTolerance.before == time(12) && tailTolerance.after == .zero)
+let headTolerance = scrubComposition.scrubTolerance(at: 100)
+precondition(headTolerance.before == .zero && headTolerance.after == time(12))
+let outsideTolerance = scrubComposition.scrubTolerance(at: 140)
+precondition(outsideTolerance.before == .zero && outsideTolerance.after == .zero)
+print("Passed contextual translation ordering, terminology guard and slice-bounded scrubbing tolerance.")
 
 let spoken = "主动表示要暂缓上市，但Anthropic仍在考虑审核进度。接下来会不会冲冲冲，什么时候确认1.25万亿美元的估值。"
 let speech = spoken.enumerated().map { index, character in
@@ -1064,6 +1100,45 @@ lowerAtStart.startEffect = ClipEdgeEffect(style: .dissolve, frames: 24)
 endProject.clips[0] = lowerAtStart
 let startPixels = transitionPixels(endProject, frame: 0, parts: endProject.clips)
 precondition(startPixels == transitionPixels(endProject, frame: 0, parts: [upperIndependent]))
+
+// Partially overlapping video chains may have non-monotonic end frames.
+var viewportProject = Project()
+let viewportMedia = Media(path: "/tmp/viewport.mp4", frames: 400, video: true, audio: true)
+viewportProject.assets = [viewportMedia]
+let viewportLead = Clip(kind: .video, asset: viewportMedia.id, start: 0, length: 100)
+var viewportFollow = Clip(kind: .video, asset: viewportMedia.id, start: 70, length: 13)
+viewportFollow.blend = 5
+viewportFollow.from = viewportLead.id
+viewportFollow.fixedCutOffset = 4
+let viewportThird = Clip(kind: .video, asset: viewportMedia.id, start: 100, length: 40)
+let viewportOverlap = Clip(kind: .video, asset: viewportMedia.id, start: 72, length: 40)
+let viewportCaption = Clip.annotation(.caption, at: 60)
+viewportProject.clips = [viewportLead, viewportFollow, viewportThird, viewportOverlap, viewportCaption]
+let viewportLayout = TimelineLayout(viewportProject)
+let viewportJoins = viewportProject.joins
+let viewportTracks = viewportProject.timelineTracks(joins: viewportJoins)
+precondition(viewportLayout.lanes.map(\.id) == viewportTracks.map(\.id))
+for (lane, track) in zip(viewportLayout.lanes, viewportTracks) {
+  let ids = Set(track.clips.map(\.id))
+  precondition(lane.joins.map(\.id) == viewportJoins.filter {
+    ids.contains($0.before.id) && ids.contains($0.after.id)
+  }.map(\.id))
+  for shift in [-180.0, -31, 0, 3.5, 40, 185] {
+    let selected = Set([viewportLead.id, viewportThird.id, viewportCaption.id])
+    for start in stride(from: 0.0, through: 260, by: 7.5) {
+      let range = start...(start + 18)
+      let expected = track.clips.filter {
+        let movement = selected.contains($0.id) ? shift : 0
+        return Double($0.end) >= range.lowerBound - movement && Double($0.start) <= range.upperBound - movement
+      }
+      let actual = lane.visible(in: range, selected: selected, shift: shift)
+      precondition(actual.map(\.clip) == expected)
+      precondition(actual.map(\.name) == expected.map { viewportProject.name($0) })
+      precondition(actual.map(\.hasAudio) == expected.map { viewportProject.asset($0.asset)?.audio == true })
+    }
+  }
+}
+print("Passed timeline viewport parity, overlapping chains and group movements from offscreen.")
 
 let dragSnap = TimelineSnap(anchors: [20, 45], targets: [0, 58, 89, 58], limits: -20...100)
 precondition(dragSnap.placement(for: 11.5, per: 2).shift == 13)
