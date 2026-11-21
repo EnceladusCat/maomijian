@@ -91,12 +91,14 @@ private struct NumericControl: NSViewRepresentable {
   }
 }
 private struct Writing: View {
-  let value: String, apply: (String) -> Void
+  let value: String
+  var title = L("正文")
+  let apply: (String) -> Void
   @State private var buffer = ""
   @FocusState private var focused: Bool
   var body: some View {
     TextEditor(text: $buffer).focused($focused).font(.body).frame(height: 62).padding(3)
-      .accessibilityLabel(L("正文"))
+      .accessibilityLabel(title)
       .background(UI.deep, in: RoundedRectangle(cornerRadius: 4))
       .onAppear { buffer = value }.onChange(of: value) { v in if v != buffer { buffer = v } }
       .onChange(of: buffer) { v in if v != value { apply(v) } }
@@ -521,7 +523,13 @@ struct Inspector: View {
     if c.kind == .text || c.kind == .caption {
       Divider()
       SectionName(name: L("正文"))
-      Writing(value: c.text) { v in e.edit(c.id) { $0.text = v } }
+      Writing(value: c.text) { v in e.edit(c.id) { $0.text = v } }.id(c.id)
+      if c.kind == .caption {
+        SectionName(name: L("译文"))
+        Writing(value: c.captionTranslation ?? "", title: L("译文")) { value in
+          e.edit(c.id) { $0.captionTranslation = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value }
+        }.id(c.id)
+      }
     }
     if c.kind == .text {
       duotoneControls(c)

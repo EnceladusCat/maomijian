@@ -19,6 +19,8 @@ struct CaptionReview: View {
     self.apply = apply
   }
 
+  private var bilingual: Bool { lines.contains { $0.captionTranslation != nil } }
+
   private var matches: [Int] {
     lines.indices.filter { find.isEmpty || lines[$0].text.range(of: find, options: .caseInsensitive) != nil }
   }
@@ -57,8 +59,16 @@ struct CaptionReview: View {
             Button(stamp(frame)) { seek(frame) }
               .buttonStyle(.borderless).font(.system(.body, design: .monospaced))
               .foregroundStyle(UI.accent).help(L("跳到这条字幕"))
-            TextField(L("字幕文本"), text: $lines[index].text, axis: .vertical)
-              .lineLimit(1...4)
+            VStack(alignment: .leading, spacing: 4) {
+              TextField(L("字幕文本"), text: $lines[index].text, axis: .vertical)
+                .lineLimit(1...4)
+              if bilingual {
+                TextField(L("译文"), text: Binding(
+                  get: { lines[index].captionTranslation ?? "" },
+                  set: { lines[index].captionTranslation = $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+                ), axis: .vertical).lineLimit(1...4)
+              }
+            }
           }.padding(.vertical, 2)
         }
       }.scrollContentBackground(.hidden).background(UI.deep)

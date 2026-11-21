@@ -207,8 +207,9 @@ struct Timeline: View {
           ScrollView(.vertical) {
             VStack(spacing: 1) {
               ForEach(lanes) { lane in
-                let ids = Set(lane.clips.map(\.id))
-                let laneJoins = lane.kind == .video ? joins.filter { ids.contains($0.after.id) && ids.contains($0.before.id) } : []
+                let transitionClips = lane.clips.filter { $0.kind.supportsTransitions }
+                let ids = Set(transitionClips.map(\.id))
+                let laneJoins = joins.filter { ids.contains($0.after.id) && ids.contains($0.before.id) }
                 HStack(spacing: 0) {
                   trackHeader(lane, order: order)
                   ZStack(alignment: .topLeading) {
@@ -244,9 +245,9 @@ struct Timeline: View {
                           title: L("接缝转场 ") + tc(join.frame), first: origin, per: per, width: width)
                       }
                     }
-                    if lane.kind == .video {
+                    if !transitionClips.isEmpty {
                       ForEach(
-                        lane.clips.filter {
+                        transitionClips.filter {
                           let origin = selected.contains($0.id) ? movedLeft : left
                           return ($0.startEffect != nil || $0.endEffect != nil)
                             && Double($0.end) >= origin && Double($0.start) <= origin + seen
@@ -264,15 +265,15 @@ struct Timeline: View {
                         }
                       }
                       TransitionDropHighlight(
-                        shelf: e.shelf, joins: laneJoins, clips: lane.clips, first: left, per: per, width: width)
+                        shelf: e.shelf, joins: laneJoins, clips: transitionClips, first: left, per: per, width: width)
                     }
                     Needle(t: e.transport, first: left, per: per).allowsHitTesting(false)
                   }.clipped()
                     .background(MarqueeTarget(id: lane.id, space: marqueeSpace))
                     .background {
-                      if lane.kind == .video {
+                      if !transitionClips.isEmpty {
                         DropBandReader(
-                          first: left, per: per, joins: laneJoins, clips: lane.clips,
+                          first: left, per: per, joins: laneJoins, clips: transitionClips,
                           viewport: viewport.frame(in: .named(DropBandKey.coordinateSpace)))
                       }
                     }

@@ -16,8 +16,8 @@ enum BackgroundKey {
 
   static let defaultSensitivity = 0.40
 
-  static func image(_ source: CGImage, sensitivity: Double, strength: Double) -> CGImage {
-    guard strength > 0, let key = edgeColor(in: source) else { return source }
+  static func image(_ source: CGImage, sensitivity: Double, strength: Double, color: UInt32? = nil) -> CGImage {
+    guard strength > 0, let key = color.map(tone) ?? edgeColor(in: source) else { return source }
     let outer = Float(0.055 + 0.30 * sensitivity)
     let inner = outer * 0.68
     let input = CIImage(cgImage: source)
@@ -29,6 +29,25 @@ enum BackgroundKey {
       return result
     }
     return softwareKey(source, key: key, inner: inner, outer: outer, strength: Float(strength))
+  }
+
+  static func hex(_ color: UInt32) -> String { String(format: "#%06X", color) }
+
+  static func sample(_ image: CGImage, at point: CGPoint) -> UInt32? {
+    guard (0..<1).contains(point.x), (0..<1).contains(point.y),
+      let pixel = image.cropping(to: CGRect(x: Int(point.x * CGFloat(image.width)),
+                                            y: Int(point.y * CGFloat(image.height)), width: 1, height: 1)),
+      let context = bitmap(1, 1), let bytes = context.data?.assumingMemoryBound(to: UInt8.self)
+    else { return nil }
+    context.draw(pixel, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+    let alpha = Int(bytes[3])
+    guard alpha >= 128 else { return nil }
+    func component(_ index: Int) -> UInt32 { UInt32(min(255, (Int(bytes[index]) * 255 + alpha / 2) / alpha)) }
+    return (component(2) << 16) | (component(1) << 8) | component(0)
+  }
+
+  private static func tone(_ color: UInt32) -> Tone {
+    Tone(Float((color >> 16) & 255), Float((color >> 8) & 255), Float(color & 255)) / 255
   }
 
   private static func edgeColor(in source: CGImage) -> Tone? {

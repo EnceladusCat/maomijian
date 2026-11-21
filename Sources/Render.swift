@@ -123,7 +123,8 @@ struct WrappedText {
     para.lineBreakMode = .byWordWrapping
     var fs =
       caption.map { $0.fontSize * unit } ?? appearance.map { $0.size * unit }
-      ?? (rect.height * (c.kind == .caption ? 0.60 : 0.71))
+      ?? (rect.height * (c.kind == .caption ? (c.captionTranslation == nil ? 0.60 : 0.30) : 0.71))
+    let text = c.kind == .caption ? c.captionText : c.text
     var setter: CTFramesetter!
     var measured = CGSize.zero
     for _ in 0..<32 {
@@ -140,7 +141,7 @@ struct WrappedText {
         attributes[.strokeWidth] = -100 * style.outlineWidth * unit / pointSize
       }
       if c.kind == .text && c.textAnimation?.characters == true { attributes[.ligature] = 0 }
-      let attr = NSAttributedString(string: c.text, attributes: attributes)
+      let attr = NSAttributedString(string: text, attributes: attributes)
       setter = CTFramesetterCreateWithAttributedString(attr)
       measured = CTFramesetterSuggestFrameSizeWithConstraints(
         setter, CFRangeMake(0, 0), nil,
@@ -160,15 +161,23 @@ struct WrappedText {
   }
 }
 
-private func artHeight(_ c: Clip, size: CGSize, style: CaptionStyle?) -> CGFloat {
+private func captionBaseHeight(_ c: Clip, size: CGSize, style: CaptionStyle?) -> CGFloat {
   let original = size.height * c.h
   guard c.kind == .caption, let style else { return original }
   let unit = min(size.width, size.height) / 1080
   return max(original, (style.fontSize * 1.6 + style.outlineWidth * 2 + 18) * unit)
 }
+
+func artworkBounds(_ c: Clip, size: CGSize, style: CaptionStyle?) -> CGRect {
+  let width = c.w * size.width
+  let base = captionBaseHeight(c, size: size, style: style)
+  let height = c.kind == .caption && c.captionTranslation != nil ? min(base * 2, max(base, size.height)) : base
+  // Keep the lower edge in the same place when a second language is added.
+  return CGRect(x: -width / 2, y: -base / 2, width: width, height: height)
+}
 func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil, waitingForReveal: Bool = false) -> CGImage? {
   let w = max(2, Int((c.w * size.width).rounded()))
-  let h = max(2, Int(artHeight(c, size: size, style: style).rounded()))
+  let h = max(2, Int(artworkBounds(c, size: size, style: style).height.rounded()))
   guard let g = bitmap(w, h) else { return nil }
   let rect = CGRect(x: 0, y: 0, width: w, height: h)
   let col = ink(c.color)
@@ -209,7 +218,7 @@ func artwork(_ c: Clip, size: CGSize, style: CaptionStyle? = nil, waitingForReve
     let layout = WrappedText(c, in: rect, unit: unit, style: style)
     let pad = layout.padding
     let measured = layout.measured
-    if c.kind == .caption && !c.text.isEmpty {
+    if c.kind == .caption && !c.captionText.isEmpty {
       let bw = min(rect.width, max(10, measured.width + 4 * pad))
       let bh = min(rect.height, measured.height + 2 * pad)
       let back = CGRect(x: (rect.width - bw) / 2, y: (rect.height - bh) / 2, width: bw, height: bh)
@@ -352,6 +361,7 @@ final class FramePainter {
   let project: Project
   private let preview: Bool
   private let motionPreview: FramePainter?
+  private let artworkJoins: [UUID: [Project.Join]]
   private let groupedArtwork: [UUID: [Clip]]
   private let clipOrder: [UUID: Int]
   private let trackDepth: [UUID: Int]?
@@ -378,6 +388,12 @@ final class FramePainter {
     self.preview = preview
     self.audioSignals = audioSignals
     trackDepth = project.visualTrackDepth()
+    var links: [UUID: [Project.Join]] = [:]
+    for join in project.artworkJoins where join.active {
+      links[join.before.id, default: []].append(join)
+      links[join.after.id, default: []].append(join)
+    }
+    artworkJoins = links
     var artworkByGroup: [UUID: [Clip]] = [:]
     for clip in project.clips where !clip.kind.isMedia {
       if let group = clip.groupID { artworkByGroup[group, default: []].append(clip) }
@@ -440,7 +456,8 @@ final class FramePainter {
       styles.reduce(picture.image) { image, filter in
         switch filter.look {
         case .prism: return ChromaticRadial.shift(image, amount: filter.amount)
-        case .backgroundKey: return BackgroundKey.image(image, sensitivity: filter.sensitivity, strength: filter.amount)
+        case .backgroundKey:
+          return BackgroundKey.image(image, sensitivity: filter.sensitivity, strength: filter.amount, color: filter.keyColor)
         default: return FootageLook.image(image, look: filter.look, amount: filter.amount)
         }
       }
@@ -570,20 +587,52 @@ final class FramePainter {
 
   private func paintTransition(
     _ look: TransitionLook, at frame: Int, progress: Double, outgoing: [Clip],
-    entering: [Clip], in g: CGContext, source: (UUID, CGSize) -> Picture?
+    entering: [Clip], in g: CGContext, artworkOnly: Bool = false,
+    source: (UUID, CGSize) -> Picture?
   ) {
+    func paint(_ clips: [Clip], in target: CGContext) {
+      if artworkOnly {
+        target.saveGState()
+        prepareCanvas(target)
+        for clip in clips { paintArtwork(clip, frame: frame, in: target) }
+        target.restoreGState()
+      } else {
+        paintScene(target, frame: frame, active: clips, source: source)
+      }
+    }
     if progress <= 0 || progress >= 1 {
-      paintScene(g, frame: frame, active: progress <= 0 ? outgoing : entering, source: source)
+      paint(progress <= 0 ? outgoing : entering, in: g)
       return
     }
     let rect = CGRect(origin: .zero, size: size)
+    // Keep erasing and additive blends on the transition's own transparent layer.
+    if artworkOnly { g.beginTransparencyLayer(auxiliaryInfo: nil) }
+    defer { if artworkOnly { g.endTransparencyLayer() } }
+    if look == .unfold {
+      paint(outgoing, in: g)
+      let opening = rect.insetBy(dx: rect.width * (1 - ease(progress)) / 2, dy: 0)
+      g.saveGState()
+      g.clip(to: opening)
+      if artworkOnly { g.clear(rect) }
+      // A zoom lens reads neighboring pixels, so it needs the full entering scene.
+      if entering.contains(where: { $0.kind == .zoom }),
+        let scene = bitmap(Int(size.width), Int(size.height))
+      {
+        paint(entering, in: scene)
+        if let image = scene.makeImage() { g.draw(image, in: rect) }
+      } else {
+        paint(entering, in: g)
+      }
+      g.restoreGState()
+      return
+    }
     // Keep the configured preview size for clear endpoints and other effects.
     if let reduced = motionPreview, look == .zoom || look == .shake,
       let surface = bitmap(Int(reduced.size.width), Int(reduced.size.height))
     {
       reduced.paintTransition(
         look, at: frame, progress: progress, outgoing: outgoing, entering: entering,
-        in: surface, source: source)
+        in: surface, artworkOnly: artworkOnly, source: source)
       if let image = surface.makeImage() {
         g.saveGState()
         g.interpolationQuality = .low
@@ -595,15 +644,21 @@ final class FramePainter {
     guard let composite = bitmap(Int(size.width), Int(size.height)),
       let scene = bitmap(Int(size.width), Int(size.height))
     else {
-      paintScene(g, frame: frame, active: progress < 0.5 ? outgoing : entering, source: source)
+      paint(progress < 0.5 ? outgoing : entering, in: g)
       return
     }
+    func snapshot(_ parts: [Clip]) -> CGImage? {
+      if artworkOnly { scene.clear(rect) }
+      paint(parts, in: scene)
+      return scene.makeImage()
+    }
     func drawScene(_ parts: [Clip], in target: CGContext, rect: CGRect) {
-      paintScene(scene, frame: frame, active: parts, source: source)
-      if let image = scene.makeImage() { target.draw(image, in: rect) }
+      if let image = snapshot(parts) { target.draw(image, in: rect) }
     }
 
     switch look {
+    case .unfold:
+      break
     case .slide:
       let phase = SlidePhase(progress)
       let seam = size.width * (1 - phase.travel)
@@ -641,9 +696,12 @@ final class FramePainter {
       let edge = sin(travel * .pi)
       let width = max(1, size.width * abs(cos(travel * .pi)))
       let face = CGRect(x: (size.width - width) / 2, y: 0, width: width, height: size.height)
-      composite.setFillColor(ink(project.background))
-      composite.fill(rect)
+      if !artworkOnly {
+        composite.setFillColor(ink(project.background))
+        composite.fill(rect)
+      }
       drawScene(travel < 0.5 ? outgoing : entering, in: composite, rect: face)
+      if artworkOnly { composite.setBlendMode(.sourceAtop) }
       composite.setFillColor(ink("#000000", edge * 0.45))
       composite.fill(face)
       if let image = composite.makeImage() {
@@ -651,8 +709,12 @@ final class FramePainter {
       }
     case .zoom:
       let mix = ease((progress - 0.36) / 0.28)
-      if mix < 1 { drawScene(outgoing, in: composite, rect: rect) }
+      if mix < 1 {
+        if artworkOnly { composite.setAlpha(1 - mix) }
+        drawScene(outgoing, in: composite, rect: rect)
+      }
       if mix > 0 {
+        if artworkOnly { composite.setBlendMode(.plusLighter) }
         composite.setAlpha(mix)
         drawScene(entering, in: composite, rect: rect)
       }
@@ -674,18 +736,15 @@ final class FramePainter {
       g.restoreGState()
     case .shake where preview && (progress <= 0.42 || progress >= 0.58):
       // The fade is fully opaque on one side outside the middle of the shake.
-      paintScene(scene, frame: frame, active: progress <= 0.42 ? outgoing : entering, source: source)
-      if let image = scene.makeImage() {
+      if let image = snapshot(progress <= 0.42 ? outgoing : entering) {
         TransitionEffects.shake(image, progress: progress, in: g, canvas: rect, preview: true)
       }
     case .dissolve, .warp, .glitch, .comparison, .fire, .shake:
-      paintScene(scene, frame: frame, active: outgoing, source: source)
-      guard let before = scene.makeImage() else { return }
-      paintScene(scene, frame: frame, active: entering, source: source)
-      guard let after = scene.makeImage() else { return }
+      guard let before = snapshot(outgoing), let after = snapshot(entering) else { return }
       TransitionEffects.draw(
         look, before: before, after: after,
-        progress: progress, in: g, scratch: composite, canvas: rect, preview: preview)
+        progress: progress, in: g, scratch: composite, canvas: rect, preview: preview,
+        transparent: artworkOnly)
     }
   }
   func paintCaptions(_ g: CGContext, frame: Int, active: [Clip]) {
@@ -749,9 +808,7 @@ final class FramePainter {
       if let shadow = c.textAppearance?.shadow, shadow.enabled && shadow.opacity > 0 {
         setTextShadow(shadow, unit: unit, in: g)
       }
-      let w = c.w * W
-      let h = artHeight(c, size: size, style: project.captionStyle)
-      g.draw(image, in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
+      g.draw(image, in: artworkBounds(c, size: size, style: project.captionStyle))
     }
     g.restoreGState()
   }
@@ -783,6 +840,111 @@ final class FramePainter {
     layout.draw(in: frame, progress: progress, context: g)
   }
 
+  func backgroundKeyPreview(_ clip: Clip, picture: Picture, frame: Int, filterIndex: Int) -> CGImage? {
+    let stack = clip.filters
+    guard stack.indices.contains(filterIndex), stack[filterIndex].look == .backgroundKey,
+      let g = bitmap(Int(size.width), Int(size.height)) else { return nil }
+    var input = clip
+    input.filters = Array(stack.prefix(filterIndex))
+    input.opacity = 1
+    prepareCanvas(g)
+    paintFootage(input, picture: picture, frame: frame, in: g, decorations: false)
+    return g.makeImage()
+  }
+
+  private func paintFootage(_ c: Clip, picture p: Picture, frame: Int, in g: CGContext, decorations: Bool = true) {
+    g.saveGState()
+    defer { g.restoreGState() }
+    var cacheable = decorations
+    let filters = c.filters.map { filter in
+      var current = filter
+      current.amount = c.filterIntensity(filter, at: frame)
+      if filter.look != .camera && current.amount != filter.amount { cacheable = false }
+      return current
+    }
+    let im = footage(p, clip: c, filters: filters, cacheable: cacheable)
+    let src = CGRect(x: 0, y: 0, width: im.width, height: im.height)
+    let oriented = src.applying(p.transform)
+    let layout = VisualGeometry(clip: c, canvas: size, aspect: oriented.width / oriented.height)
+    let placement = c.placement(at: frame, canvas: size, geometry: layout)
+    g.translateBy(x: placement.center.x, y: placement.center.y)
+    g.rotate(by: c.angle * .pi / 180)
+    g.scaleBy(x: placement.scale, y: placement.scale)
+    g.setAlpha(c.opacity)
+    if let inset = c.pictureInset {
+      g.addPath(inset.shape.path(layout.visible))
+      g.clip()
+    } else { g.clip(to: layout.visible) }
+    let matteOverlays = decorations && filters.contains { $0.look == .backgroundKey && $0.amount > 0 }
+      && filters.contains { $0.look == .vhs && $0.amount > 0 }
+    if matteOverlays { g.beginTransparencyLayer(auxiliaryInfo: nil) }
+    g.saveGState()
+    g.translateBy(x: layout.full.minX, y: layout.full.minY)
+    g.scaleBy(x: layout.full.width / oriented.width, y: layout.full.height / oriented.height)
+    g.translateBy(x: -oriented.minX, y: -oriented.minY)
+    g.concatenate(p.transform)
+    g.translateBy(x: 0, y: src.height)
+    g.scaleBy(x: 1, y: -1)
+    g.draw(im, in: src)
+    g.restoreGState()
+    guard decorations else { return }
+    for filter in filters {
+      if matteOverlays && filter.look == .vhs { g.setBlendMode(.sourceAtop) }
+      FootageLook.drawOverlay(
+        filter.look, amount: filter.amount, in: g, rect: layout.visible,
+        frame: max(0, frame - c.start))
+      if matteOverlays && filter.look == .vhs { g.setBlendMode(.normal) }
+    }
+    if matteOverlays { g.endTransparencyLayer() }
+    if let border = c.visualBorder, border.style != .none {
+      let line = min(
+        border.width * min(size.width, size.height) / 1080, min(layout.visible.width, layout.visible.height))
+      g.setStrokeColor(ink(border.color))
+      g.setLineWidth(line)
+      if border.style == .dashed { g.setLineDash(phase: 0, lengths: [4 * line, 2.5 * line]) }
+      let frame = layout.visible.insetBy(dx: line / 2, dy: line / 2)
+      if let inset = c.pictureInset {
+        g.addPath(inset.shape.path(frame))
+        g.strokePath()
+      } else { g.stroke(frame) }
+    }
+  }
+
+  private func paintArtworkTransition(
+    _ c: Clip, frame: Int, active: [Clip], in g: CGContext, source: (UUID, CGSize) -> Picture?
+  ) {
+    func paint(_ look: TransitionLook, span: Range<Int>, before: [Clip], after: [Clip]) {
+      let progress = Double(frame - span.lowerBound) / Double(max(1, span.count - 1))
+      g.saveGState()
+      defer { g.restoreGState() }
+      // The transition painter takes a bottom-up context; artwork is normally drawn top-down.
+      g.translateBy(x: 0, y: size.height)
+      g.scaleBy(x: 1, y: -1)
+      paintTransition(
+        look, at: frame, progress: progress, outgoing: before, entering: after,
+        in: g, artworkOnly: true, source: source)
+    }
+    if let join = artworkJoins[c.id]?.first(where: { $0.range.contains(frame) }),
+      let before = active.first(where: { $0.id == join.before.id }),
+      let after = active.first(where: { $0.id == join.after.id })
+    {
+      if c.id == (frame < join.frame ? before.id : after.id) {
+        paint(after.transitionStyle, span: join.range, before: [before], after: [after])
+      }
+      return
+    }
+    if c.startEffect != nil || c.endEffect != nil {
+      for side in ClipEnd.allCases {
+        guard let span = c.transitionRange(at: side), span.contains(frame),
+          let look = c.effect(at: side)?.style
+        else { continue }
+        paint(look, span: span, before: side == .tail ? [c] : [], after: side == .head ? [c] : [])
+        return
+      }
+    }
+    paintArtwork(c, frame: frame, in: g)
+  }
+
   private func paintScene(_ g: CGContext, frame: Int, active: [Clip], source: (UUID, CGSize) -> Picture?) {
     let W = size.width
     let H = size.height
@@ -793,61 +955,7 @@ final class FramePainter {
     g.fill(r)
     prepareCanvas(g)
     func paintVideo(_ c: Clip) {
-      guard let p = source(c.id, size) else { return }
-      g.saveGState()
-      var cacheable = true
-      let filters = c.filters.map { filter in
-        var current = filter
-        current.amount = c.filterIntensity(filter, at: frame)
-        if filter.look != .camera && current.amount != filter.amount { cacheable = false }
-        return current
-      }
-      let im = footage(p, clip: c, filters: filters, cacheable: cacheable)
-      let src = CGRect(x: 0, y: 0, width: im.width, height: im.height)
-      let oriented = src.applying(p.transform)
-      let layout = VisualGeometry(clip: c, canvas: size, aspect: oriented.width / oriented.height)
-      let placement = c.placement(at: frame, canvas: size, geometry: layout)
-      g.translateBy(x: placement.center.x, y: placement.center.y)
-      g.rotate(by: c.angle * .pi / 180)
-      g.scaleBy(x: placement.scale, y: placement.scale)
-      g.setAlpha(c.opacity)
-      if let inset = c.pictureInset {
-        g.addPath(inset.shape.path(layout.visible))
-        g.clip()
-      } else { g.clip(to: layout.visible) }
-      let matteOverlays = filters.contains { $0.look == .backgroundKey && $0.amount > 0 }
-        && filters.contains { $0.look == .vhs && $0.amount > 0 }
-      if matteOverlays { g.beginTransparencyLayer(auxiliaryInfo: nil) }
-      g.saveGState()
-      g.translateBy(x: layout.full.minX, y: layout.full.minY)
-      g.scaleBy(x: layout.full.width / oriented.width, y: layout.full.height / oriented.height)
-      g.translateBy(x: -oriented.minX, y: -oriented.minY)
-      g.concatenate(p.transform)
-      g.translateBy(x: 0, y: src.height)
-      g.scaleBy(x: 1, y: -1)
-      g.draw(im, in: src)
-      g.restoreGState()
-      for filter in filters {
-        if matteOverlays && filter.look == .vhs { g.setBlendMode(.sourceAtop) }
-        FootageLook.drawOverlay(
-          filter.look, amount: filter.amount, in: g, rect: layout.visible,
-          frame: max(0, frame - c.start))
-        if matteOverlays && filter.look == .vhs { g.setBlendMode(.normal) }
-      }
-      if matteOverlays { g.endTransparencyLayer() }
-      if let border = c.visualBorder, border.style != .none {
-        let line = min(
-          border.width * min(W, H) / 1080, min(layout.visible.width, layout.visible.height))
-        g.setStrokeColor(ink(border.color))
-        g.setLineWidth(line)
-        if border.style == .dashed { g.setLineDash(phase: 0, lengths: [4 * line, 2.5 * line]) }
-        let frame = layout.visible.insetBy(dx: line / 2, dy: line / 2)
-        if let inset = c.pictureInset {
-          g.addPath(inset.shape.path(frame))
-          g.strokePath()
-        } else { g.stroke(frame) }
-      }
-      g.restoreGState()
+      if let picture = source(c.id, size) { paintFootage(c, picture: picture, frame: frame, in: g) }
     }
     func paintLenses(_ lenses: [Clip]) {
       guard !lenses.isEmpty else { return }
@@ -903,13 +1011,13 @@ final class FramePainter {
         case .zoom: paintLenses([clip])
         case .highlight: paintHighlights([clip])
         case .audio, .caption: break
-        default: paintArtwork(clip, frame: frame, in: g)
+        default: paintArtworkTransition(clip, frame: frame, active: active, in: g, source: source)
         }
       }
     } else {
       for clip in active where clip.kind == .video && clip.pictureInset == nil { paintVideo(clip) }
       for clip in active where clip.kind.isArt && !clip.kind.isRegion && clip.kind != .caption {
-        paintArtwork(clip, frame: frame, in: g)
+        paintArtworkTransition(clip, frame: frame, active: active, in: g, source: source)
       }
       paintLenses(active.filter { $0.kind == .zoom })
       let lights = active.filter { $0.kind == .highlight }

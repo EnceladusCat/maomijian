@@ -555,6 +555,7 @@ func buildComposition(
 ) throws -> Composition {
   let graph = try existing ?? buildMediaGraph(p, cancelled: cancelled)
   let visibleVideo = p.videoVisibility
+  let visibleArtwork = p.artworkTransitionVisibility
   let vc = AVMutableVideoComposition()
   let size = p.canvas.size(short)
   let signals = audioSignals(in: p, cancelled: cancelled)
@@ -564,7 +565,7 @@ func buildComposition(
   var begins = [Int: [Int]]()
   var ends = [Int: [Int]]()
   for (i, c) in p.clips.enumerated() where c.kind != .audio {
-    let span = visibleVideo[c.id] ?? (c.start..<c.end)
+    let span = visibleVideo[c.id] ?? visibleArtwork[c.id] ?? (c.start..<c.end)
     begins[span.lowerBound, default: []].append(i)
     ends[span.upperBound, default: []].append(i)
   }

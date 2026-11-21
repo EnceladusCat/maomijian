@@ -113,7 +113,8 @@ struct BatchCutPanel: View {
         }.padding(.top, 7)
         Text(L("第一份从原值开始，后续各份按序号累加。填入后仍可单独修改。"))
           .font(.caption).foregroundStyle(UI.muted).padding(.top, 5)
-      }.padding(10).background(UI.well, in: RoundedRectangle(cornerRadius: 6))
+      }.disclosureGroupStyle(SettingsDisclosureStyle())
+        .padding(10).background(UI.well, in: RoundedRectangle(cornerRadius: 6))
 
       if let plan = draft.plan {
         partsTable(plan.parts)

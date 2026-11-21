@@ -49,10 +49,13 @@ struct TransitionMarker: View {
           .frame(width: right - left, height: active ? 15 : 9)
           .contentShape(Rectangle())
       }.buttonStyle(.plain)
+        .overlay {
+          if active { TransitionDragSurface(e: editor, origin: .marker(target)) }
+        }
         .position(x: (left + right) / 2, y: active ? 10 : 8)
         .onHover { hovering = $0 }
         .accessibilityLabel(effect.map { L("编辑\(LKey($0.style.rawValue))，\(title)") } ?? L("添加\(title)"))
-        .help(active ? L("点击选中转场，拖动边缘调整时长") : L("添加转场，也可从转场面板拖放"))
+        .help(active ? L("拖动转场改变位置，拖动边缘调整时长") : L("添加转场，也可从转场面板拖放"))
         .contextMenu {
           if active {
             Button(L("预览转场")) { editor.previewTransition(target) }
@@ -64,8 +67,9 @@ struct TransitionMarker: View {
           let realX = x(side == .head ? initial.lowerBound : initial.upperBound)
           let visibleX = x(side == .head ? span.lowerBound : span.upperBound)
           if realX >= 0, realX <= width {
-            durationHandle(side, frames: effect.frames, color: color)
-              .position(x: bound(visibleX, 4, width - 4), y: 16)
+            let hitWidth = min(18, max(8, half * 0.8))
+            durationHandle(side, frames: effect.frames, color: color, hitWidth: hitWidth)
+              .position(x: bound(visibleX, 4, width - 4), y: 15)
           }
         }
       }
@@ -80,7 +84,7 @@ struct TransitionMarker: View {
     }
   }
 
-  private func durationHandle(_ side: ClipEnd, frames: Int, color: Color) -> some View {
+  private func durationHandle(_ side: ClipEnd, frames: Int, color: Color, hitWidth: Double) -> some View {
     let multiplier: Double
     switch target {
     case .join: multiplier = 2
@@ -94,7 +98,7 @@ struct TransitionMarker: View {
     return RoundedRectangle(cornerRadius: 1)
       .fill(color.opacity(selected || hovering || resizing != nil ? 1 : 0.65))
       .frame(width: 3, height: 7)
-      .frame(width: 10, height: 10)
+      .frame(width: hitWidth, height: 22)
       .contentShape(Rectangle())
       .onHover { inside in
         if inside { NSCursor.resizeLeftRight.set() }
@@ -103,7 +107,6 @@ struct TransitionMarker: View {
       .gesture(
         DragGesture(minimumDistance: 1, coordinateSpace: .global)
           .onChanged { value in
-            if resizing == nil { editor.selectTransition(target) }
             resizing = duration(value.translation.width)
           }
           .onEnded { value in

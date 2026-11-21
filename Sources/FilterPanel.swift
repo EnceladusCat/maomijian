@@ -61,9 +61,10 @@ struct FilterStackRows: View {
           }
         }
         if filter.look == .backgroundKey {
+          backgroundColorControls(filter, index: index)
           NumberRow(label: L("敏感度"), value: filter.sensitivity * 100, range: 0...100, unit: "%") { value in
             edit(index) { $0[index].keySensitivity = value / 100 }
-          }.help(L("从素材边缘自动取色。提高敏感度会去除更多相近颜色。"))
+          }.help(L("提高敏感度会去除更多相近颜色。"))
         } else {
           NumberRow(label: L("强度"), value: filter.amount * 100, range: 0...100, unit: "%") { value in
             edit(index) { $0[index].amount = value / 100 }
@@ -78,8 +79,34 @@ struct FilterStackRows: View {
               edit(index) { $0[index].fadeOutFrames = value }
             }
           }.padding(.top, 6)
-        }.font(.caption)
+        }.disclosureGroupStyle(SettingsDisclosureStyle()).font(.caption)
       }.padding(7).background(UI.well, in: RoundedRectangle(cornerRadius: 5))
+    }
+  }
+
+  @ViewBuilder private func backgroundColorControls(_ filter: ClipFilter, index: Int) -> some View {
+    Button {
+      editor.beginBackgroundColorPick(clipID: clip.id, filterIndex: index)
+    } label: {
+      Label(L("吸管取色"), systemImage: "eyedropper")
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }.buttonStyle(QuietButton())
+      .help(L("在预览中点击要去除的颜色。"))
+    if let color = filter.keyColor {
+      let hex = BackgroundKey.hex(color)
+      HStack(spacing: 5) {
+        RoundedRectangle(cornerRadius: 3).fill(Color(cgColor: ink(hex)))
+          .overlay(RoundedRectangle(cornerRadius: 3).strokeBorder(UI.muted.opacity(0.5)))
+          .frame(width: 14, height: 14)
+          .accessibilityHidden(true)
+        Text(hex).monospaced().foregroundStyle(UI.muted).lineLimit(1)
+        Spacer(minLength: 0)
+        Tool(symbol: "arrow.counterclockwise", label: L("恢复自动取色"), size: 20) {
+          edit(index) { $0[index].keyColor = nil }
+        }
+      }.font(.caption)
+    } else {
+      Text(L("自动取色")).font(.caption).foregroundStyle(UI.muted)
     }
   }
 

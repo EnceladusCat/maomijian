@@ -138,31 +138,6 @@ struct PlayerSurface: NSViewRepresentable {
     nsView.layer?.backgroundColor = ink(background)
   }
 }
-struct TransportBar: View {
-  @ObservedObject var t: Transport
-  let e: Editor
-  let duration: Int
-  var body: some View {
-    HStack(spacing: 8) {
-      Text(tc(t.frame)).font(.system(size: 14, weight: .medium, design: .monospaced))
-      Text("/ " + tc(duration)).font(.system(size: 11, design: .monospaced)).foregroundStyle(
-        UI.muted)
-      Spacer()
-      Tool(symbol: "backward.end.fill", label: L("回到开头")) { e.seek(0) }
-      Button(action: e.play) {
-        Image(systemName: t.playing ? "pause.fill" : "play.fill")
-          .font(.system(size: 14, weight: .semibold))
-          .padding(.leading, t.playing ? 0 : 2)
-          .frame(width: 36, height: 36)
-          .foregroundStyle(UI.deep)
-          .background(UI.mint, in: Circle())
-          .contentShape(Circle())
-      }.buttonStyle(.plain).disabled(duration == 0).opacity(duration == 0 ? 0.42 : 1)
-        .accessibilityLabel(L("播放 / 暂停（空格）")).help(L("播放 / 暂停（空格）"))
-      Tool(symbol: "forward.end.fill", label: L("跳到结尾")) { e.seek(duration) }
-    }.padding(.horizontal, 16).frame(height: 46)
-  }
-}
 struct Preview: View {
   @ObservedObject var e: Editor
   @ObservedObject var t: Transport
@@ -209,27 +184,29 @@ struct Preview: View {
         let h = shape.height * factor * displayZoom
         let canvasSize = CGSize(width: w, height: h)
         let drawing = e.pathDrawingID
+        let colorPick = e.backgroundColorPick
+        let regionTool = e.regionTool
         ZStack {
           UI.deep
           ZStack {
             PlayerSurface(player: e.player, background: e.p.background).allowsHitTesting(false)
             LiveCanvasOverlay(preview: e.liveCanvas)
-            if e.p.clips.isEmpty {
-              VStack(spacing: 13) {
-                Image(systemName: "film.stack").font(.system(size: 32, weight: .light))
-                  .foregroundStyle(UI.muted)
-                Button(L("导入素材"), action: e.importPanel).buttonStyle(PrimaryButton())
-                Text(L("也可以把文件拖到窗口中")).font(.caption).foregroundStyle(UI.muted)
-              }
-            }
             let selectedRegion = (e.selectedIDs.count == 1 ? e.clip : nil).flatMap { c in
               c.kind.isRegion && c.start <= t.frame && t.frame < c.end ? c : nil
             }
-            if let id = drawing {
+            if let colorPick {
+              if let image = colorPick.image {
+                UI.deep
+                Image(decorative: image, scale: 1).resizable().allowsHitTesting(false)
+                BackgroundColorPickSurface(pick: e.useBackgroundSample)
+                  .frame(width: w, height: h)
+                  .accessibilityLabel(L("在画布中吸管取色"))
+              }
+            } else if let id = drawing {
               MotionPathDrawingSurface { stroke, canvas in e.finishPathDrawing(for: id, stroke: stroke, canvas: canvas) }
                 .frame(width: w, height: h).id(id)
                 .accessibilityLabel(L("绘制运动路径"))
-            } else if !hand && (e.regionTool != nil || selectedRegion != nil) {
+            } else if regionTool != nil || (!hand && selectedRegion != nil) {
               RegionControls(e: e, c: selectedRegion, size: canvasSize)
             } else if !hand, !t.playing, e.selectedIDs.count == 1, let c = e.clip, c.kind == .video,
               let id = c.asset, let source = e.mediaSizes[id],
@@ -245,15 +222,20 @@ struct Preview: View {
               t.frame < c.end
             {
               let placement = c.placement(at: t.frame, canvas: CGSize(width: w, height: h))
-              let ww = w * c.w * placement.scale
-              let hh = h * c.h * placement.scale
+              let bounds = c.kind == .caption ? artworkBounds(c, size: canvasSize, style: e.p.captionStyle)
+                : CGRect(x: -w * c.w / 2, y: -h * c.h / 2, width: w * c.w, height: h * c.h)
+              let ww = bounds.width * placement.scale
+              let hh = bounds.height * placement.scale
+              let angle = c.angle * .pi / 180
+              let lift = bounds.midY * placement.scale
               RoundedRectangle(cornerRadius: 2).strokeBorder(
                 UI.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3])
               )
               .background(Color.white.opacity(0.002)).frame(width: ww, height: hh).rotationEffect(
                 .degrees(c.angle)
               )
-              .position(x: placement.center.x + delta.width, y: placement.center.y + delta.height)
+              .position(x: placement.center.x + delta.width + sin(angle) * lift,
+                        y: placement.center.y + delta.height - cos(angle) * lift)
               .gesture(
                 DragGesture(minimumDistance: 1, coordinateSpace: .named("canvas")).onChanged { v in
                   delta = v.translation
@@ -273,7 +255,7 @@ struct Preview: View {
                 delta = .zero
               }
             }
-            if drawing == nil, !hand, !t.playing, e.cropID == nil, e.regionTool == nil,
+            if drawing == nil, colorPick == nil, !hand, !t.playing, e.cropID == nil, e.regionTool == nil,
               e.selectedIDs.count == 1, let clip = e.clip, (clip.start..<clip.end).contains(t.frame),
               let path = clip.motionPath
             {
@@ -284,7 +266,11 @@ struct Preview: View {
             .position(
               x: geo.size.width / 2 + pan.width + panGesture.width,
               y: geo.size.height / 2 + pan.height + panGesture.height)
-          if hand && drawing == nil {
+          if e.p.clips.isEmpty && drawing == nil && colorPick == nil && regionTool == nil && !hand {
+            EmptyWorkspaceMenu(e: e, recent: e.recentProjects)
+              .padding(.horizontal, 14).padding(.vertical, 6)
+          }
+          if hand && drawing == nil && colorPick == nil && regionTool == nil {
             Color.white.opacity(0.001).contentShape(Rectangle())
               .gesture(
                 DragGesture(minimumDistance: 0).updating($panGesture) { value, state, _ in
@@ -304,8 +290,9 @@ struct Preview: View {
       HStack(spacing: 6) {
         Tool(symbol: hand ? "hand.raised.fill" : "hand.raised", label: L("拖动画布视图")) {
           hand.toggle()
-        }.foregroundStyle(hand && e.pathDrawingID == nil ? UI.accent : UI.muted)
-          .disabled(e.pathDrawingID != nil)
+        }.foregroundStyle(hand && e.pathDrawingID == nil && e.backgroundColorPick == nil && e.regionTool == nil
+          ? UI.accent : UI.muted)
+          .disabled(e.pathDrawingID != nil || e.backgroundColorPick != nil || e.regionTool != nil)
         Slider(value: $zoom, in: 0.25...4)
           .controlSize(.small).frame(width: 88).accessibilityLabel(L("预览缩放"))
         Text("\(Int((bound(zoom * pinch, 0.25, 4) * 100).rounded()))%")
@@ -316,7 +303,11 @@ struct Preview: View {
           hand = false
         }.buttonStyle(QuietButton())
         Spacer()
-        if e.pathDrawingID != nil {
+        if let pick = e.backgroundColorPick {
+          Text(pick.image == nil ? L("正在准备取色画面…") : L("点击要去除的背景颜色"))
+            .font(.caption).foregroundStyle(UI.mint).lineLimit(1)
+          Button(L("取消"), action: e.cancelBackgroundColorPick).buttonStyle(QuietButton())
+        } else if e.pathDrawingID != nil {
           Text(L("拖动画出素材中心的路径")).font(.caption).foregroundStyle(UI.mint).lineLimit(1)
           Button(L("取消"), action: e.cancelPathDrawing).buttonStyle(QuietButton())
         } else if e.selectedIDs.count == 1 && e.cropID == e.selected && e.cropID != nil {
@@ -421,6 +412,34 @@ struct Library: View {
     }.help(m.path)
   }
 }
+private struct HeaderCommand: View {
+  let symbol: String
+  let label: String
+  let action: () -> Void
+  @Environment(\.isEnabled) private var enabled
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  @State private var hovered = false
+
+  var body: some View {
+    Button(action: action) {
+      Image(systemName: symbol)
+        .font(.system(size: 14, weight: .medium))
+        .frame(width: 29, height: 30)
+        .foregroundStyle(hovered && enabled ? .white : enabled ? UI.muted : UI.muted.opacity(0.44))
+        .background(
+          hovered && enabled ? UI.accent.opacity(0.16) : .clear,
+          in: RoundedRectangle(cornerRadius: 7)
+        )
+        .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .onHover { hovered = $0 }
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.13), value: hovered)
+    .help(label)
+    .accessibilityLabel(label)
+  }
+}
+
 struct Workspace: View {
   @ObservedObject var e: Editor
   @State private var over = false
@@ -429,18 +448,28 @@ struct Workspace: View {
     GeometryReader { geo in
       VStack(spacing: 1) {
         HStack(spacing: 10) {
-          Image(systemName: "square.3.layers.3d.down.right").font(
-            .system(size: 22, weight: .semibold)
-          ).foregroundStyle(UI.accent)
+          SwiftUI.Canvas { context, size in
+            context.withCGContext { graphics in
+              BrandMark.draw(in: CGRect(origin: .zero, size: size), context: graphics)
+            }
+          }.frame(width: 27, height: 27).accessibilityHidden(true)
           Text(AppLanguage.appName).font(.system(size: 19, weight: .bold))
           Divider().frame(height: 17)
-          Text(
-            (e.url?.deletingPathExtension().lastPathComponent ?? L("未命名工程")) + (e.dirty ? " •" : "")
-          ).lineLimit(1)
-          Spacer()
-          Tool(symbol: "arrow.uturn.backward", label: L("撤销（⌘Z）"), act: e.undo).disabled(!e.canUndo)
-          Tool(symbol: "arrow.uturn.forward", label: L("重做（⇧⌘Z）"), act: e.redo).disabled(!e.canRedo)
-          Tool(symbol: "square.and.arrow.down", label: L("保存工程（⌘S）")) { e.save() }
+          let name = e.url?.deletingPathExtension().lastPathComponent ?? L("未命名工程")
+          HStack(spacing: 6) {
+            Text(name).lineLimit(1).truncationMode(.middle).help(name)
+            if e.dirty {
+              Circle().fill(UI.buttonTint).frame(width: 4, height: 4)
+                .help(L("有未保存的更改")).accessibilityLabel(L("有未保存的更改"))
+            }
+          }.frame(maxWidth: 230, alignment: .leading).fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+          NightCityBanner(transport: e.transport, exporting: e.progress != nil)
+            .frame(maxWidth: .infinity).frame(height: 48)
+            .allowsHitTesting(false).accessibilityHidden(true)
+          HeaderCommand(symbol: "arrow.uturn.backward", label: L("撤销（⌘Z）"), action: e.undo).disabled(!e.canUndo)
+          HeaderCommand(symbol: "arrow.uturn.forward", label: L("重做（⇧⌘Z）"), action: e.redo).disabled(!e.canRedo)
+          HeaderCommand(symbol: "square.and.arrow.down", label: L("保存工程（⌘S）")) { e.save() }
           Divider().frame(height: 17)
           if let v = e.progress {
             ProgressView(value: v).frame(width: 68)

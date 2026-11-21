@@ -7,7 +7,8 @@ enum TransitionEffects {
 
   static func draw(
     _ style: TransitionLook, before: CGImage, after: CGImage,
-    progress: Double, in out: CGContext, scratch: CGContext, canvas: CGRect, preview: Bool = false
+    progress: Double, in out: CGContext, scratch: CGContext, canvas: CGRect, preview: Bool = false,
+    transparent: Bool = false
   ) {
     let pulse = sin(progress * .pi)
     let width = canvas.width
@@ -15,9 +16,9 @@ enum TransitionEffects {
     let short = min(width, height)
     switch style {
     case .dissolve:
-      crossfade(before, after, mix: eased(progress), in: out, rect: canvas)
+      crossfade(before, after, mix: eased(progress), in: out, rect: canvas, transparent: transparent)
     case .warp:
-      crossfade(before, after, mix: eased((progress - 0.27) / 0.46), in: scratch, rect: canvas)
+      crossfade(before, after, mix: eased((progress - 0.27) / 0.46), in: scratch, rect: canvas, transparent: transparent)
       guard let combined = scratch.makeImage() else { return }
       let zoom = canvas.insetBy(dx: -0.34 * width * pulse, dy: -0.34 * height * pulse)
       let image = CIImage(cgImage: combined)
@@ -46,7 +47,7 @@ enum TransitionEffects {
       }
     case .glitch:
       let mix = eased((progress - 0.32) / 0.36)
-      crossfade(before, after, mix: mix, in: scratch, rect: canvas)
+      crossfade(before, after, mix: mix, in: scratch, rect: canvas, transparent: transparent)
       guard let base = scratch.makeImage() else { return }
       out.draw(ChromaticRadial.shift(base, amount: pulse * 0.78), in: canvas)
       let tick = Int(progress * 29)
@@ -61,7 +62,7 @@ enum TransitionEffects {
         out.draw(
           index % 4 == 0 ? (progress < 0.5 ? after : before) : base,
           in: canvas.insetBy(dx: -abs(shift), dy: 0).offsetBy(dx: shift, dy: 0))
-        out.setBlendMode(.screen)
+        out.setBlendMode(transparent ? .sourceAtop : .screen)
         out.setFillColor(ink(colors[(tick + index) % colors.count], 0.18 * pulse))
         out.fill(band)
         out.restoreGState()
@@ -79,17 +80,21 @@ enum TransitionEffects {
       out.addLine(to: CGPoint(x: -margin, y: height))
       out.closePath()
       out.clip()
+      if transparent { out.clear(canvas) }
       out.draw(after, in: canvas)
       out.restoreGState()
+      out.saveGState()
+      if transparent { out.setBlendMode(.sourceAtop) }
       out.setStrokeColor(ink("#FFFFFF"))
       out.setLineWidth(thickness)
       out.move(to: CGPoint(x: x - halfSlant, y: 0))
       out.addLine(to: CGPoint(x: x + halfSlant, y: height))
       out.strokePath()
+      out.restoreGState()
     case .fire:
-      fire(before, after, progress: progress, in: out, canvas: canvas)
+      fire(before, after, progress: progress, in: out, canvas: canvas, transparent: transparent)
     case .shake:
-      crossfade(before, after, mix: eased((progress - 0.42) / 0.16), in: scratch, rect: canvas)
+      crossfade(before, after, mix: eased((progress - 0.42) / 0.16), in: scratch, rect: canvas, transparent: transparent)
       guard let combined = scratch.makeImage() else { return }
       shake(combined, progress: progress, in: out, canvas: canvas, preview: preview)
     default:
@@ -130,10 +135,12 @@ enum TransitionEffects {
 
   private static func crossfade(
     _ before: CGImage, _ after: CGImage, mix: Double,
-    in g: CGContext, rect: CGRect
+    in g: CGContext, rect: CGRect, transparent: Bool
   ) {
-    g.draw(before, in: rect)
     g.saveGState()
+    if transparent { g.setAlpha(1 - mix) }
+    g.draw(before, in: rect)
+    if transparent { g.setBlendMode(.plusLighter) }
     g.setAlpha(mix)
     g.draw(after, in: rect)
     g.restoreGState()
@@ -147,7 +154,7 @@ enum TransitionEffects {
 
   private static func fire(
     _ before: CGImage, _ after: CGImage, progress: Double,
-    in g: CGContext, canvas: CGRect
+    in g: CGContext, canvas: CGRect, transparent: Bool
   ) {
     let width = canvas.width
     let height = canvas.height
@@ -165,8 +172,12 @@ enum TransitionEffects {
     g.addLines(between: [.zero] + points + [CGPoint(x: width, y: 0)])
     g.closePath()
     g.clip()
+    if transparent { g.clear(canvas) }
     g.draw(after, in: canvas)
     g.restoreGState()
+    g.saveGState()
+    defer { g.restoreGState() }
+    if transparent { g.setBlendMode(.sourceAtop) }
     let layers = [
       (0.095, 0.07, "#B5340D", 0.38),
       (0.047, 0.045, "#F5590F", 0.9),

@@ -55,13 +55,16 @@ final class PanelUpdates: ObservableObject {
         if next.assets != previous.assets
           || (slide
             ? previous.clips != next.clips
-            : previous.clips.filter { $0.kind == .video } != next.clips.filter { $0.kind == .video })
+            : previous.clips.filter { $0.kind.supportsTransitions } != next.clips.filter { $0.kind.supportsTransitions })
         {
           changed()
         }
       default: break
       }
     }.store(in: &subscriptions)
+    if tab == .annotations {
+      editor.$regionTool.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
+    }
     if tab == .media {
       editor.$libraryIDs.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
       editor.$thumbnails.dropFirst().sink { _ in changed() }.store(in: &subscriptions)
@@ -107,6 +110,8 @@ final class Editor: ObservableObject {
   @Published var regionTool: Kind?
   @Published var cropID: UUID?
   @Published private(set) var pathDrawingID: UUID?
+  @Published private(set) var backgroundColorPick: BackgroundColorPick?
+  private var preparingBackgroundPick: UUID?
   @Published private(set) var mediaSizes = [UUID: CGSize]()
   private var pendingAudition: Range<Int>?
   private var auditionEnd: Int?
@@ -116,6 +121,7 @@ final class Editor: ObservableObject {
   @Published var selectedIDs: [UUID] = [] {
     didSet {
       if let pathDrawingID, selectedIDs != [pathDrawingID] { cancelPathDrawing() }
+      if let pick = backgroundColorPick, selectedIDs != [pick.clipID] { cancelBackgroundColorPick() }
     }
   }
   @Published var libraryIDs: [UUID] = []
@@ -313,6 +319,7 @@ final class Editor: ObservableObject {
   @Published var thumbnails = [UUID: NSImage]()
   let waveforms = WaveformStore()
   let automaticCaptions = AutomaticCaptions()
+  let recentProjects = RecentProjects()
   let transport = Transport(), player = AVPlayer()
   let liveCanvas = LiveCanvasPreview()
   private var baseline = Project(), undoStack = [Project](), redoStack = [Project](),
@@ -362,6 +369,7 @@ final class Editor: ObservableObject {
     if transport.playing { transport.playing = false }
   }
   func seek(_ f: Int) {
+    cancelBackgroundColorPick()
     liveCanvas.clear()
     pause()
     transport.frame = bound(f, 0, p.duration)
@@ -370,6 +378,7 @@ final class Editor: ObservableObject {
   // Keep a single decode in flight while dragging. A release or a transport
   // command invalidates its callback and seeks the exact requested frame.
   func scrub(_ frame: Int) {
+    cancelBackgroundColorPick()
     guard player.currentItem != nil else {
       seek(frame)
       return
@@ -408,6 +417,7 @@ final class Editor: ObservableObject {
       toleranceAfter: .zero)
   }
   func play() {
+    cancelBackgroundColorPick()
     cancelPathDrawing()
     liveCanvas.clear()
     if scrubSession != nil { seek(transport.frame) }
@@ -441,6 +451,7 @@ final class Editor: ObservableObject {
     install(next, keepingCanvasFrame: keepingCanvasFrame)
   }
   private func install(_ project: Project, keepingCanvasFrame: Bool = false) {
+    cancelBackgroundColorPick()
     cancelPathDrawing()
     pause()
     let previousProjectWasDirty = dirty
@@ -560,6 +571,7 @@ final class Editor: ObservableObject {
           self.previewGraph = nil
           self.graphSnapshot = nil
           self.previewComposition = nil
+          self.cancelBackgroundColorPick()
           self.liveCanvas.clear()
           self.pause()
           self.player.replaceCurrentItem(with: nil)
@@ -572,6 +584,7 @@ final class Editor: ObservableObject {
     queue.async(execute: work)
   }
   private func didPrepare() {
+    prepareBackgroundColorPick()
     if playWhenReady {
       playWhenReady = false
       player.play()
@@ -607,6 +620,7 @@ final class Editor: ObservableObject {
   }
   func beginCrop(_ c: Clip) {
     guard c.kind == .video else { return }
+    cancelBackgroundColorPick()
     cancelPathDrawing()
     regionTool = nil
     if cropID == c.id {
@@ -644,6 +658,76 @@ final class Editor: ObservableObject {
 
   func previewPath(_ c: Clip) { previewRange(c.start..<c.end) }
 
+  func beginBackgroundColorPick(clipID: UUID, filterIndex: Int) {
+    finishWorkspaceTextEditing()
+    guard selectedIDs == [clipID], let clip, clip.kind == .video,
+      clip.filters.indices.contains(filterIndex), clip.filters[filterIndex].look == .backgroundKey
+    else { return }
+    if backgroundColorPick?.clipID == clipID && backgroundColorPick?.filterIndex == filterIndex {
+      cancelBackgroundColorPick()
+      return
+    }
+
+    pause()
+    liveCanvas.clear()
+    cancelPathDrawing()
+    regionTool = nil
+    cropID = nil
+    if !(clip.start..<clip.end).contains(transport.frame) { seek(clip.start) }
+    backgroundColorPick = BackgroundColorPick(clipID: clipID, filterIndex: filterIndex, frame: transport.frame)
+    prepareBackgroundColorPick()
+  }
+
+  func cancelBackgroundColorPick() {
+    if backgroundColorPick != nil { backgroundColorPick = nil }
+    preparingBackgroundPick = nil
+  }
+
+  private func prepareBackgroundColorPick() {
+    guard !busy, let pick = backgroundColorPick, pick.image == nil, preparingBackgroundPick != pick.token,
+      let clip, clip.id == pick.clipID else { return }
+    guard let composition = previewComposition else {
+      cancelBackgroundColorPick()
+      status = L("取色画面未就绪，请再试一次。")
+      return
+    }
+    preparingBackgroundPick = pick.token
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      let image = autoreleasepool {
+        guard let snapshot = composition.canvasFrame(at: pick.frame),
+          let picture = snapshot.pictures[pick.clipID] else { return nil as CGImage? }
+        return snapshot.painter.backgroundKeyPreview(clip, picture: picture, frame: pick.frame,
+                                                     filterIndex: pick.filterIndex)
+      }
+      DispatchQueue.main.async {
+        guard let self, self.backgroundColorPick?.token == pick.token else { return }
+        self.preparingBackgroundPick = nil
+        if let image {
+          self.backgroundColorPick?.image = image
+        } else {
+          self.cancelBackgroundColorPick()
+          self.status = L("取色画面未就绪，请再试一次。")
+        }
+      }
+    }
+  }
+
+  func useBackgroundSample(at point: CGPoint) {
+    guard let pick = backgroundColorPick, let image = pick.image else { return }
+    guard let color = BackgroundKey.sample(image, at: point) else {
+      status = L("请点击当前素材内有颜色的位置。")
+      return
+    }
+    cancelBackgroundColorPick()
+    edit(pick.clipID) { clip in
+      var filters = clip.filters
+      guard filters.indices.contains(pick.filterIndex), filters[pick.filterIndex].look == .backgroundKey
+      else { return }
+      filters[pick.filterIndex].keyColor = color
+      clip.filters = filters
+    }
+  }
+
   func addFilter(_ look: FootageFilter) {
     guard look != .none else { return }
     editSelectedFilters { filters in
@@ -675,14 +759,15 @@ final class Editor: ObservableObject {
   }
   func add(_ kind: Kind) {
     guard kind != .chart && kind != .editorial && kind != .audioVisual else { return }
+    cancelBackgroundColorPick()
     cancelPathDrawing()
     if cropID != nil { cropID = nil }
     pause()
-    if regionTool != nil { regionTool = nil }
     if kind.isRegion {
-      regionTool = kind
+      if regionTool != kind { regionTool = kind }
       return
     }
+    if regionTool != nil { regionTool = nil }
     insertAnnotation(Clip.annotation(kind, at: min(transport.frame, maxFrames - 1)))
   }
   func addChart(_ chart: ChartSpec, appearance: ChartAppearance?, color: String) {
@@ -824,7 +909,9 @@ final class Editor: ObservableObject {
     var c = clip
     c.length = min(c.length, maxFrames - c.start)
     change { $0.clips.append(c) }
+    guard p.clips.last?.id == c.id else { return }
     selected = c.id
+    if !(c.start..<c.end).contains(transport.frame) { seek(c.start) }
   }
   func append(_ asset: Media, at start: Int) { insertAssets([asset], at: start) }
   func insertAssets(_ assets: [Media], at start: Int) {
@@ -978,12 +1065,10 @@ final class Editor: ObservableObject {
   func finishRegion(_ rect: CGRect) {
     guard let kind = regionTool else { return }
     regionTool = nil
-    var c = Clip.annotation(kind, at: transport.frame)
-    c.length = min(c.length, maxFrames - c.start)
+    var c = Clip.annotation(kind, at: min(transport.frame, maxFrames - 1))
     c.regionShape = drawShape
     c.setRegion(drawShape.fit(rect, in: p.canvas.size(540)))
-    change { $0.clips.append(c) }
-    selected = c.id
+    insertAnnotation(c)
   }
   func deselectTransition() {
     if selectedTransition != nil { selectedTransition = nil }
@@ -999,6 +1084,7 @@ final class Editor: ObservableObject {
   }
   func openTab(_ tab: ToolTab) {
     guard toolTab != tab else { return }
+    cancelBackgroundColorPick()
     if tab != .media { libraryMarquee.cancel() }
     libraryFocus = tab == .media
     if regionTool != nil { regionTool = nil }
@@ -1015,6 +1101,17 @@ final class Editor: ObservableObject {
       selectTransition(first)
     } catch { self.error = error.localizedDescription }
   }
+  func moveTransition(from origin: TransitionTarget, to destination: TransitionTarget) {
+    guard origin != destination else { return }
+    var next = p
+    do {
+      try next.moveTransition(from: origin, to: destination)
+      if next != p {
+        change { $0 = next }
+        selectTransition(destination)
+      }
+    } catch { self.error = error.localizedDescription }
+  }
   func applyTransitionCard(_ style: TransitionLook) {
     if let target = selectedTransition {
       placeTransition(style, on: [target])
@@ -1022,7 +1119,7 @@ final class Editor: ObservableObject {
     }
     let targets = TransitionTarget.cardTargets(for: selectedClips)
     guard !targets.isEmpty else {
-      status = L("把效果拖到时间线上的视频或图片")
+      status = L("把效果拖到时间线上的可用片段")
       return
     }
     placeTransition(style, on: targets)
@@ -1288,6 +1385,32 @@ final class Editor: ObservableObject {
     }
   }
 
+  func translateSubtitles(from source: CaptionLanguage) {
+    guard let window = sheetWindow else { return }
+    let lines = SubtitleTranslationLine.snapshot(in: p)
+    guard !lines.isEmpty else { return }
+    let sheet = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: 478, height: 392),
+      styleMask: [.titled], backing: .buffered, defer: false)
+    sheet.title = L("翻译字幕")
+    sheet.appearance = NSAppearance(named: .darkAqua)
+    let generation = generation
+    let close = { [weak window, weak sheet] in
+      if let sheet { window?.endSheet(sheet) }
+    }
+    let view = CaptionTranslationPanel(
+      lines: lines, source: source, close: close
+    ) { [weak self] mode, text in
+      guard let self, self.generation == generation,
+        SubtitleTranslationLine.snapshot(in: self.p) == lines else { return false }
+      self.change { mode.apply(text, to: &$0) }
+      close()
+      return true
+    }
+    sheet.contentView = NSHostingView(rootView: view)
+    window.beginSheet(sheet) { _ in sheet.contentView = nil }
+  }
+
   func reviewSubtitles() {
     guard canExportSubtitles, let window = sheetWindow else { return }
     let sheet = NSPanel(
@@ -1304,10 +1427,13 @@ final class Editor: ObservableObject {
       guard let self, let sheet else { return }
       window?.endSheet(sheet)
       guard self.generation == generation else { return }
-      let text = Dictionary(uniqueKeysWithValues: edited.map { ($0.id, $0.text) })
+      let rows = Dictionary(uniqueKeysWithValues: edited.map { ($0.id, $0) })
       self.change { project in
         for index in project.clips.indices where project.clips[index].kind == .caption {
-          if let replacement = text[project.clips[index].id] { project.clips[index].text = replacement }
+          if let row = rows[project.clips[index].id] {
+            project.clips[index].text = row.text
+            project.clips[index].captionTranslation = row.captionTranslation
+          }
         }
       }
     }
@@ -1371,6 +1497,7 @@ final class Editor: ObservableObject {
     do {
       try p.write(to: dest!)
       url = dest
+      recentProjects.record(dest!)
       baseline = p
       recovery.discard()
       status = L("工程已保存")
@@ -1465,7 +1592,10 @@ final class Editor: ObservableObject {
   func open(_ u: URL) {
     do {
       let next = try Project.read(from: u)
-      if mayLeave() { reset(next, u) }
+      if mayLeave() {
+        reset(next, u)
+        recentProjects.record(u)
+      }
     } catch { self.error = error.localizedDescription }
   }
   private var exportName: String { url?.deletingPathExtension().lastPathComponent ?? L("剪辑") }

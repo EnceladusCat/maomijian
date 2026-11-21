@@ -14,6 +14,22 @@ extension Project {
     orderedTracks(defaultTracks(joins: joins))
   }
 
+  func annotationLanes() -> [[Clip]] { packedLanes(for: .text) }
+
+  private func packedLanes(for kind: Kind) -> [[Clip]] {
+    var lanes = [[Clip]()]
+    let items = clips.filter { kind == .text ? $0.kind.isArt && $0.kind != .caption : $0.kind == kind }
+      .sorted { $0.start < $1.start }
+    for clip in items {
+      if let index = lanes.firstIndex(where: { ($0.last?.end ?? 0) <= clip.start }) {
+        lanes[index].append(clip)
+      } else {
+        lanes.append([clip])
+      }
+    }
+    return lanes
+  }
+
   private func defaultTracks(joins: [Join]) -> [TimelineTrack] {
     var tracks: [TimelineTrack] = []
     for (kind, title) in [
@@ -25,17 +41,9 @@ extension Project {
         }
         continue
       }
-      var rows = [TimelineTrack(title: title, kind: kind, index: 0, clips: [])]
-      let items = clips.filter { kind == .text ? $0.kind.isArt && $0.kind != .caption : $0.kind == kind }
-        .sorted { $0.start < $1.start }
-      for clip in items {
-        if let i = rows.firstIndex(where: { ($0.clips.last?.end ?? 0) <= clip.start }) {
-          rows[i].clips.append(clip)
-        } else {
-          rows.append(TimelineTrack(title: title, kind: kind, index: rows.count, clips: [clip]))
-        }
+      tracks += packedLanes(for: kind).enumerated().map {
+        TimelineTrack(title: title, kind: kind, index: $0.offset, clips: $0.element)
       }
-      tracks += rows
       if kind == .caption {
         tracks += videoLanes(joins, insets: true).enumerated().map {
           TimelineTrack(title: L("画中画"), kind: .video, index: $0.offset, clips: $0.element, isInset: true)

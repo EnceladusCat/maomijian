@@ -145,6 +145,9 @@ private final class ToolStrip: NSView {
 private final class ToolButton: NSButton {
   let tab: ToolTab
   private var active = false
+  private var hovering = false
+  private var hoverArea: NSTrackingArea?
+  private let selectionBar = CALayer()
 
   init(tab: ToolTab, target: AnyObject, action: Selector) {
     self.tab = tab
@@ -160,24 +163,75 @@ private final class ToolButton: NSButton {
     setButtonType(.momentaryChange)
     focusRingType = .exterior
     wantsLayer = true
-    layer?.cornerRadius = 10
+    layer?.cornerRadius = 7
+    layer?.addSublayer(selectionBar)
+    layer?.borderWidth = 1
+    selectionBar.cornerRadius = 1
     updateStyle()
   }
   required init?(coder: NSCoder) { fatalError() }
+
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+  override func layout() {
+    super.layout()
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    selectionBar.frame = CGRect(x: 0, y: (bounds.height - 16) / 2, width: 2, height: 16)
+    CATransaction.commit()
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let hoverArea { removeTrackingArea(hoverArea) }
+    let area = NSTrackingArea(
+      rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+      owner: self, userInfo: nil)
+    addTrackingArea(area)
+    hoverArea = area
+  }
+
+  override func mouseEntered(with event: NSEvent) {
+    hovering = true
+    updateStyle()
+  }
+
+  override func mouseExited(with event: NSEvent) {
+    hovering = false
+    updateStyle()
+  }
+
   func markSelected(_ next: Bool) {
     guard next != active else { return }
     active = next
     updateStyle()
   }
+
   private func updateStyle() {
-    let color = NSColor(active ? UI.deep : UI.muted)
+    let tint = NSColor(tab.tint)
+    let color = active ? tint : hovering ? .white : NSColor(UI.muted)
     contentTintColor = color
     attributedTitle = NSAttributedString(
       string: LKey(tab.rawValue),
       attributes: [
         .font: NSFont.systemFont(ofSize: 10.5, weight: .medium), .foregroundColor: color,
       ])
-    layer?.backgroundColor = active ? NSColor(tab.tint).cgColor : nil
+    let fill = tint.withAlphaComponent(active ? 0.19 : hovering ? 0.10 : 0.02).cgColor
+    let previous = layer?.presentation()?.backgroundColor ?? layer?.backgroundColor
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    layer?.backgroundColor = fill
+    layer?.borderColor = tint.withAlphaComponent(active ? 0.40 : hovering ? 0.24 : 0.08).cgColor
+    selectionBar.backgroundColor = active ? tint.cgColor : NSColor.clear.cgColor
+    CATransaction.commit()
+    if let previous, window?.isKeyWindow == true,
+      !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+      let fade = CABasicAnimation(keyPath: "backgroundColor")
+      fade.fromValue = previous
+      fade.toValue = fill
+      fade.duration = 0.13
+      layer?.add(fade, forKey: "toolTint")
+    }
     setAccessibilityValue(active ? L("已选") : nil)
   }
 }
@@ -211,18 +265,22 @@ struct DropBandReader: View {
   }
 }
 
-private struct TransitionCardDrag: NSViewRepresentable {
+struct TransitionDragSurface: NSViewRepresentable {
+  enum Origin {
+    case card(TransitionLook)
+    case marker(TransitionTarget)
+  }
   let e: Editor
-  let look: TransitionLook
+  let origin: Origin
   func makeNSView(context: Context) -> Surface {
     let view = Surface()
-    view.card = self
+    view.drag = self
     return view
   }
-  func updateNSView(_ view: Surface, context: Context) { view.card = self }
+  func updateNSView(_ view: Surface, context: Context) { view.drag = self }
 
   final class Surface: NSView {
-    var card: TransitionCardDrag?
+    var drag: TransitionDragSurface?
     private var start = CGPoint.zero
     private var dragging = false
     override var isFlipped: Bool { true }
@@ -237,16 +295,22 @@ private struct TransitionCardDrag: NSViewRepresentable {
       dragging = false
     }
     private func targets(_ event: NSEvent) -> [TransitionTarget] {
-      guard let card, let content = window?.contentView else { return [] }
+      guard let drag, let content = window?.contentView else { return [] }
       let point = content.convert(event.locationInWindow, from: nil)
       let workspace = CGPoint(
         x: point.x, y: content.isFlipped ? point.y : content.bounds.height - point.y)
-      guard let band = card.e.dropBands.first(where: { $0.rect.contains(workspace) }) else { return [] }
+      guard let band = drag.e.dropBands.first(where: { $0.rect.contains(workspace) }) else { return [] }
+      let bothEnds: Bool
+      switch drag.origin {
+      case .card: bothEnds = true
+      case .marker: bothEnds = false
+      }
       return TransitionTarget.at(
-        x: workspace.x - band.originX, first: band.first, per: band.per, clips: band.clips, joins: band.joins)
+        x: workspace.x - band.originX, first: band.first, per: band.per, clips: band.clips,
+        joins: band.joins, bothEnds: bothEnds)
     }
     override func mouseDragged(with event: NSEvent) {
-      guard let card else { return }
+      guard let drag else { return }
       if !dragging {
         guard hypot(event.locationInWindow.x - start.x, event.locationInWindow.y - start.y) >= 3
         else { return }
@@ -254,19 +318,27 @@ private struct TransitionCardDrag: NSViewRepresentable {
         NSCursor.closedHand.push()
       }
       let next = targets(event)
-      if card.e.shelf.dropTargets != next { card.e.shelf.dropTargets = next }
+      if drag.e.shelf.dropTargets != next { drag.e.shelf.dropTargets = next }
     }
     override func mouseUp(with event: NSEvent) {
-      guard let card else { return }
+      guard let drag else { return }
       guard dragging else {
-        card.e.applyTransitionCard(card.look)
+        switch drag.origin {
+        case .card(let look): drag.e.applyTransitionCard(look)
+        case .marker(let target): drag.e.selectTransition(target)
+        }
         return
       }
       dragging = false
       NSCursor.pop()
       let next = targets(event)
-      card.e.shelf.dropTargets = []
-      card.e.placeTransition(card.look, on: next)
+      drag.e.shelf.dropTargets = []
+      switch drag.origin {
+      case .card(let look):
+        drag.e.placeTransition(look, on: next)
+      case .marker(let target):
+        if let destination = next.first { drag.e.moveTransition(from: target, to: destination) }
+      }
     }
   }
 }
@@ -310,6 +382,20 @@ private struct TransitionSwatch: View {
             height: width * 0.59)
           ctx.stroke(Path(r), with: .color(color), lineWidth: 1.5)
         }
+      case .unfold:
+        let frame = box.insetBy(dx: 4, dy: 5)
+        ctx.fill(Path(frame), with: .color(blue))
+        ctx.fill(Path(frame.insetBy(dx: frame.width * 0.28, dy: 0)), with: .color(mint))
+        var arrows = Path()
+        for direction in [-1.0, 1.0] {
+          let tip = frame.midX + direction * 15
+          arrows.move(to: CGPoint(x: frame.midX + direction * 4, y: frame.midY))
+          arrows.addLine(to: CGPoint(x: tip, y: frame.midY))
+          arrows.move(to: CGPoint(x: tip - direction * 4, y: frame.midY - 3))
+          arrows.addLine(to: CGPoint(x: tip, y: frame.midY))
+          arrows.addLine(to: CGPoint(x: tip - direction * 4, y: frame.midY + 3))
+        }
+        ctx.stroke(arrows, with: .color(.white), style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round))
       case .comparison:
         ctx.fill(Path(box.insetBy(dx: 4, dy: 5)), with: .color(blue))
         var split = Path()
@@ -395,7 +481,7 @@ struct TransitionPanel: View {
       active ? UI.accent.opacity(0.16) : UI.deep,
       in: RoundedRectangle(cornerRadius: 5)
     )
-    .contentShape(Rectangle()).overlay { TransitionCardDrag(e: e, look: look) }
+    .contentShape(Rectangle()).overlay { TransitionDragSurface(e: e, origin: .card(look)) }
     .help(L("拖到时间线，或点按应用到选中的素材或转场"))
     .accessibilityElement(children: .ignore).accessibilityLabel(LKey(look.rawValue) + L("效果卡"))
     .accessibilityAddTraits(.isButton).accessibilityAction { e.applyTransitionCard(look) }

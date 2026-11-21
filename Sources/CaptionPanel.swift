@@ -165,9 +165,8 @@ struct CaptionPanel: View {
         Button(L("所选片段")) { selection = true }
       }
       if let stage = automatic.stage {
-        HStack(spacing: 6) {
-          ProgressView().controlSize(.small)
-          Text(stage).font(.caption).foregroundStyle(UI.muted)
+        HStack(alignment: .top, spacing: 6) {
+          CaptionGenerationProgress(stage: stage)
           Spacer(minLength: 2)
           Button(L("停止"), action: automatic.cancel).buttonStyle(QuietButton())
         }
@@ -196,7 +195,7 @@ struct CaptionPanel: View {
           Text(L("在本机识别。首次可能下载语言模型。"))
             .font(.caption).foregroundStyle(UI.muted)
         }.padding(.vertical, 6)
-      }.font(.system(size: 12))
+      }.disclosureGroupStyle(SettingsDisclosureStyle()).font(.system(size: 12))
       Divider()
     } else {
       Text(L("自动字幕需要 macOS 26 或更新版本。"))
@@ -235,6 +234,11 @@ struct CaptionPanel: View {
         Label(L("批量校对…"), systemImage: "text.badge.checkmark")
           .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
       }.buttonStyle(PrimaryButton(tint: UI.mint))
+      Button { e.translateSubtitles(from: language) } label: {
+        Label(L("翻译字幕…"), systemImage: "translate")
+          .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
+      }.buttonStyle(QuietButton())
+        .disabled(!captions.contains { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
       LazyVStack(alignment: .leading, spacing: 0) {
         ForEach(captions) { caption in
           Button {
@@ -244,7 +248,7 @@ struct CaptionPanel: View {
             VStack(alignment: .leading, spacing: 3) {
               Text(tc(caption.start)).font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(UI.color(.caption))
-              Text(caption.text).font(.system(size: 12)).lineLimit(2)
+              Text(caption.captionText).font(.system(size: 12)).lineLimit(3)
                 .foregroundStyle(.white)
             }.padding(.vertical, 7).padding(.horizontal, 7)
               .frame(maxWidth: .infinity, alignment: .leading)
@@ -285,7 +289,7 @@ struct CaptionPanel: View {
         }.buttonStyle(QuietButton()).disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
           .accessibilityLabel(L("保存字幕模板"))
       }.padding(.vertical, 6)
-    }
+    }.disclosureGroupStyle(SettingsDisclosureStyle())
     if !feedback.isEmpty { Text(feedback).font(.caption).foregroundStyle(UI.accent) }
     Divider()
     DisclosureGroup(L("字体与描边"), isExpanded: $showFont) {
@@ -303,7 +307,7 @@ struct CaptionPanel: View {
         number(L("描边宽度"), \.outlineWidth, 0...16)
         if style.outlineWidth > 0 { color(L("描边颜色"), \.outline) }
       }.padding(.vertical, 6)
-    }
+    }.disclosureGroupStyle(SettingsDisclosureStyle())
     Divider()
     DisclosureGroup(L("背景与边框"), isExpanded: $showBox) {
       VStack(alignment: .leading, spacing: 8) {
@@ -318,7 +322,7 @@ struct CaptionPanel: View {
           number(L("边框宽度"), \.borderWidth, 1...16)
         }
       }.padding(.vertical, 6)
-    }
+    }.disclosureGroupStyle(SettingsDisclosureStyle())
   }
 }
 private struct CaptionSwatch: View {
@@ -335,5 +339,40 @@ private struct CaptionSwatch: View {
       RoundedRectangle(cornerRadius: 4).fill(UI.deep)
       if let image { Image(decorative: image, scale: 1).resizable().scaledToFit().padding(5) }
     }.frame(height: 48).accessibilityLabel(L("字幕样式预览"))
+  }
+}
+
+private struct CaptionGenerationProgress: View {
+  let stage: AutomaticCaptions.Stage
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      Text(stage.label).font(.caption.weight(.semibold))
+      switch stage {
+      case .recognizing(let progress):
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+          let value = progress.snapshot()
+          ProgressView(value: value.fraction).controlSize(.small)
+          Text(remainingLabel(value.remainingSeconds, fraction: value.fraction))
+            .font(.caption.monospacedDigit()).foregroundStyle(UI.muted)
+        }
+      case .preparingAudio(let progress):
+        TimelineView(.periodic(from: .now, by: 0.5)) { _ in
+          ProgressView(value: progress.snapshot().fraction).controlSize(.small)
+        }
+      case .preparingModel, .arranging:
+        ProgressView().controlSize(.small)
+      }
+    }.frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  private func remainingLabel(_ seconds: Int?, fraction: Double) -> String {
+    if fraction >= 0.995 { return L("即将完成") }
+    guard let seconds else { return L("正在估计剩余时间…") }
+    let rounded = seconds >= 15 ? ((seconds + 4) / 5) * 5 : seconds
+    let duration = Duration.seconds(rounded).formatted(
+      .units(allowed: [.hours, .minutes, .seconds], width: .abbreviated, maximumUnitCount: 2)
+        .locale(Locale(identifier: AppLanguage.current.rawValue)))
+    return L("预计还需 \(duration)")
   }
 }

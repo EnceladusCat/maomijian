@@ -25,8 +25,51 @@ enum CaptionLanguage: String, CaseIterable {
   }
 }
 
+final class CaptionProgress: @unchecked Sendable {
+  private let lock = NSLock()
+  private let startedAt: TimeInterval
+  private var fraction = 0.0
+  private var elapsed = 0.0
+
+  init(startedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+    self.startedAt = startedAt
+  }
+
+  func update(_ value: Double, at uptime: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+    guard value.isFinite else { return }
+    let next = min(1, value)
+    lock.lock()
+    defer { lock.unlock() }
+    guard next > fraction else { return }
+    fraction = next
+    elapsed = max(0, uptime - startedAt)
+  }
+
+  func snapshot() -> (fraction: Double, remainingSeconds: Int?) {
+    lock.lock()
+    defer { lock.unlock() }
+    guard fraction >= 0.02, elapsed >= 0.5 else { return (fraction, nil) }
+    let estimate = min(86_400, (elapsed / fraction) * (1 - fraction))
+    guard estimate.isFinite else { return (fraction, nil) }
+    return (fraction, Int(estimate.rounded(.up)))
+  }
+}
+
 final class AutomaticCaptions: ObservableObject {
-  @Published private(set) var stage: String?
+  enum Stage {
+    case preparingAudio(CaptionProgress), preparingModel, recognizing(CaptionProgress), arranging
+
+    var label: String {
+      switch self {
+      case .preparingAudio: return L("正在准备音频")
+      case .preparingModel: return L("正在准备语言模型")
+      case .recognizing: return L("正在识别字幕")
+      case .arranging: return L("正在整理字幕")
+      }
+    }
+  }
+
+  @Published private(set) var stage: Stage?
   private var id: UUID?
   private var task: Task<[Clip], Error>?
   private var audioExport: ExportJob?
@@ -49,18 +92,20 @@ final class AutomaticCaptions: ObservableObject {
         let export = ExportJob()
         self.id = id
         audioExport = export
-        stage = L("正在准备音频")
+        let audioProgress = CaptionProgress()
+        stage = .preparingAudio(audioProgress)
         let work = Task.detached(priority: .utility) { [weak self] in
           try Task.checkCancellation()
           let audio = try MediaScratch.shared.make(.audio)
           defer { withExtendedLifetime(audio) {} }
-          try export.runAudio(project, to: audio.url) { _ in }
+          try export.runAudio(project, to: audio.url) { audioProgress.update($0) }
           try Task.checkCancellation()
-          await MainActor.run { [weak self] in self?.report(L("正在准备语言模型"), id: id) }
-          let speech = try await Self.transcribe(audio.url, language: language, terms: terms) {
-            await MainActor.run { [weak self] in self?.report(L("正在识别字幕"), id: id) }
+          await MainActor.run { [weak self] in self?.report(.preparingModel, id: id) }
+          let speech = try await Self.transcribe(audio.url, language: language, terms: terms) { progress in
+            await MainActor.run { [weak self] in self?.report(.recognizing(progress), id: id) }
           }
           try Task.checkCancellation()
+          await MainActor.run { [weak self] in self?.report(.arranging, id: id) }
           return CaptionSegmentation.captions(
             speech, offset: offset, duration: project.duration, language: language.rawValue, terms: terms)
         }
@@ -80,8 +125,8 @@ final class AutomaticCaptions: ObservableObject {
     completion(.failure(EditError.message(L("自动字幕需要 macOS 26 或更新版本。"))))
   }
 
-  private func report(_ message: String, id: UUID) {
-    if self.id == id { stage = message }
+  private func report(_ next: Stage, id: UUID) {
+    if self.id == id { stage = next }
   }
 
   func cancel() {
@@ -99,7 +144,7 @@ final class AutomaticCaptions: ObservableObject {
   extension AutomaticCaptions {
     private static func transcribe(
       _ audio: URL, language: CaptionLanguage, terms: [String],
-      ready: @escaping () async -> Void
+      ready: @escaping (CaptionProgress) async -> Void
     ) async throws -> [RecognizedSpeech] {
       let requested = Locale(identifier: language.rawValue)
       if SpeechTranscriber.isAvailable,
@@ -141,7 +186,7 @@ final class AutomaticCaptions: ObservableObject {
 
     private static func recognize<Results: AsyncSequence & Sendable>(
       _ audio: URL, module: any SpeechModule, results: Results, terms: [String],
-      ready: @escaping () async -> Void, extract: @escaping (Results.Element) -> [RecognizedSpeech]
+      ready: @escaping (CaptionProgress) async -> Void, extract: @escaping (Results.Element) -> [RecognizedSpeech]
     ) async throws -> [RecognizedSpeech] {
       let modules = [module]
       if let install = try await AssetInventory.assetInstallationRequest(supporting: modules) {
@@ -161,7 +206,14 @@ final class AutomaticCaptions: ObservableObject {
         }
         return spans
       }
-      await ready()
+      let progress = CaptionProgress()
+      let audioDuration = Double(file.length) / file.processingFormat.sampleRate
+      if audioDuration.isFinite && audioDuration > 0 {
+        await analyzer.setVolatileRangeChangedHandler { range, changedStart, _ in
+          if changedStart { progress.update(range.start.seconds / audioDuration) }
+        }
+      }
+      await ready(progress)
       return try await withTaskCancellationHandler {
         do {
           if let end = try await analyzer.analyzeSequence(from: file) {

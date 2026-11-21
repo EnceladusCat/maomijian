@@ -1,10 +1,11 @@
 import AppKit
 import SwiftUI
 
-final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
+final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSMenuDelegate {
   let e = Editor()
   var window: NSWindow!, monitor: Any?
   var deferredURL: URL?
+  private var recentMenu: NSMenu?
   func applicationDidFinishLaunching(_ notification: Notification) {
     let view = Workspace(e: e)
     window = NSWindow(
@@ -47,6 +48,10 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
       switch event.keyCode {
       case 53:
         if self.e.timelineMarquee.cancel() || self.e.libraryMarquee.cancel() { return nil }
+        if self.e.backgroundColorPick != nil {
+          self.e.cancelBackgroundColorPick()
+          return nil
+        }
         if self.e.pathDrawingID != nil {
           self.e.cancelPathDrawing()
           return nil
@@ -126,6 +131,13 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
     let file = menu(L("文件"))
     add(file, L("新建工程"), #selector(newFile), "n", target: self)
     add(file, L("打开工程…"), #selector(openFile), "o", target: self)
+    let recent = NSMenu(title: L("最近使用"))
+    recent.delegate = self
+    recentMenu = recent
+    let recentItem = NSMenuItem(title: recent.title, action: nil, keyEquivalent: "")
+    recentItem.submenu = recent
+    file.addItem(recentItem)
+    menuNeedsUpdate(recent)
     add(file, L("保存"), #selector(saveFile), "s", target: self)
     add(file, L("另存为…"), #selector(saveAs), "s", shift: true, target: self)
     file.addItem(.separator())
@@ -155,6 +167,32 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
     add(win, L("缩放"), #selector(NSWindow.performZoom(_:)))
     NSApp.windowsMenu = win
   }
+  func menuNeedsUpdate(_ menu: NSMenu) {
+    guard menu === recentMenu else { return }
+    menu.removeAllItems()
+    if e.recentProjects.urls.isEmpty {
+      let empty = NSMenuItem(title: L("暂无最近使用的工程"), action: nil, keyEquivalent: "")
+      empty.isEnabled = false
+      menu.addItem(empty)
+      return
+    }
+    for url in e.recentProjects.urls {
+      let item = NSMenuItem(
+        title: e.recentProjects.title(for: url), action: #selector(openRecent(_:)), keyEquivalent: "")
+      item.target = self
+      item.representedObject = url
+      item.toolTip = url.path
+      menu.addItem(item)
+    }
+    menu.addItem(.separator())
+    let clear = NSMenuItem(title: L("清除列表"), action: #selector(clearRecent), keyEquivalent: "")
+    clear.target = self
+    menu.addItem(clear)
+  }
+  @objc private func openRecent(_ item: NSMenuItem) {
+    if let url = item.representedObject as? URL { e.open(url) }
+  }
+  @objc private func clearRecent() { e.recentProjects.clear() }
   @objc func newFile() { e.new() }
   @objc func openFile() { e.open() }
   @objc func saveFile() { e.save() }

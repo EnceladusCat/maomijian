@@ -11,15 +11,7 @@ struct AnnotationPanel: View {
         SectionName(name: L("添加到播放头"))
         LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible())], spacing: 6) {
           ForEach(tools, id: \.self) { kind in
-            Button { e.add(kind) } label: {
-              VStack(spacing: 4) {
-                AnnotationSwatch(kind: kind).accessibilityHidden(true)
-                Text(kind.title)
-                  .font(.system(size: 11, weight: .medium))
-              }
-            }
-            .buttonStyle(AnnotationTile())
-            .help(kind.isRegion ? L("在预览区拖出\(kind.title)范围") : L("在播放头添加\(kind.title)"))
+            AnnotationTile(kind: kind, active: e.regionTool == kind) { e.add(kind) }
           }
         }
         let source = e.audioVisualizationSource
@@ -52,19 +44,63 @@ struct AnnotationPanel: View {
   }
 }
 
-private struct AnnotationTile: ButtonStyle {
+private struct AnnotationTile: View {
+  let kind: Kind
+  let active: Bool
+  let add: () -> Void
   @State private var hovering = false
+  private var tip: String {
+    kind.isRegion ? L("在预览区拖出\(kind.title)范围") : L("在播放头添加\(kind.title)")
+  }
 
-  func makeBody(configuration: Configuration) -> some View {
-    configuration.label
-      .padding(4)
-      .foregroundStyle(hovering ? .white : UI.muted)
-      .background(
-        Color.white.opacity(configuration.isPressed ? 0.16 : hovering ? 0.08 : 0),
-        in: RoundedRectangle(cornerRadius: 10)
-      )
-      .contentShape(RoundedRectangle(cornerRadius: 10))
-      .onHover { hovering = $0 }
+  var body: some View {
+    let shape = RoundedRectangle(cornerRadius: 10)
+    VStack(spacing: 4) {
+      AnnotationSwatch(kind: kind)
+      Text(kind.title).font(.system(size: 11, weight: .medium)).lineLimit(1)
+    }
+    .foregroundStyle(active || hovering ? .white : UI.muted)
+    .padding(4).frame(maxWidth: .infinity)
+    .background(active ? UI.accent.opacity(0.19) : .white.opacity(hovering ? 0.08 : 0.025), in: shape)
+    .accessibilityHidden(true)
+    .overlay {
+      AnnotationAction(label: kind.title, tip: tip, selected: active, add: add)
+    }
+    .onHover { hovering = $0 }
+  }
+}
+
+private struct AnnotationAction: NSViewRepresentable {
+  let label: String
+  let tip: String
+  let selected: Bool
+  let add: () -> Void
+
+  func makeNSView(context: Context) -> TileButton {
+    let button = TileButton(frame: .zero)
+    button.title = ""
+    button.isBordered = false
+    button.isTransparent = true
+    button.setButtonType(.momentaryChange)
+    button.focusRingType = .exterior
+    button.target = button
+    button.action = #selector(TileButton.activate)
+    return button
+  }
+
+  func updateNSView(_ button: TileButton, context: Context) {
+    button.setAccessibilityLabel(label)
+    button.setAccessibilityValue(selected ? L("已选") : nil)
+    button.toolTip = tip
+    button.add = add
+  }
+
+  final class TileButton: NSButton {
+    var add: (() -> Void)?
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill() }
+    @objc func activate() { add?() }
   }
 }
 

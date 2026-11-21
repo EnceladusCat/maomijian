@@ -98,6 +98,10 @@ enum Kind: String, Codable, CaseIterable {
   var isMedia: Bool { self == .video || self == .audio }
   var isRegion: Bool { self == .highlight || self == .zoom }
   var isArt: Bool { !isMedia && self != .zoom }
+  var supportsArtworkTransitions: Bool {
+    self == .text || self == .rectangle || self == .ellipse || self == .audioVisual
+  }
+  var supportsTransitions: Bool { self == .video || supportsArtworkTransitions }
   var supportsShapeAppearance: Bool { self == .rectangle || self == .ellipse }
   var supportsRelief: Bool { [.text, .timer, .rectangle, .ellipse, .arrow].contains(self) }
 }
@@ -194,6 +198,7 @@ enum TransitionLook: String, Codable, CaseIterable {
   case flip = "模糊翻转"
   case zoom = "模糊动感放大"
   case dissolve = "叠化"
+  case unfold = "展开"
   case warp = "变焦扭曲"
   case glitch = "幻彩故障"
   case comparison = "前后对比"
@@ -213,21 +218,22 @@ enum TransitionTarget: Hashable {
   case edge(EdgeTarget)
 
   static func ends(of clip: Clip) -> [Self] {
-    if clip.length < 2 { return [] }
+    if !clip.kind.supportsTransitions || clip.length < 2 { return [] }
     let sides: [ClipEnd] = clip.length >= 4 ? [.head, .tail] : [.head]
     return sides.map { .edge(EdgeTarget(clipID: clip.id, end: $0)) }
   }
 
   static func cardTargets(for clips: [Clip]) -> [Self] {
-    let videos = clips.filter { $0.kind == .video && $0.length >= 2 }
-    let groups = Dictionary(grouping: videos.filter { $0.groupID != nil }, by: \.groupID)
+    let eligible = clips.filter { $0.kind.supportsTransitions && $0.length >= 2 }
+    let groups = Dictionary(grouping: eligible.filter { $0.kind == .video && $0.groupID != nil }, by: \.groupID)
     let outerEdges = groups.compactMapValues { members -> (head: UUID, tail: UUID)? in
       guard members.count > 1, let first = members.min(by: { $0.start < $1.start }),
         let last = members.max(by: { $0.end < $1.end })
       else { return nil }
       return (first.id, last.id)
     }
-    return videos.flatMap { clip -> [Self] in
+    return eligible.flatMap { clip -> [Self] in
+      if clip.kind.supportsArtworkTransitions && groups[clip.groupID] != nil { return [] }
       guard let ends = outerEdges[clip.groupID] else { return Self.ends(of: clip) }
       if ends.head == clip.id && ends.tail == clip.id { return Self.ends(of: clip) }
       return ClipEnd.allCases.compactMap { side in
@@ -238,7 +244,7 @@ enum TransitionTarget: Hashable {
   }
 
   static func at(
-    x: Double, first: Double, per: Double, clips: [Clip], joins: [Project.Join]
+    x: Double, first: Double, per: Double, clips: [Clip], joins: [Project.Join], bothEnds: Bool = true
   ) -> [Self] {
     let frame = first + x / per
     if let join = joins.min(by: { abs(Double($0.frame) - frame) < abs(Double($1.frame) - frame) }),
@@ -246,7 +252,9 @@ enum TransitionTarget: Hashable {
     {
       return [.join(join.id)]
     }
-    guard let clip = clips.last(where: { Double($0.start) <= frame && frame <= Double($0.end) }),
+    guard let clip = clips.last(where: {
+      $0.kind.supportsTransitions && Double($0.start) <= frame && frame <= Double($0.end)
+    }),
       clip.length >= 2
     else { return [] }
     let offset = (frame - Double(clip.start)) * per
@@ -257,6 +265,9 @@ enum TransitionTarget: Hashable {
     }
     if width - offset <= edgeWidth || clip.length < 4 {
       return [.edge(EdgeTarget(clipID: clip.id, end: .tail))]
+    }
+    if !bothEnds {
+      return [.edge(EdgeTarget(clipID: clip.id, end: offset < width / 2 ? .head : .tail))]
     }
     return ends(of: clip)
   }
@@ -280,12 +291,13 @@ struct ClipFilter: Codable, Equatable {
   var fadeInFrames: Int?
   var fadeOutFrames: Int?
   var keySensitivity: Double?
+  var keyColor: UInt32?
   var sensitivity: Double { keySensitivity ?? BackgroundKey.defaultSensitivity }
   var entryFrames: Int { fadeInFrames ?? 0 }
   var exitFrames: Int { fadeOutFrames ?? 0 }
   var valid: Bool {
     look != .none && (0...1).contains(amount)
-      && (0...1).contains(sensitivity)
+      && (0...1).contains(sensitivity) && keyColor.map { $0 <= 0xFFFFFF } != false
       && (0...maxFrames).contains(entryFrames) && (0...maxFrames).contains(exitFrames)
   }
 }
@@ -555,6 +567,12 @@ struct Clip: Identifiable, Codable, Equatable {
       max(length, Int(floor((Double(assetFrames) - sourceIn) / effectiveRate + 1e-8))))
   }
   var text = ""
+  var captionTranslation: String?
+  var captionText: String {
+    guard let captionTranslation, !captionTranslation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return text }
+    return text.isEmpty ? captionTranslation : text + "\n" + captionTranslation
+  }
   var x = 0.5
   var y = 0.5
   var w = 0.32
@@ -672,7 +690,7 @@ struct Clip: Identifiable, Codable, Equatable {
   func effect(at side: ClipEnd) -> ClipEdgeEffect? { side == .head ? startEffect : endEffect }
 
   func transitionRange(at side: ClipEnd) -> Range<Int>? {
-    guard kind == .video && length >= 2, let own = effect(at: side) else { return nil }
+    guard kind.supportsTransitions && length >= 2, let own = effect(at: side) else { return nil }
     var n = min(own.frames, length)
     if let a = startEffect, let b = endEffect, a.frames + b.frames > length {
       if length < 4 { return side == .head ? (start..<end) : nil }
@@ -946,7 +964,21 @@ struct Project: Codable, Equatable {
       return active ? after.start + min(after.blend, before.end - after.start) / 2 : before.end
     }
   }
-  var joins: [Join] {
+  var joins: [Join] { videoJoins + artworkJoins }
+
+  var artworkJoins: [Join] {
+    guard clips.contains(where: { $0.kind.supportsArtworkTransitions }) else { return [] }
+    return annotationLanes().flatMap { lane in
+      zip(lane, lane.dropFirst()).compactMap { before, after in
+        guard before.end == after.start, before.length >= 3, after.length >= 3,
+          before.kind.supportsArtworkTransitions, after.kind.supportsArtworkTransitions
+        else { return nil }
+        return Join(before: before, after: after)
+      }
+    }
+  }
+
+  private var videoJoins: [Join] {
     let videos = clips.filter { $0.kind == .video }.sorted { $0.start < $1.start }
     let byID = Dictionary(uniqueKeysWithValues: videos.map { ($0.id, $0) })
     let ending = Dictionary(grouping: videos, by: \.end)
@@ -993,6 +1025,22 @@ struct Project: Codable, Equatable {
   var videoVisibility: [UUID: Range<Int>] {
     var spans = Dictionary(
       uniqueKeysWithValues: clips.filter { $0.kind == .video }.map { ($0.id, $0.start..<$0.end) })
+    extendVisibility(&spans, across: videoJoins)
+    return spans
+  }
+
+  var artworkTransitionVisibility: [UUID: Range<Int>] {
+    let active = artworkJoins.filter(\.active)
+    var spans: [UUID: Range<Int>] = [:]
+    for join in active {
+      spans[join.before.id] = join.before.start..<join.before.end
+      spans[join.after.id] = join.after.start..<join.after.end
+    }
+    extendVisibility(&spans, across: active)
+    return spans
+  }
+
+  private func extendVisibility(_ spans: inout [UUID: Range<Int>], across joins: [Join]) {
     for j in joins where j.after.from == j.before.id && j.after.fixedCutOffset != nil {
       let cut = j.range
       guard let left = spans[j.before.id], let right = spans[j.after.id],
@@ -1001,7 +1049,6 @@ struct Project: Codable, Equatable {
       spans[j.before.id] = left.lowerBound..<cut.upperBound
       spans[j.after.id] = cut.lowerBound..<right.upperBound
     }
-    return spans
   }
   func transitionEffect(_ target: TransitionTarget) -> ClipEdgeEffect? {
     switch target {
@@ -1021,7 +1068,7 @@ struct Project: Codable, Equatable {
       let next = links.first { $0.before.id == id }?.frame ?? join.after.end
       return min(90, join.frame - previous, next - join.frame)
     case .edge(let edge):
-      guard let c = clips.first(where: { $0.id == edge.clipID && $0.kind == .video }),
+      guard let c = clips.first(where: { $0.id == edge.clipID && $0.kind.supportsTransitions }),
         c.length >= 2
       else { return 0 }
       let other = c.effect(at: edge.end == .head ? .tail : .head)
@@ -1037,7 +1084,16 @@ struct Project: Codable, Equatable {
     case .edge(let edge): try setEdgeEffect(edge, frames: frames, style: style)
     }
   }
-  mutating func placeTransition(_ style: TransitionLook, on targets: [TransitionTarget]) throws {
+  mutating func moveTransition(from origin: TransitionTarget, to destination: TransitionTarget) throws {
+    guard origin != destination, let effect = transitionEffect(origin) else { return }
+    var next = self
+    try next.updateTransition(origin, frames: 0)
+    try next.placeTransition(effect.style, on: [destination], preferredFrames: effect.frames)
+    self = next
+  }
+  mutating func placeTransition(
+    _ style: TransitionLook, on targets: [TransitionTarget], preferredFrames: Int? = nil
+  ) throws {
     var next = self
     let selected = Set(targets)
     for case .edge(let edge) in targets where edge.end == .head {
@@ -1048,7 +1104,7 @@ struct Project: Codable, Equatable {
       }
     }
     for target in targets {
-      let originalFrames = transitionEffect(target)?.frames ?? 15
+      let originalFrames = preferredFrames ?? transitionEffect(target)?.frames ?? 15
       var duration = originalFrames
       switch target {
       case .join(let id):
@@ -1077,8 +1133,8 @@ struct Project: Codable, Equatable {
   }
   mutating func setEdgeEffect(_ target: EdgeTarget, frames: Int, style: TransitionLook?) throws {
     guard let index = clips.firstIndex(where: { $0.id == target.clipID }),
-      clips[index].kind == .video
-    else { throw EditError.message(L("请选择图片或视频片段的首端或末端。")) }
+      clips[index].kind.supportsTransitions
+    else { throw EditError.message(L("请选择支持转场的片段首端或末端。")) }
     let c = clips[index]
     let available = transitionFrameLimit(.edge(target))
     if frames > 0 && available < 2 {
@@ -1100,7 +1156,7 @@ struct Project: Codable, Equatable {
   mutating func setTransition(_ id: UUID, frames: Int, style: TransitionLook? = nil) throws {
     guard let join = joins.first(where: { $0.id == id }),
       let i = clips.firstIndex(where: { $0.id == id })
-    else { throw EditError.message(L("请先让两个视频片段首尾相接。")) }
+    else { throw EditError.message(L("请先让两个支持转场的片段在同一轨道首尾相接。")) }
     let cut = join.frame
     let n = frames == 0 ? 0 : min(max(2, frames), transitionFrameLimit(.join(id)))
     guard frames == 0 || n >= 2 else { throw EditError.message(L("这两个片段没有足够长度添加转场。")) }
@@ -1156,7 +1212,7 @@ enum SRT {
         format: "%02d:%02d:%02d,%03d", v / 3_600_000, v / 60000 % 60, v / 1000 % 60, v % 1000)
     }
     return clips.filter { $0.kind == .caption }.sorted { $0.start < $1.start }.enumerated().map {
-      i, c in "\(i+1)\n\(stamp(c.start)) --> \(stamp(c.end))\n\(c.text)\n"
+      i, c in "\(i+1)\n\(stamp(c.start)) --> \(stamp(c.end))\n\(c.captionText)\n"
     }.joined(separator: "\n")
   }
 }

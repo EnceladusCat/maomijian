@@ -78,7 +78,7 @@ struct ChartStyleControls: View {
       }.padding(.top, 8)
     } label: {
       Label(L("图表样式"), systemImage: "slider.horizontal.3").font(.callout)
-    }
+    }.disclosureGroupStyle(SettingsDisclosureStyle())
   }
 
   private var defaultTextColor: String { style.theme == .light ? "#182438" : "#F1F5FF" }

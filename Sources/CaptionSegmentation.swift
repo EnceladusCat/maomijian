@@ -19,6 +19,10 @@ enum CaptionSegmentation {
     let hard: Bool
   }
 
+  private static let preferredWidth = 15.0
+  private static let maximumWidth = 20.0
+  private static let maximumSeconds = 5.5
+
   private static let stops: Set<Character> = ["。", "！", "？", "!", "?", ".", "…"]
   private static let softStops: Set<Character> = ["，", "、", "；", "：", ",", ";", ":"]
   private static let openers: Set<Character> = ["（", "(", "【", "[", "《", "「", "『", "“", "‘", "«"]
@@ -26,6 +30,7 @@ enum CaptionSegmentation {
   private static let clauseStarts = [
     "但是", "不过", "不过呢", "所以", "因此", "那么", "另一方面", "换句话说", "也就是说", "而是",
     "接下来", "先说", "再说", "最后", "总之", "同时", "另外", "以及", "甚至", "如果", "注意", "至于",
+    "不過", "那麼", "換句話說", "也就是說", "接下來", "最後", "總之", "同時", "至於",
   ]
   private static let commonPhrases = [
     "什么时候", "什么地方", "怎么回事", "多少时间", "多少钱", "多长时间", "多大程度",
@@ -46,9 +51,9 @@ enum CaptionSegmentation {
     guard !glyphs.isEmpty else { return [] }
     let text = String(glyphs.map(\.value))
     guard text.count == glyphs.count else { return [] }
-    let boundaries = boundaries(in: text, glyphs: glyphs, language: language, terms: terms)
     var widths = [0.0]
     for glyph in glyphs { widths.append(widths.last! + glyph.width) }
+    let boundaries = boundaries(in: text, glyphs: glyphs, widths: widths, language: language, terms: terms)
     let ranges = cues(in: glyphs, boundaries: boundaries, widths: widths)
     var entries = [Clip]()
     for range in ranges {
@@ -112,14 +117,22 @@ enum CaptionSegmentation {
   }
 
   private static func boundaries(
-    in text: String, glyphs: [TimedCharacter], language: String, terms: [String]
+    in text: String, glyphs: [TimedCharacter], widths: [Double], language: String, terms: [String]
   ) -> [Boundary] {
     let indexes = Array(text.indices) + [text.endIndex]
     let positions = Dictionary(uniqueKeysWithValues: indexes.enumerated().map { ($0.element, $0.offset) })
+    let chinese = language.hasPrefix("zh") || language.hasPrefix("yue")
+    let scriptWithoutSpaces = chinese || language.hasPrefix("ja") || language.hasPrefix("ko")
     var blocked = Set<Int>()
-    func protect(_ word: Range<String.Index>) {
+    var fallback = Set<Int>()
+    func protect(_ word: Range<String.Index>, fromTokenizer: Bool = false) {
       guard let first = positions[word.lowerBound], let last = positions[word.upperBound], last > first + 1 else { return }
-      blocked.formUnion((first + 1)..<last)
+      let interior = (first + 1)..<last
+      if fromTokenizer && scriptWithoutSpaces && widths[last] - widths[first] > maximumWidth {
+        fallback.formUnion(interior)
+      } else {
+        blocked.formUnion(interior)
+      }
     }
     let tokenizer = NLTokenizer(unit: .word)
     tokenizer.string = text
@@ -132,10 +145,9 @@ enum CaptionSegmentation {
     default: break
     }
     tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
-      protect(range)
+      protect(range, fromTokenizer: true)
       return true
     }
-    let chinese = language.hasPrefix("zh") || language.hasPrefix("yue")
     let phrases = chinese ? commonPhrases + clauseStarts + terms : terms
     for term in phrases where !term.isEmpty {
       var search = text.startIndex..<text.endIndex
@@ -169,6 +181,7 @@ enum CaptionSegmentation {
       let reward = (softStops.contains(mark) ? 3.4 : 0)
         + min(pause * 9, 4.5) + (nextClause ? 3.1 : 0)
         - (chinese && lastWordNeedsObject.contains(left) ? 3.0 : 0)
+        - (fallback.contains(i) ? 7.0 : 0)
       result.append(Boundary(position: i, previous: previous, reward: reward, hard: sentence || pause >= 1.15))
     }
     result.append(Boundary(position: glyphs.count, previous: glyphs.count - 1, reward: 0, hard: true))
@@ -188,9 +201,10 @@ enum CaptionSegmentation {
         let start = boundaries[j].position
         let units = widths[end.previous + 1] - widths[start]
         let seconds = glyphs[end.previous].end - glyphs[start].start
-        if j < i - 1 && (units > 38 || seconds > 7.5) { break }
-        let widthPenalty = pow((units - 22) / 10, 2)
-        let timePenalty = pow(max(0, seconds - 4.8) * 1.1, 2)
+        // Keeping an indivisible word or protected term intact can exceed the limit.
+        if j < i - 1 && (units > maximumWidth + 1e-8 || seconds > maximumSeconds) { break }
+        let widthPenalty = pow((units - preferredWidth) / 7, 2)
+        let timePenalty = pow(max(0, seconds - 3.6) * 1.1, 2)
         let short = units < 6 || seconds < 0.8 ? 4.0 : 0
         let total = cost[j] + widthPenalty + timePenalty + short + 2.5 - end.reward
         if total < cost[i] {

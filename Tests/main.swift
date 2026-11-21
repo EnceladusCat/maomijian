@@ -2,6 +2,71 @@ import AppKit
 import CoreText
 import Foundation
 
+let recognitionProgress = CaptionProgress(startedAt: 10)
+recognitionProgress.update(.nan, at: 11)
+recognitionProgress.update(0.01, at: 11)
+precondition(recognitionProgress.snapshot().remainingSeconds == nil)
+recognitionProgress.update(0.25, at: 18)
+recognitionProgress.update(0.20, at: 19)
+precondition(recognitionProgress.snapshot().fraction == 0.25)
+precondition(recognitionProgress.snapshot().remainingSeconds == 24)
+recognitionProgress.update(1, at: 28)
+precondition(recognitionProgress.snapshot().remainingSeconds == 0)
+
+var translationProject = Project()
+var originalCaption = Clip(kind: .caption, start: 21, length: 65)
+originalCaption.text = "简体与软件开发"
+translationProject.clips = [Clip(kind: .caption, start: 0, length: 19), originalCaption]
+let translationLines = SubtitleTranslationLine.snapshot(in: translationProject)
+precondition(translationLines == [SubtitleTranslationLine(originalCaption)])
+let traditionalPair = SubtitleTranslationPair(source: .mandarin, target: .traditional)
+let traditionalText = try SubtitleTranslator.convertScript(translationLines.map(\.text), pair: traditionalPair)
+let translationEdits = try SubtitleTranslationLine.replacements(for: translationLines, translated: traditionalText)
+precondition(translationEdits == [originalCaption.id: "簡體與軟件開發"])
+precondition((try? SubtitleTranslationLine.replacements(for: translationLines, translated: [])) == nil)
+precondition(CaptionLanguage.allCases.map(\.translationCode).sorted() == ["en", "ja", "ko", "yue", "zh-Hans", "zh-Hant"])
+
+let recentDefaults = UserDefaults(suiteName: "local.framecut.test.\(UUID().uuidString)")!
+let recentProjects = RecentProjects(defaults: recentDefaults)
+let firstProject = URL(fileURLWithPath: "/tmp/one/Named.framecut")
+let secondProject = URL(fileURLWithPath: "/tmp/two/Named.framecut")
+recentProjects.record(firstProject)
+recentProjects.record(secondProject)
+recentProjects.record(firstProject)
+precondition(recentProjects.urls == [firstProject, secondProject])
+precondition(recentProjects.title(for: firstProject) != recentProjects.title(for: secondProject))
+precondition(RecentProjects(defaults: recentDefaults).urls == recentProjects.urls)
+recentProjects.clear()
+precondition(RecentProjects(defaults: recentDefaults).urls.isEmpty)
+print("Passed caption ETA, Chinese script conversion, translation line identity, and recent-project history.")
+
+var bilingualProject = translationProject
+CaptionTranslationMode.bilingual.apply(translationEdits, to: &bilingualProject)
+let bilingualCaption = bilingualProject.clips[1]
+precondition(bilingualCaption.text == originalCaption.text)
+precondition(bilingualCaption.captionTranslation == "簡體與軟件開發")
+precondition(bilingualCaption.start == originalCaption.start && bilingualCaption.length == originalCaption.length)
+precondition(bilingualProject.clips[0] == translationProject.clips[0])
+let bilingualSRT = try SRT.parse(SRT.write([bilingualCaption]))
+precondition(bilingualSRT[0].text == "简体与软件开发\n簡體與軟件開發")
+precondition(bilingualSRT[0].start == originalCaption.start && bilingualSRT[0].end == originalCaption.end)
+let bilingualSaved = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(bilingualProject))
+precondition(bilingualSaved == bilingualProject)
+let subtitleCanvas = CGSize(width: 1920, height: 1080)
+let singleRect = artworkBounds(originalCaption, size: subtitleCanvas, style: nil)
+let bilingualRect = artworkBounds(bilingualCaption, size: subtitleCanvas, style: nil)
+precondition(singleRect.minY == bilingualRect.minY && bilingualRect.height > singleRect.height)
+let bilingualImage = artwork(bilingualCaption, size: subtitleCanvas)!
+let singleImage = artwork(originalCaption, size: subtitleCanvas)!
+precondition(bilingualImage.width == singleImage.width && bilingualImage.height > singleImage.height)
+let layout = WrappedText(
+  bilingualCaption, in: CGRect(x: 0, y: 0, width: bilingualImage.width, height: bilingualImage.height),
+  unit: 1)
+precondition(layout.lines.count == 2)
+CaptionTranslationMode.replace.apply(translationEdits, to: &bilingualProject)
+precondition(bilingualProject.clips[1].text == "簡體與軟件開發" && bilingualProject.clips[1].captionTranslation == nil)
+print("Passed bilingual caption timing, shared render bounds, SRT export, persistence, and translation-only replacement.")
+
 let spoken = "主动表示要暂缓上市，但Anthropic仍在考虑审核进度。接下来会不会冲冲冲，什么时候确认1.25万亿美元的估值。"
 let speech = spoken.enumerated().map { index, character in
   let start = Double(index) * 0.18
@@ -39,7 +104,27 @@ let paused = CaptionSegmentation.captions(
    RecognizedSpeech(start: 4, end: 4.1, text: "。")],
   offset: 210, duration: 180, language: "zh-CN")
 precondition(paused.map(\.text) == ["第一段", "第二段。"] && paused.map(\.start) == [210, 300])
-print("Passed caption segmentation, vocabulary, punctuation, pause and timeline alignment checks.")
+let longSpeech = "我们先看数据中心业务的增长速度再把过去四个季度的收入拆开比较最后回到现金流看看这次增长到底有没有带来更多利润"
+let shortCues = CaptionSegmentation.captions(
+  [RecognizedSpeech(start: 0, end: 7.1, text: longSpeech)], offset: 75, duration: 240,
+  language: "zh-CN", terms: ["数据中心业务", "现金流"])
+precondition(shortCues.count >= 3 && shortCues.allSatisfy { $0.text.count <= 20 })
+precondition(shortCues.map(\.text).joined() == longSpeech)
+precondition(shortCues.contains { $0.text.contains("数据中心业务") } && shortCues.contains { $0.text.contains("现金流") })
+precondition(shortCues.first?.start == 75 && shortCues.last?.end == 288)
+precondition(zip(shortCues, shortCues.dropFirst()).allSatisfy { $0.end <= $1.start })
+let naturalPause = CaptionSegmentation.captions(
+  [RecognizedSpeech(start: 0, end: 2.1, text: "先看公司过去一年的现金流变化，"),
+   RecognizedSpeech(start: 2.55, end: 4.5, text: "再比较三个主要部门的营收。")],
+  offset: 0, duration: 150, language: "zh-CN")
+precondition(naturalPause.map(\.text) == ["先看公司过去一年的现金流变化，", "再比较三个主要部门的营收。"])
+let english = "The team reviewed the internationalization plan before closing the quarterly report."
+let englishCues = CaptionSegmentation.captions(
+  [RecognizedSpeech(start: 0, end: 12, text: english)], offset: 0, duration: 360, language: "en-US")
+precondition(englishCues.allSatisfy { $0.length <= 165 && $0.text.count <= 36 })
+precondition(englishCues.map(\.text).joined(separator: " ") == english)
+precondition(englishCues.contains { $0.text.contains("internationalization") })
+print("Passed short Chinese and English cues, unpunctuated speech, vocabulary, pauses and timeline alignment.")
 
 // Pixel comparisons are exact before video compression.
 let size = CGSize(width: 240, height: 160)
@@ -472,6 +557,33 @@ let keyedImage = keyedCanvas.makeImage()!
 precondition(keyPixel(keyedImage, 10, 10) == [41, 76, 135, 255])
 precondition(keyPixel(keyedImage, 90, 54) != [41, 76, 135, 255])
 
+let redSample = BackgroundKey.sample(variedImage, at: CGPoint(x: 0.25, y: 0.75))
+precondition(redSample == 0xD13C30)
+let manualKey = BackgroundKey.image(variedImage, sensitivity: 0.1, strength: 1, color: redSample)
+precondition(keyPixel(manualKey, 48, 81) == [0, 0, 0, 0])
+precondition(keyPixel(manualKey, 48, 27) == [232, 217, 76, 255])
+precondition(BackgroundKey.sample(manualKey, at: CGPoint(x: 0.25, y: 0.75)) == nil)
+precondition(BackgroundKey.sample(manualKey, at: CGPoint(x: -0.1, y: 0.75)) == nil)
+precondition(storedKey.clips[0].filters[0].keyColor == nil)
+
+let keyPainter = FramePainter(keyProject, keySize)
+var placedKey = keyClip
+placedKey.visualScale = 0.5
+placedKey.x = 0.625
+placedKey.angle = 90
+placedKey.opacity = 0.25
+var pickedFilters = placedKey.filters
+pickedFilters[0].keyColor = redSample
+placedKey.filters = pickedFilters
+let unkeyed = keyPainter.backgroundKeyPreview(placedKey, picture: Picture(image: variedImage, still: true),
+                                             frame: 20, filterIndex: 0)!
+precondition(BackgroundKey.sample(unkeyed, at: CGPoint(x: 0.05, y: 0.05)) == nil)
+precondition(BackgroundKey.sample(unkeyed, at: CGPoint(x: 0.555, y: 0.278)) == redSample)
+precondition(BackgroundKey.sample(unkeyed, at: CGPoint(x: 0.695, y: 0.278)) == 0xE8D94C)
+let restoredPick = try JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(placedKey))
+precondition(restoredPick.filters[0].keyColor == redSample)
+precondition(!ClipFilter(look: .backgroundKey, keyColor: 0x1000000).valid)
+
 if let folder = ProcessInfo.processInfo.environment["MAOMI_KEY_QA"] {
   let directory = URL(fileURLWithPath: folder)
   let source = directory.appendingPathComponent("Color-Key.png")
@@ -480,8 +592,15 @@ if let folder = ProcessInfo.processInfo.environment["MAOMI_KEY_QA"] {
     .write(to: directory.appendingPathComponent("Keyed-Result.png"))
   keyProject.assets[0].path = source.path
   try keyProject.write(to: directory.appendingPathComponent("BackgroundKey.framecut"))
+  let multicolor = directory.appendingPathComponent("Color-Pick.png")
+  try NSBitmapImageRep(cgImage: variedImage).representation(using: .png, properties: [:])!.write(to: multicolor)
+  var pickProject = keyProject
+  pickProject.assets[0].path = multicolor.path
+  pickProject.clips[0].filters = [ClipFilter(look: .backgroundKey)]
+  try pickProject.write(to: directory.appendingPathComponent("Eyedropper.framecut"))
+
 }
-print("Passed automatic border color selection, adjustable key sensitivity, fades, clean alpha stacking and filter persistence.")
+print("Passed auto and manual color keying, transformed eyedropper sampling, sensitivity, fades, alpha stacking and persistence.")
 print("Passed ordered filter rendering, legacy pixel parity, zero intensity and persistence.")
 print(
   "Passed still persistence, crop/rotation and background pixels, glyph outlines, timer phase and four filters."
@@ -521,10 +640,42 @@ for look in TransitionLook.allCases {
   precondition(twoScenes.joins[0].after.transitionStyle == look)
 }
 precondition(Set(intermediates).count == TransitionLook.allCases.count)
+var unfoldProject = twoScenes
+try unfoldProject.setTransition(enteringVideo.id, frames: 15, style: .unfold)
+let unfoldRange = unfoldProject.joins[0].range
+let earlyUnfold = transitionPixels(unfoldProject, frame: unfoldRange.lowerBound + 3, parts: unfoldProject.clips)
+let halfUnfold = transitionPixels(unfoldProject, frame: unfoldRange.lowerBound + 7, parts: unfoldProject.clips)
+let laterUnfold = transitionPixels(unfoldProject, frame: unfoldRange.lowerBound + 11, parts: unfoldProject.clips)
+let unfoldBefore = transitionPixels(unfoldProject, frame: 60, parts: [outgoingVideo])
+let unfoldAfter = transitionPixels(unfoldProject, frame: 60, parts: [enteringVideo])
+for y in [10, 80, 149] {
+  for x in [20, 50, 80, 120, 159, 189, 219] {
+    let fromBefore = rgbAt(unfoldBefore, x, y)
+    let fromAfter = rgbAt(unfoldAfter, x, y)
+    precondition(rgbAt(earlyUnfold, x, y) == (x == 120 ? fromAfter : fromBefore))
+    precondition(rgbAt(halfUnfold, x, y) == ((60..<180).contains(x) ? fromAfter : fromBefore))
+    precondition(rgbAt(laterUnfold, x, y) == fromAfter)
+  }
+}
+let unfoldSaved = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(unfoldProject))
+precondition(unfoldSaved.joins[0].after.transitionStyle == .unfold && unfoldSaved.duration == twoScenes.duration)
+if let path = ProcessInfo.processInfo.environment["MAOMI_UNFOLD_QA"] {
+  let qa = URL(fileURLWithPath: path)
+  var fixture = unfoldProject
+  let pngs = [image, alternateImage]
+  for index in fixture.clips.indices {
+    let url = qa.appendingPathComponent("Unfold-\(index + 1).png")
+    try NSBitmapImageRep(cgImage: pngs[index]).representation(using: .png, properties: [:])!.write(to: url)
+    let media = Media(path: url.path, frames: 180, video: true, audio: false, still: true)
+    fixture.assets.append(media)
+    fixture.clips[index].asset = media.id
+  }
+  try fixture.write(to: qa.appendingPathComponent("Unfold.framecut"))
+}
 let restoredLook = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(twoScenes))
 precondition(restoredLook.joins[0].after.transitionStyle == .shake)
 print(
-  "Passed nine distinct transition renders, endpoint pixels, duration edits and look persistence.")
+  "Passed distinct transition renders, symmetric center-out reveal, endpoints, duration edits and look persistence.")
 
 // Both clip ends use the full range of previews without changing the authored clip timing.
 var trimProject = Project()
@@ -671,6 +822,115 @@ try shortTransition.placeTransition(.dissolve, on: TransitionTarget.ends(of: tin
 precondition(shortTransition.clips[0].startEffect?.frames == 2)
 precondition(shortTransition.clips[0].endEffect?.frames == 2)
 print("Passed direct transition placement, fixed timing, resizing, replacement and short clips.")
+
+// Artwork transitions blend transparent layers without modifying the canvas or the soundtrack.
+let animationWave = AudioWaveform(frames: 450, peaks: Array(repeating: 180, count: 450))
+let animationAudio = Clip(kind: .audio, start: 0, length: 450)
+let animationSignals = [animationAudio.id: AudioSignalTrack([
+  AudioSignal(clip: animationAudio, wave: animationWave)
+])]
+var stillOverlay = Clip.annotation(.rectangle, at: 0)
+stillOverlay.color = "#75BD5E"
+stillOverlay.shapeAppearance = ShapeAppearance(fill: .solid)
+stillOverlay.x = 0.10
+stillOverlay.y = 0.14
+stillOverlay.w = 0.12
+stillOverlay.h = 0.12
+func artTransitionPixels(_ p: Project, frame: Int, parts: [Clip], preview: Bool = false) -> [UInt8] {
+  let g = bitmap(240, 160)!
+  FramePainter(p, size, preview: preview, audioSignals: animationSignals)
+    .paint(g, frame: frame, active: [video, stillOverlay] + parts) { _ in Picture(image: image) }
+  return Array(
+    UnsafeBufferPointer(start: g.data!.assumingMemoryBound(to: UInt8.self), count: 240 * 160 * 4))
+}
+var exampleArtwork: [Clip] = []
+for (index, kind) in [Kind.text, .rectangle, .ellipse, .audioVisual].enumerated() {
+  var clip = Clip.annotation(kind, at: index * 90)
+  clip.text = "Motion"
+  clip.color = "#F19230"
+  if kind.supportsShapeAppearance { clip.shapeAppearance = ShapeAppearance(fill: .solid) }
+  if kind == .audioVisual {
+    clip.audioVisualization = AudioVisualization(source: animationAudio.id, style: .bars)
+  }
+  exampleArtwork.append(clip)
+  var edgeProject = Project()
+  edgeProject.clips = [clip]
+  let edges = TransitionTarget.cardTargets(for: [clip])
+  precondition(edges.count == 2)
+  for look in TransitionLook.allCases {
+    try edgeProject.placeTransition(look, on: edges)
+    let animated = edgeProject.clips[0]
+    precondition(edgeProject.duration == clip.end)
+    let headSpan = animated.transitionRange(at: .head)!
+    let tailSpan = animated.transitionRange(at: .tail)!
+    for (frame, originals) in [
+      (headSpan.lowerBound, []), (headSpan.upperBound - 1, [clip]),
+      (tailSpan.lowerBound, [clip]), (tailSpan.upperBound - 1, []),
+    ] {
+      precondition(
+        artTransitionPixels(edgeProject, frame: frame, parts: [animated])
+          == artTransitionPixels(edgeProject, frame: frame, parts: originals),
+        "Incorrect artwork endpoint for \(kind) / \(look)")
+    }
+    let midpoint = headSpan.lowerBound + headSpan.count / 2
+    let rendered = artTransitionPixels(edgeProject, frame: midpoint, parts: [animated], preview: true)
+    let under = artTransitionPixels(edgeProject, frame: midpoint, parts: [])
+    for (x, y) in [(0, 0), (238, 138), (24, 22)] {
+      precondition(rgbAt(rendered, x, y) == rgbAt(under, x, y),
+                   "Artwork transition modified another layer for \(kind) / \(look)")
+    }
+    if look == .dissolve {
+      precondition(rendered != under)
+      precondition(rendered != artTransitionPixels(edgeProject, frame: midpoint, parts: [clip]))
+    }
+  }
+}
+
+let incomingArtwork = exampleArtwork[2]
+let artworkSeam = TransitionTarget.join(incomingArtwork.id)
+var artworkCuts = Project()
+artworkCuts.clips = exampleArtwork
+precondition(artworkCuts.artworkJoins.count == 3)
+let hit = TransitionTarget.at(
+  x: Double(incomingArtwork.start * 2 + 3), first: 0, per: 2,
+  clips: artworkCuts.clips, joins: artworkCuts.artworkJoins)
+precondition(hit == [artworkSeam])
+let authoredArtTiming = artworkCuts.clips.map { [$0.start, $0.end] }
+try artworkCuts.placeTransition(.dissolve, on: hit, preferredFrames: 27)
+let paintedJoin = artworkCuts.artworkJoins.first { $0.active }!
+precondition(paintedJoin.frame == incomingArtwork.start && paintedJoin.range.count == 27)
+precondition(
+  artworkCuts.artworkTransitionVisibility[paintedJoin.before.id]?.upperBound == paintedJoin.range.upperBound
+    && artworkCuts.artworkTransitionVisibility[paintedJoin.after.id]?.lowerBound == paintedJoin.range.lowerBound)
+let seek = paintedJoin.range.lowerBound + paintedJoin.range.count / 2
+let artJoinMiddle = artTransitionPixels(artworkCuts, frame: seek, parts: [paintedJoin.before, paintedJoin.after])
+precondition(artJoinMiddle != artTransitionPixels(artworkCuts, frame: seek, parts: [paintedJoin.before]))
+precondition(artJoinMiddle != artTransitionPixels(artworkCuts, frame: seek, parts: [incomingArtwork]))
+let waveTarget = TransitionTarget.edge(EdgeTarget(clipID: exampleArtwork[3].id, end: .tail))
+precondition(
+  TransitionTarget.at(
+    x: 650, first: 0, per: 2, clips: artworkCuts.clips, joins: artworkCuts.artworkJoins,
+    bothEnds: false
+  ) == [waveTarget])
+try artworkCuts.moveTransition(from: artworkSeam, to: waveTarget)
+precondition(artworkCuts.transitionEffect(artworkSeam) == nil)
+precondition(artworkCuts.transitionEffect(waveTarget) == ClipEdgeEffect(style: .dissolve, frames: 27))
+precondition(artworkCuts.clips.map { [$0.start, $0.end] } == authoredArtTiming)
+let restoredArt = try JSONDecoder().decode(Project.self, from: JSONEncoder().encode(artworkCuts)).checked()
+precondition(restoredArt == artworkCuts)
+let removedArtTransition = artworkCuts
+do {
+  try artworkCuts.moveTransition(
+    from: waveTarget, to: .edge(EdgeTarget(clipID: animationAudio.id, end: .head)))
+  preconditionFailure("An invalid drop must not remove the source transition")
+} catch { precondition(artworkCuts == removedArtTransition) }
+if let path = ProcessInfo.processInfo.environment["MAOMI_ARTWORK_TRANSITION_QA"] {
+  artworkCuts.clips.removeLast()
+  try artworkCuts.placeTransition(.comparison, on: [artworkSeam])
+  try artworkCuts.write(to: URL(fileURLWithPath: path))
+}
+print("Passed all artwork transition looks, layer isolation, same-track joins, transfer and persistence.")
+
 
 var groups = Project()
 let groupText = Clip.annotation(.text, at: 0)
