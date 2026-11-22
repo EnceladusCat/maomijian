@@ -6,6 +6,7 @@ import Foundation
 final class MediaScratch {
   enum Format: String {
     case video = "mp4", audio = "m4a", pitch = "caf", subtitles = "srt"
+    case wav, json, log, npy
   }
 
   final class File {

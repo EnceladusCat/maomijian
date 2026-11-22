@@ -32,6 +32,7 @@ enum CaptionSegmentation {
     "接下来", "先说", "再说", "最后", "总之", "同时", "另外", "以及", "甚至", "如果", "注意", "至于",
     "不過", "那麼", "換句話說", "也就是說", "接下來", "最後", "總之", "同時", "至於",
   ]
+  private static let clausesByInitial = Dictionary(grouping: clauseStarts) { $0.first! }
   private static let commonPhrases = [
     "什么时候", "什么地方", "怎么回事", "多少时间", "多少钱", "多长时间", "多大程度",
     "有多少", "有多大", "是不是", "能不能", "会不会", "有没有", "可不可以", "能否",
@@ -42,6 +43,9 @@ enum CaptionSegmentation {
   ]
   private static let numbersAndUnits = try! NSRegularExpression(
     pattern: #"[0-9]+(?:[.,，][0-9]+)*(?:\s*(?:万亿|百万|亿|万)?(?:美元|人民币|港元|元|月|日|年|天|小时|秒|个|次|倍|%|％))?"#)
+
+  private static let punctuationSpacing = try! NSRegularExpression(
+    pattern: #" +(?=[，。！？；：、,.!?;:）)】\]》」』])"#)
 
   static func captions(
     _ segments: [RecognizedSpeech], offset: Int, duration: Int,
@@ -59,9 +63,10 @@ enum CaptionSegmentation {
     for range in ranges {
       let first = max(entries.last.map { $0.end - offset } ?? 0, frame(glyphs[range.lowerBound].start, duration))
       let last = min(duration, max(first + 1, frame(glyphs[range.upperBound - 1].end, duration)))
-      let text = String(glyphs[range].map(\.value))
+      let line = String(glyphs[range].map(\.value))
         .split(whereSeparator: \.isWhitespace).joined(separator: " ")
-        .replacingOccurrences(of: #" +(?=[，。！？；：、,.!?;:）)】\]》」』])"#, with: "", options: .regularExpression)
+      let text = punctuationSpacing.stringByReplacingMatches(
+        in: line, range: NSRange(line.startIndex..<line.endIndex, in: line), withTemplate: "")
       guard last > first, text.contains(where: { $0.isLetter || $0.isNumber || $0.isSymbol }) else { continue }
       var caption = Clip.annotation(.caption, at: first + offset)
       caption.length = last - first
@@ -123,15 +128,15 @@ enum CaptionSegmentation {
     let positions = Dictionary(uniqueKeysWithValues: indexes.enumerated().map { ($0.element, $0.offset) })
     let chinese = language.hasPrefix("zh") || language.hasPrefix("yue")
     let scriptWithoutSpaces = chinese || language.hasPrefix("ja") || language.hasPrefix("ko")
-    var blocked = Set<Int>()
-    var fallback = Set<Int>()
+    var blocked = [Bool](repeating: false, count: glyphs.count)
+    var fallback = [Bool](repeating: false, count: glyphs.count)
     func protect(_ word: Range<String.Index>, fromTokenizer: Bool = false) {
       guard let first = positions[word.lowerBound], let last = positions[word.upperBound], last > first + 1 else { return }
       let interior = (first + 1)..<last
       if fromTokenizer && scriptWithoutSpaces && widths[last] - widths[first] > maximumWidth {
-        fallback.formUnion(interior)
+        for index in interior { fallback[index] = true }
       } else {
-        blocked.formUnion(interior)
+        for index in interior { blocked[index] = true }
       }
     }
     let tokenizer = NLTokenizer(unit: .word)
@@ -149,7 +154,12 @@ enum CaptionSegmentation {
       return true
     }
     let phrases = chinese ? commonPhrases + clauseStarts + terms : terms
-    for term in phrases where !term.isEmpty {
+    let transcriptScalars = Set(text.unicodeScalars)
+    for term in phrases {
+      guard let initial = term.unicodeScalars.first else { continue }
+      // Case folding leaves Han characters intact, so a missing initial
+      // rules out a match without scanning the entire transcript for the term.
+      if (0x3400...0x9FFF).contains(initial.value), !transcriptScalars.contains(initial) { continue }
       var search = text.startIndex..<text.endIndex
       while let match = text.range(of: term, options: [.caseInsensitive, .literal], range: search) {
         protect(match)
@@ -165,7 +175,7 @@ enum CaptionSegmentation {
       if !glyphs[i - 1].value.isWhitespace { previous = i - 1 }
       let left = glyphs[previous].value
       let right = glyphs[i].value
-      if blocked.contains(i) || right.isWhitespace || stops.contains(right) || softStops.contains(right)
+      if blocked[i] || right.isWhitespace || stops.contains(right) || softStops.contains(right)
         || closers.contains(right) || openers.contains(left) { continue }
       if i == previous + 1, chinese, left == right, !right.isASCII, right.isLetter,
         glyphs[i].start - glyphs[previous].end < 0.18
@@ -177,11 +187,13 @@ enum CaptionSegmentation {
         && asciiWordCharacter(glyphs[punctuation - 1].value) && asciiWordCharacter(right)
       let sentence = stops.contains(mark) && !internalPeriod
       let pause = max(0, glyphs[i].start - glyphs[previous].end)
-      let nextClause = chinese && clauseStarts.contains { text[indexes[i]...].hasPrefix($0) }
+      let nextClause = chinese && clausesByInitial[right]?.contains {
+        text[indexes[i]...].hasPrefix($0)
+      } == true
       let reward = (softStops.contains(mark) ? 3.4 : 0)
         + min(pause * 9, 4.5) + (nextClause ? 3.1 : 0)
         - (chinese && lastWordNeedsObject.contains(left) ? 3.0 : 0)
-        - (fallback.contains(i) ? 7.0 : 0)
+        - (fallback[i] ? 7.0 : 0)
       result.append(Boundary(position: i, previous: previous, reward: reward, hard: sentence || pause >= 1.15))
     }
     result.append(Boundary(position: glyphs.count, previous: glyphs.count - 1, reward: 0, hard: true))

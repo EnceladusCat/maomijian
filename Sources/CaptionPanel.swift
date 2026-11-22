@@ -31,12 +31,13 @@ struct CaptionPanel: View {
   @ObservedObject var templates = CaptionTemplates.shared
   @ObservedObject var automatic: AutomaticCaptions
   private enum Page: String, CaseIterable {
-    case generate = "生成", review = "校对", style = "样式"
+    case generate = "生成", review = "校对", voiceover = "配音", style = "样式"
 
     var icon: String {
       switch self {
       case .generate: return "waveform"
       case .review: return "text.badge.checkmark"
+      case .voiceover: return "waveform.and.mic"
       case .style: return "text.alignleft"
       }
     }
@@ -44,6 +45,7 @@ struct CaptionPanel: View {
       switch self {
       case .generate: return UI.buttonTint
       case .review: return UI.mint
+      case .voiceover: return UI.accent
       case .style: return UI.coral
       }
     }
@@ -142,6 +144,7 @@ struct CaptionPanel: View {
           switch page {
           case .generate: generator
           case .review: review
+          case .voiceover: CaptionVoiceoverPanel(editor: e, voiceover: e.captionVoiceover, captions: captions)
           case .style: styling
           }
         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)

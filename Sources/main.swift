@@ -86,6 +86,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
   }
   func applicationWillTerminate(_ notification: Notification) {
     e.automaticCaptions.cancel()
+    e.captionVoiceover.cancel()
     MediaScratch.shared.close()
   }
   func windowShouldClose(_ sender: NSWindow) -> Bool {

@@ -9,4 +9,5 @@ xcrun swiftc -O -whole-module-optimization -swift-version 5 -target "$(uname -m)
 cp "$src/Info.plist" "$dest/Contents/Info.plist"
 cp -R "$src/Resources/"* "$dest/Contents/Resources/"
 cp "$src/LICENSE" "$dest/Contents/Resources/"
+bash "$src/Scripts/bundle-audio8.sh" "$src" "$(cd "$dest/Contents/Resources/Audio8" && pwd)"
 codesign --force --sign - "$dest"

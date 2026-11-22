@@ -1,0 +1,26 @@
+--- runtime.py
++++ runtime.py
+@@ -378,0 +379,3 @@
++        *,
++        prompt: np.ndarray | None = None,
++        prefilled: tuple[np.ndarray, dict[str, np.ndarray]] | None = None,
+@@ -380,2 +383,3 @@
+-        reference_codes, meta = self.voices.load(voice)
+-        prompt = self.prompt_builder.build(text, meta["reference_text"], reference_codes)
++        if prompt is None:
++            reference_codes, meta = self.voices.load(voice)
++            prompt = self.prompt_builder.build(text, meta["reference_text"], reference_codes)
+@@ -389 +393,9 @@
+-        slow_state = self._empty_slow_state()
++        start = 0
++        if prefilled is not None:
++            prefix, state = prefilled
++            length = prefix.shape[2]
++            if 0 < length < prompt_len and np.array_equal(prefix, prompt[:, :, :length]):
++                start = length
++                slow_state = {name: value.copy() for name, value in state.items()}
++        if start == 0:
++            slow_state = self._empty_slow_state()
+@@ -393 +405 @@
+-        for position in range(prompt_len):
++        for position in range(start, prompt_len):

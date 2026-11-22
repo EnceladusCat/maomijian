@@ -343,6 +343,7 @@ final class Editor: ObservableObject {
   @Published var thumbnails = [UUID: NSImage]()
   let waveforms = WaveformStore()
   let automaticCaptions = AutomaticCaptions()
+  let captionVoiceover = CaptionVoiceover()
   let recentProjects = RecentProjects()
   let transport = Transport(), player = AVPlayer()
   let liveCanvas = LiveCanvasPreview()
@@ -1497,9 +1498,10 @@ final class Editor: ObservableObject {
   }
 
   private func captionAudio(_ id: UUID?) -> (Project, Int)? {
+    let timedAssets = Set(p.assets.lazy.filter { !$0.isStill }.map(\.id))
     var clips = p.clips.filter {
       $0.kind.isMedia && $0.volume > 0 && (id == nil || $0.id == id)
-        && p.asset($0.asset)?.isStill == false
+        && $0.asset.map(timedAssets.contains) == true
     }
     guard !clips.isEmpty else { return nil }
     let offset = id == nil ? 0 : clips[0].start
@@ -1550,6 +1552,39 @@ final class Editor: ObservableObject {
       case .failure(let error):
         self.error = L("自动字幕失败。") + error.localizedDescription
       }
+    }
+  }
+
+  func generateVoiceover(from captions: [Clip], source: VoiceoverText, voice: VoiceoverProfile?) {
+    let cues = captions.map { VoiceoverCue($0, source: source) }.filter { !$0.text.isEmpty }
+    let generation = generation
+    captionVoiceover.start(cues, voice: voice) { [weak self] output in
+      guard let self, self.generation == generation else {
+        output.discard()
+        return ""
+      }
+      let current = Dictionary(uniqueKeysWithValues: self.p.clips.lazy
+        .filter { $0.kind == .caption }.map { ($0.id, VoiceoverCue($0, source: source)) })
+      guard cues.allSatisfy({ current[$0.id] == $0 }) else {
+        output.discard()
+        return L("字幕文字或时间已更改，请重新生成配音。")
+      }
+      self.change {
+        $0.assets += output.assets
+        $0.clips += output.clips
+      }
+      guard let first = output.clips.first, self.p.clips.last?.id == output.clips.last?.id else {
+        output.discard()
+        return L("无法将配音添加到时间线。")
+      }
+      output.assets.forEach { self.loadWaveform($0) }
+      self.selected = first.id
+      self.seek(first.start)
+      let extended = zip(cues, output.clips).filter { $1.length > $0.length }.count
+      if extended > 0 {
+        return L("已添加 \(cues.count) 段配音，\(extended) 段长于对应字幕。")
+      }
+      return L("已添加 \(cues.count) 段配音。")
     }
   }
 
@@ -1697,6 +1732,7 @@ final class Editor: ObservableObject {
   }
   private func reset(_ next: Project, _ file: URL?, saved: Project? = nil, frame: Int = 0) {
     automaticCaptions.cancel()
+    captionVoiceover.cancel()
     timelineMarquee.cancel()
     libraryMarquee.cancel()
     graphSnapshot = nil

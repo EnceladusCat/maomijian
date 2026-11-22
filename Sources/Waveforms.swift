@@ -61,31 +61,57 @@ final class AudioWaveform: Equatable {
         let count = bytes / MemoryLayout<Int16>.size
         let frameCount = min(sample.numSamples, count / channels)
         guard frameCount > 0 else { return }
-        if samples.count < count { samples = [Int16](repeating: 0, count: count) }
-        let read = samples.withUnsafeMutableBytes {
-          CMBlockBufferCopyDataBytes(data, atOffset: 0, dataLength: bytes, destination: $0.baseAddress!)
-        }
-        guard read == noErr else { return }
-        let rate = format.mSampleRate
-        var frame = Int(bound(ceil(-start * rate), 0, Double(frameCount)))
-        let end = Int(bound(
-          ceil((Double(media.frames) / Double(fps) - start) * rate), Double(frame), Double(frameCount)))
-        while frame < end {
-          let index = bound(
-            Int(floor((start + Double(frame) / rate) * binsPerSecond)), 0, peaks.count - 1)
-          let next = bound(Int(ceil((Double(index + 1) / binsPerSecond - start) * rate)),
-            frame + 1, end)
-          var magnitude = 0
-          for i in frame * channels..<next * channels {
-            magnitude = max(magnitude, abs(Int(samples[i])))
+        readPCM(data, count: count, scratch: &samples) { pcm in
+          let rate = format.mSampleRate
+          var frame = Int(bound(ceil(-start * rate), 0, Double(frameCount)))
+          let end = Int(bound(
+            ceil((Double(media.frames) / Double(fps) - start) * rate), Double(frame), Double(frameCount)))
+          let source = pcm.baseAddress!
+          while frame < end {
+            let index = bound(
+              Int(floor((start + Double(frame) / rate) * binsPerSecond)), 0, peaks.count - 1)
+            let next = bound(Int(ceil((Double(index + 1) / binsPerSecond - start) * rate)),
+              frame + 1, end)
+            var magnitude = 0
+            for i in frame * channels..<next * channels {
+              magnitude = max(magnitude, abs(Int(source[i])))
+            }
+            peaks[index] = max(peaks[index], UInt8((magnitude * 255 + 16_384) / 32_768))
+            frame = next
           }
-          peaks[index] = max(peaks[index], UInt8((magnitude * 255 + 16_384) / 32_768))
-          frame = next
         }
       }
     }
     guard !cancelled(), reader.status == .completed else { return (true, nil) }
     return (true, AudioWaveform(frames: media.frames, peaks: peaks))
+  }
+
+  static func readPCM(
+    _ data: CMBlockBuffer, count: Int, scratch: inout [Int16],
+    consume: (UnsafeBufferPointer<Int16>) -> Void
+  ) {
+    let bytes = count * MemoryLayout<Int16>.stride
+    var available = 0
+    var contiguous: UnsafeMutablePointer<Int8>?
+    let status = CMBlockBufferGetDataPointer(
+      data, atOffset: 0, lengthAtOffsetOut: &available, totalLengthOut: nil,
+      dataPointerOut: &contiguous)
+    if status == noErr, bytes <= available, let contiguous,
+      Int(bitPattern: contiguous).isMultiple(of: MemoryLayout<Int16>.alignment)
+    {
+      let pointer = UnsafeRawPointer(contiguous).assumingMemoryBound(to: Int16.self)
+      withExtendedLifetime(data) { consume(UnsafeBufferPointer(start: pointer, count: count)) }
+      return
+    }
+    if scratch.count < count { scratch = [Int16](repeating: 0, count: count) }
+    let read = scratch.withUnsafeMutableBytes {
+      CMBlockBufferCopyDataBytes(data, atOffset: 0, dataLength: bytes, destination: $0.baseAddress!)
+    }
+    if read == noErr {
+      scratch.withUnsafeBufferPointer {
+        consume(UnsafeBufferPointer(start: $0.baseAddress, count: count))
+      }
+    }
   }
 }
 

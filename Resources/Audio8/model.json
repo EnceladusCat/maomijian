@@ -1,0 +1,70 @@
+{
+  "revision": "4b04c49d6fd8155257e4aa8972df203af97173ba",
+  "files": [
+    {
+      "path": "LICENSE",
+      "size": 6973,
+      "sha256": "d6386c15f43c086f5eec426bd0037cd9628490049cca023e4c0ac9e2a4559f1a"
+    },
+    {
+      "path": "codec_decoder_fp16.onnx",
+      "size": 594319,
+      "sha256": "25379b866ad555b9a55226c46325344d2ebfafea1b474c29de5223a9d01ea533"
+    },
+    {
+      "path": "codec_decoder_fp16.onnx.data",
+      "size": 260741440,
+      "sha256": "b9bc968a84f41b86a9a3d19bc6c42b00b5de576512a87501d0c66ff7f896c954"
+    },
+    {
+      "path": "fast_ar_int8.onnx",
+      "size": 511306,
+      "sha256": "6cfc5c8e85d83d27d508d11351d8ca7d2749d6ff2990dc9efd048f86c27ff371"
+    },
+    {
+      "path": "fast_ar_int8.onnx.data",
+      "size": 36718592,
+      "sha256": "cef092e658d8daad329117f9e9c3b09730deb3e39ea6f6634cd4d1ec8426eb9d"
+    },
+    {
+      "path": "reference_codes.npy",
+      "size": 8928,
+      "sha256": "7a4fbf777804d88df906982b2b055f579229b0a2044208a4c9bc7680948c4471"
+    },
+    {
+      "path": "runtime_manifest.json",
+      "size": 1424,
+      "sha256": "c7dc8c2490bcad21739ac01994f0ed2dfc71f76e8e9695239c9606eac03e6b62"
+    },
+    {
+      "path": "slow_ar_int8.onnx",
+      "size": 4820700,
+      "sha256": "5aa5263d5c7e94cc58c81c969710045d313b4de87deae847f5388c126722bd3a"
+    },
+    {
+      "path": "slow_ar_int8.onnx.data",
+      "size": 133471232,
+      "sha256": "4cf0f7ee7d5a9e817caaed310cc2f62dc08ebd37a1b87300dd4255ff0c45dace"
+    },
+    {
+      "path": "tokenizer/tokenizer.json",
+      "size": 5852397,
+      "sha256": "f1c5ac4973f74a007635d81dafcb2cf0e5c4578c7426f48f53ab0ebf5b978bef"
+    },
+    {
+      "path": "registration/codec_encoder_fp16.onnx",
+      "size": 940787,
+      "sha256": "f9c08ca7a3a428e2caf089a17e2179934e20ba5c7c8e5d5f9dbc8c89ebc0306b"
+    },
+    {
+      "path": "registration/codec_encoder_fp16.onnx.data",
+      "size": 414425088,
+      "sha256": "ca4af8d00784b557fc06c90e462de0ee36586f6ffca63f3ca24f3af121fbb300"
+    },
+    {
+      "path": "registration/registration_manifest.json",
+      "size": 179,
+      "sha256": "df743225ea9697f9b96c2505b1ed2345eae371c87591e6dd4b2fad998845fe64"
+    }
+  ]
+}
