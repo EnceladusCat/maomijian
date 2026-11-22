@@ -9,6 +9,9 @@ struct MediaHandles: View {
   let cropping: Bool
 
   @State private var draft: Clip?
+  @State private var move: CanvasMove?
+  @State private var xGuide: CanvasMove.Guide?
+  @State private var yGuide: CanvasMove.Guide?
   private let coordinate = CoordinateSpace.named("canvas")
 
   var body: some View {
@@ -39,14 +42,19 @@ struct MediaHandles: View {
         .gesture(
           DragGesture(minimumDistance: 2, coordinateSpace: coordinate)
             .onChanged { value in
-              var updated = clip
-              let original = clip.placement(
-                at: frame, canvas: canvas, geometry: VisualGeometry(clip: clip, canvas: canvas, aspect: aspect))
-              let ratio = original.anchorsToCanvas ? original.scale : 1
-              updated.x = bound(clip.x + value.translation.width / (canvas.width * ratio), -4, 5)
-              updated.y = bound(clip.y + value.translation.height / (canvas.height * ratio), -4, 5)
-              update(updated)
-            }.onEnded { _ in commit() })
+              if move == nil {
+                let item = CanvasObject(clip: clip, frame: frame, canvas: canvas,
+                                        mediaSize: CGSize(width: aspect, height: 1), style: nil)
+                move = CanvasMove(item: item, canvas: canvas, neighbors: editor.canvasObjects(at: frame, size: canvas))
+              }
+              guard let result = move?.translated(by: value.translation) else { return }
+              xGuide = result.x
+              yGuide = result.y
+              update(result.clip)
+            }.onEnded { value in
+              if let result = move?.translated(by: value.translation) { editor.commitCanvas(result.clip) }
+              resetMove()
+            })
       ForEach(0..<(cropping ? 8 : 4), id: \.self) { index in
         let point = index < 4 ? VisualGeometry.corners(box)[index] : edgePoints(box)[index - 4]
         Rectangle().fill(cropping ? .white : UI.accent)
@@ -84,6 +92,8 @@ struct MediaHandles: View {
               }.onEnded { _ in commit() }
           ).help(L("拖动旋转素材")).accessibilityLabel(L("旋转手柄"))
       }
+      CanvasGuides(x: xGuide, y: yGuide, canvas: canvas,
+                   pixelsPerPoint: editor.p.canvas.size(editor.preview).width / canvas.width)
     }.frame(width: canvas.width, height: canvas.height)
       .onChange(of: cropping) { _ in clearDraft() }
       .onDisappear(perform: clearDraft)
@@ -131,8 +141,14 @@ struct MediaHandles: View {
     editor.previewCanvas(clip)
   }
   private func clearDraft() {
-    draft = nil
+    resetMove()
     if editor.liveCanvas.activeID == clip.id { editor.liveCanvas.clear() }
+  }
+  private func resetMove() {
+    draft = nil
+    move = nil
+    xGuide = nil
+    yGuide = nil
   }
   private func commit() {
     if let draft { editor.commitCanvas(draft) }

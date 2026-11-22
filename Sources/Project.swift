@@ -794,6 +794,7 @@ struct CaptionPreset: Identifiable, Codable, Equatable {
 struct Project: Codable, Equatable {
   var captionStyle: CaptionStyle?
   var captionTerms: String?
+  var captionGlossary: String?
   var trackOrder: [String]?
   var backgroundColor: String?
   var background: String { backgroundColor ?? "#000000" }
@@ -803,6 +804,11 @@ struct Project: Codable, Equatable {
   var clips: [Clip] = []
   var duration: Int { clips.lazy.map(\.end).max() ?? 0 }
   func asset(_ id: UUID?) -> Media? { assets.first { $0.id == id } }
+  func hasSameTimelineMedia(as previous: Project) -> Bool {
+    guard assets != previous.assets else { return true }
+    let used = Set(clips.compactMap { $0.kind.isMedia ? $0.asset : nil })
+    return assets.filter { used.contains($0.id) } == previous.assets.filter { used.contains($0.id) }
+  }
   func name(_ c: Clip) -> String {
     if c.kind.isMedia { return asset(c.asset)?.name ?? c.kind.title }
     if let visual = c.audioVisualization { return L("音频可视化 · \(visual.style.title)") }

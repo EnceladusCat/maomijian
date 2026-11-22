@@ -1,27 +1,28 @@
 import AVFoundation
 import SwiftUI
 
-private final class SoundAudition: NSObject, ObservableObject, AVAudioPlayerDelegate {
-  @Published var active: BuiltInSound?
+final class SoundAudition: NSObject, ObservableObject, AVAudioPlayerDelegate {
+  @Published private(set) var active: URL?
   private var player: AVAudioPlayer?
   private var request = UUID()
 
   func stop() {
+    guard active != nil else { return }
     request = UUID()
     player?.stop()
     player = nil
     active = nil
   }
-  func toggle(_ sound: BuiltInSound, failure: @escaping (String) -> Void) {
-    let wasPlaying = active == sound
+  func toggle(_ url: URL, failure: @escaping (String) -> Void) {
+    let wasPlaying = active == url
     stop()
-    guard !wasPlaying, let url = sound.url else { return }
+    guard !wasPlaying else { return }
     let token = request
-    active = sound
+    active = url
     DispatchQueue.global(qos: .userInitiated).async {
       let result = Result { () throws -> AVAudioPlayer in
         let player = try AVAudioPlayer(contentsOf: url)
-        guard player.prepareToPlay() else { throw EditError.message(L("无法准备试听音效。")) }
+        guard player.prepareToPlay() else { throw EditError.message(L("无法准备试听。")) }
         return player
       }
       DispatchQueue.main.async {
@@ -30,7 +31,7 @@ private final class SoundAudition: NSObject, ObservableObject, AVAudioPlayerDele
           let candidate = try result.get()
           self.player = candidate
           candidate.delegate = self
-          guard candidate.play() else { throw EditError.message(L("无法播放音效。")) }
+          guard candidate.play() else { throw EditError.message(L("无法播放试听音频。")) }
         } catch {
           self.stop()
           failure(error.localizedDescription)
@@ -39,7 +40,9 @@ private final class SoundAudition: NSObject, ObservableObject, AVAudioPlayerDele
     }
   }
   func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-    if player === self.player { stop() }
+    DispatchQueue.main.async {
+      if player === self.player { self.stop() }
+    }
   }
 }
 struct SoundPanel: View {
@@ -50,11 +53,14 @@ struct SoundPanel: View {
     ScrollView {
       VStack(alignment: .leading, spacing: 7) {
         ForEach(BuiltInSound.library, id: \.self) { sound in
+          let url = sound.url
           HStack(spacing: 7) {
             Tool(
-              symbol: audition.active == sound ? "stop.fill" : "play.fill",
+              symbol: audition.active != nil && audition.active == url ? "stop.fill" : "play.fill",
               label: L("试听 ") + sound.name
-            ) { audition.toggle(sound) { e.error = $0 } }
+            ) {
+              if let url { audition.toggle(url) { e.error = $0 } }
+            }
             VStack(alignment: .leading, spacing: 2) {
               Text(sound.name).font(.system(size: 12, weight: .semibold))
               Text(sound.title).font(.caption).foregroundStyle(UI.muted)

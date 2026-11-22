@@ -17,17 +17,23 @@ enum VoiceoverText: String, CaseIterable {
   }
 }
 
+enum VoiceoverFormat: String {
+  case m4a, wav
+
+  var scratchFormat: MediaScratch.Format { self == .m4a ? .audio : .wav }
+}
+
 struct VoiceoverCue: Equatable {
   let id: UUID
   let start: Int
   let length: Int
   let text: String
 
-  init(_ clip: Clip, source: VoiceoverText) {
+  init(_ clip: Clip, source: VoiceoverText, glossary: CaptionGlossary = .empty) {
     id = clip.id
     start = clip.start
     length = clip.length
-    text = source.text(in: clip)
+    text = glossary.read(source.text(in: clip))
   }
 
   func audioClip(using media: Media) -> Clip {
@@ -46,7 +52,7 @@ struct VoiceoverCue: Equatable {
 
 final class CaptionVoiceover: ObservableObject {
   enum Stage: Equatable {
-    case preparing, downloading(Double), registering, synthesizing(Int, Int)
+    case preparing, downloading(Double), registering, synthesizing(Int, Int), exporting(VoiceoverFormat)
   }
 
   struct Output {
@@ -60,8 +66,17 @@ final class CaptionVoiceover: ObservableObject {
     }
   }
 
+  struct InstantOutput {
+    let file: MediaScratch.File
+    let text: String
+    let voiceID: UUID?
+    let frames: Int
+  }
+
   typealias Report = (Stage) async -> Void
   @Published var instantText = ""
+  @Published private(set) var instant: InstantOutput?
+  let audition = SoundAudition()
   @Published private(set) var stage: Stage?
   @Published private(set) var notice = ""
   @Published private(set) var profiles = VoiceoverProfile.load(in: support)
@@ -97,15 +112,28 @@ final class CaptionVoiceover: ObservableObject {
     }, accept: accept)
   }
 
-  func exportText(
-    _ text: String, voice: VoiceoverProfile?, to destination: URL,
-    validate: @escaping () throws -> Void
-  ) {
-    guard let resources = Self.resources else { return }
+  func generateText(voice: VoiceoverProfile?, glossary: CaptionGlossary = .empty) {
+    let text = glossary.read(instantText.trimmingCharacters(in: .whitespacesAndNewlines))
+    guard job == nil, !text.isEmpty, let resources = Self.resources else { return }
+    audition.stop()
     let support = Self.support
     perform(discard: { _ in }, work: { report in
-      try await Self.renderText(text, voice: voice, to: destination,
-                                resources: resources, support: support, report: report)
+      try await Self.renderText(text, voice: voice, resources: resources, support: support, report: report)
+    }, accept: { [weak self] output in
+      self?.instant = output
+      return ""
+    })
+  }
+
+  func export(
+    _ instant: InstantOutput, format: VoiceoverFormat, to destination: URL,
+    validate: @escaping () throws -> Void
+  ) {
+    guard job == nil else { return }
+    audition.stop()
+    let encoder = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/ffmpeg")
+    perform(stage: .exporting(format), discard: { _ in }, work: { _ in
+      try await Self.stageExport(instant.file, format: format, to: destination, encoder: encoder)
     }, accept: { file in
       do {
         try validate()
@@ -113,6 +141,13 @@ final class CaptionVoiceover: ObservableObject {
         return L("已导出 ") + destination.lastPathComponent
       } catch { return error.localizedDescription }
     })
+  }
+
+  func reset() {
+    cancel()
+    audition.stop()
+    instant = nil
+    notice = ""
   }
 
   func register(name: String, transcript: String, recording: URL, saved: @escaping (VoiceoverProfile) -> Void) {
@@ -142,11 +177,12 @@ final class CaptionVoiceover: ObservableObject {
   }
 
   private func perform<T>(
+    stage initialStage: Stage = .preparing,
     discard: @escaping (T) -> Void, work: @escaping (Report) async throws -> T,
     accept: @escaping (T) -> String
   ) {
     guard job == nil else { return }
-    stage = .preparing
+    stage = initialStage
     notice = ""
     job = Task.detached(priority: .utility) { [weak self] in
       let result: Result<T, Error>
@@ -188,15 +224,41 @@ final class CaptionVoiceover: ObservableObject {
   }
 
   static func renderText(
-    _ text: String, voice: VoiceoverProfile?, to destination: URL, resources: URL, support: URL,
+    _ text: String, voice: VoiceoverProfile?, resources: URL, support: URL,
     scratch: MediaScratch = .shared, report: Report
-  ) async throws -> MediaScratch.File {
-    let staged = try scratch.make(.wav, beside: destination.deletingLastPathComponent())
-    let request = Request(text: text, path: staged.url.path)
+  ) async throws -> InstantOutput {
+    let file = try scratch.make(.wav)
+    let request = Request(text: text, path: file.url.path)
     try await synthesize(request, total: nil, voice: voice, resources: resources, support: support,
                          scratch: scratch, report: report)
-    let audio = try inspect(staged.url)
+    let audio = try inspect(file.url)
     guard audio.audio, !audio.video else { throw CocoaError(.fileReadCorruptFile) }
+    return InstantOutput(file: file, text: text, voiceID: voice?.id, frames: audio.frames)
+  }
+
+  static func stageExport(
+    _ source: MediaScratch.File, format: VoiceoverFormat, to destination: URL, encoder: URL,
+    scratch: MediaScratch = .shared
+  ) async throws -> MediaScratch.File {
+    try Task.checkCancellation()
+    let staged = try scratch.make(format.scratchFormat, beside: destination.deletingLastPathComponent())
+    switch format {
+    case .wav:
+      try FileManager.default.copyItem(at: source.url, to: staged.url)
+    case .m4a:
+      guard FileManager.default.isExecutableFile(atPath: encoder.path) else {
+        throw EditError.message(L("找不到随应用提供的 M4A 编码器。"))
+      }
+      let status = try await LocalInference.run(encoder, arguments: [
+        "-hide_banner", "-loglevel", "error", "-nostdin", "-xerror", "-i", source.url.path,
+        "-map", "0:a:0", "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart",
+        "-f", "ipod", staged.url.path
+      ], scratch: scratch)
+      guard status == 0, FileManager.default.fileExists(atPath: staged.url.path) else {
+        throw EditError.message(L("无法编码 M4A 音频。"))
+      }
+    }
+    try Task.checkCancellation()
     return staged
   }
 
@@ -249,15 +311,18 @@ final class CaptionVoiceover: ObservableObject {
     try Task.checkCancellation()
     let request = try scratch.make(.json)
     let progress = try scratch.make(.log)
+    let decoderGraph = try scratch.make(.onnx)
+    let decoderWeights = try scratch.make(.weights)
+    defer { withExtendedLifetime((request, progress, decoderGraph, decoderWeights)) {} }
     try JSONEncoder().encode(payload).write(to: request.url, options: .atomic)
     let voiceFolder = voice?.folder(in: support).path ?? ""
     let fallback = AppLanguage.current == .english ? "en" : "zh"
     await report(total.map { .synthesizing(0, $0) } ?? .preparing)
     var previous = ""
-    let status = try await run(interpreter(in: resources), arguments: [
+    let status = try await LocalInference.run(interpreter(in: resources), arguments: [
       "-IB", resources.appendingPathComponent("voiceover.py").path,
       total == nil ? "instant" : "synthesize", folder.path, request.url.path,
-      progress.url.path, voiceFolder, fallback
+      progress.url.path, voiceFolder, fallback, decoderGraph.url.path, decoderWeights.url.path
     ], scratch: scratch) {
       guard let value = try? String(contentsOf: progress.url, encoding: .ascii), value != previous
       else { return }
@@ -284,7 +349,7 @@ final class CaptionVoiceover: ObservableObject {
       throw EditError.message(rejection)
     }
     let pcm = try scratch.make(.wav)
-    let converted = try await run(URL(fileURLWithPath: "/usr/bin/afconvert"), arguments: [
+    let converted = try await LocalInference.run(URL(fileURLWithPath: "/usr/bin/afconvert"), arguments: [
       "-f", "WAVE", "-d", "LEI16@44100", "-c", "1", recording.path, pcm.url.path
     ], scratch: scratch)
     guard converted == 0 else { throw EditError.message(rejection) }
@@ -295,7 +360,7 @@ final class CaptionVoiceover: ObservableObject {
     }
     let codes = try scratch.make(.npy)
     await report(.registering)
-    let status = try await run(interpreter(in: resources), arguments: [
+    let status = try await LocalInference.run(interpreter(in: resources), arguments: [
       "-IB", resources.appendingPathComponent("voiceover.py").path, "register",
       folder.path, pcm.url.path, codes.url.path
     ], scratch: scratch)
@@ -314,38 +379,5 @@ final class CaptionVoiceover: ObservableObject {
       try? fm.removeItem(at: destination)
       throw error
     }
-  }
-
-  private static func run(
-    _ executable: URL, arguments: [String], scratch: MediaScratch,
-    poll: () async -> Void = {}
-  ) async throws -> Int32 {
-    let log = try scratch.make(.log)
-    try Data().write(to: log.url)
-    let diagnostics = try FileHandle(forWritingTo: log.url)
-    defer { try? diagnostics.close() }
-    let process = Process()
-    process.executableURL = executable
-    process.arguments = arguments
-    process.standardInput = FileHandle.nullDevice
-    process.standardOutput = FileHandle.nullDevice
-    process.standardError = diagnostics
-    process.qualityOfService = .utility
-
-    try Task.checkCancellation()
-    try process.run()
-    defer {
-      if process.isRunning { process.terminate() }
-      process.waitUntilExit()
-    }
-    while process.isRunning {
-      try await Task.sleep(for: .milliseconds(250))
-      await poll()
-    }
-    try Task.checkCancellation()
-    if process.terminationStatus != 0, let details = try? String(contentsOf: log.url, encoding: .utf8) {
-      NSLog("Audio8: %@", String(details.suffix(2000)))
-    }
-    return process.terminationStatus
   }
 }

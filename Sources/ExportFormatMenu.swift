@@ -7,6 +7,7 @@ struct ExportFormatMenu: View {
   var body: some View {
     VStack(spacing: 4) {
       format(L("导出视频（MP4）…"), icon: "film") { editor.export() }
+      format(L("导出当前帧（PNG）…"), icon: "photo") { editor.exportFrame() }
       Divider().padding(.vertical, 2)
       format(L("仅导出音频（M4A）…"), icon: "waveform") { editor.audioExport() }
         .disabled(!editor.canExportAudio)

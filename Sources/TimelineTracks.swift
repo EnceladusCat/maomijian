@@ -81,6 +81,7 @@ struct TimelineLayout {
   let lanes: [Lane]
   let movableIDs: [String]
   let duration: Int
+  let nextCaption: [UUID: UUID]
 
   init(_ project: Project) {
     let joins = project.joins
@@ -104,6 +105,9 @@ struct TimelineLayout {
       })
     }
     movableIDs = tracks.filter { !$0.pinned }.map(\.id)
+    nextCaption = Dictionary(uniqueKeysWithValues: tracks.filter(\.pinned).flatMap { track in
+      zip(track.clips, track.clips.dropFirst()).map { ($0.id, $1.id) }
+    })
     duration = project.duration
   }
 }

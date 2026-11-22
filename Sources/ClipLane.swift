@@ -222,6 +222,11 @@ struct ClipLane: NSViewRepresentable {
         add(L("复制属性"), #selector(copyProperties(_:)))
         menu.items.last?.representedObject = clip.id
         add(L("粘贴属性"), #selector(pasteProperties), enabled: editor.hasCopiedProperties)
+        if let media = editor.p.asset(clip.asset), media.isStill {
+          menu.addItem(.separator())
+          add(L("高清化并替换此片段"), #selector(enhanceImage(_:)))
+          menu.items.last?.representedObject = clip.id
+        }
       }
       return menu
     }
@@ -233,6 +238,12 @@ struct ClipLane: NSViewRepresentable {
       if let id = item.representedObject as? UUID { editor?.copyProperties(from: id) }
     }
     @objc private func pasteProperties() { editor?.pasteProperties() }
+    @objc private func enhanceImage(_ item: NSMenuItem) {
+      guard let editor, let id = item.representedObject as? UUID,
+        let clip = editor.p.clips.first(where: { $0.id == id }),
+        let media = editor.p.asset(clip.asset) else { return }
+      editor.enhanceImage(media, replacing: id)
+    }
 
     override func mouseDown(with event: NSEvent) {
       guard let d = layoutData, let e = editor else { return }

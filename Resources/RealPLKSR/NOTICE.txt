@@ -1,0 +1,9 @@
+4xNomosWebPhoto_RealPLKSR by Philip Hofmann
+https://huggingface.co/Phips/4xNomosWebPhoto_RealPLKSR
+
+The model is licensed under Creative Commons Attribution 4.0 International.
+https://creativecommons.org/licenses/by/4.0/
+
+This app bundles the unchanged ONNX conversion by notaneimu from revision
+4cd6fa6bf614d37d00350c6cac174897582ed4bc, renamed to model_x4.onnx.
+https://huggingface.co/notaneimu/onnx-image-models/blob/4cd6fa6bf614d37d00350c6cac174897582ed4bc/4xNomosWebPhoto_RealPLKSR.onnx

@@ -1,16 +1,25 @@
 --- runtime.py
 +++ runtime.py
-@@ -378,0 +379,3 @@
+@@ -131,0 +132 @@
++        decoder_factory=None,
+@@ -159,0 +161,2 @@
++        codec_path = self.model_dir / codec_name
++        self.decoder = decoder_factory(codec_path, threads) if decoder_factory else None
+@@ -162 +165,2 @@
+-        self.decoder = _session(self.model_dir / codec_name, threads)
++        if self.decoder is None:
++            self.decoder = _session(codec_path, threads)
+@@ -378,0 +383,3 @@
 +        *,
 +        prompt: np.ndarray | None = None,
 +        prefilled: tuple[np.ndarray, dict[str, np.ndarray]] | None = None,
-@@ -380,2 +383,3 @@
+@@ -380,2 +387,3 @@
 -        reference_codes, meta = self.voices.load(voice)
 -        prompt = self.prompt_builder.build(text, meta["reference_text"], reference_codes)
 +        if prompt is None:
 +            reference_codes, meta = self.voices.load(voice)
 +            prompt = self.prompt_builder.build(text, meta["reference_text"], reference_codes)
-@@ -389 +393,9 @@
+@@ -389 +397,9 @@
 -        slow_state = self._empty_slow_state()
 +        start = 0
 +        if prefilled is not None:
@@ -21,6 +30,6 @@
 +                slow_state = {name: value.copy() for name, value in state.items()}
 +        if start == 0:
 +            slow_state = self._empty_slow_state()
-@@ -393 +405 @@
+@@ -393 +409 @@
 -        for position in range(prompt_len):
 +        for position in range(start, prompt_len):

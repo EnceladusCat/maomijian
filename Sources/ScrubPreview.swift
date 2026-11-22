@@ -38,8 +38,8 @@ final class ScrubPreview: ObservableObject {
     }
 
     func render() async -> Frame? {
-      let lower = max(bounds.lowerBound, frame - 12)
-      let upper = min(bounds.upperBound - 1, frame + 12)
+      let lower = max(bounds.lowerBound, frame - 4)
+      let upper = min(bounds.upperBound - 1, frame + 4)
       guard lower <= frame, upper >= frame else { return nil }
       let sourceFrame = clip.sourceFrame(at: frame)
       let sourceTime = CMTime(seconds: sourceFrame / Double(fps), preferredTimescale: 600_000)
@@ -51,12 +51,14 @@ final class ScrubPreview: ObservableObject {
       guard let decoded = try? await generator.image(at: sourceTime), !Task.isCancelled else { return nil }
       let sourceOffset = (decoded.actualTime - sourceTime).seconds
       guard sourceOffset.isFinite else { return nil }
-      let actual = bound(frame + Int((sourceOffset * Double(fps) / clip.effectiveRate).rounded()), lower, upper)
+      let actual = frame + Int((sourceOffset * Double(fps) / clip.effectiveRate).rounded())
+      guard (lower...upper).contains(actual) else { return nil }
       let picture = Picture(image: decoded.image, transform: transform)
       guard let context = bitmap(Int(painter.size.width), Int(painter.size.height)) else { return nil }
-      painter.paint(context, frame: actual, active: slice.clips) { id in
+      painter.paint(context, frame: actual, active: slice.compositedClips) { id in
         id == clip.id ? picture : nil
       }
+      if !slice.inlineCaptions.isEmpty { painter.paintCaptions(context, frame: actual, active: slice.inlineCaptions) }
       guard let image = context.makeImage() else { return nil }
       return Frame(number: actual, image: image)
     }
@@ -131,7 +133,8 @@ final class ScrubPreview: ObservableObject {
         if let updated {
           let delay = bound(CACurrentMediaTime() - started, 0.008, 0.070)
           self.decodeDelay = 0.7 * self.decodeDelay + 0.3 * delay
-          if self.frame?.number != updated.number { self.frame = updated }
+          if (self.next == nil || self.next?.slice === adjusted.slice),
+            self.frame?.number != updated.number { self.frame = updated }
         } else if self.next == nil {
           self.onFailure?(request.frame)
         }

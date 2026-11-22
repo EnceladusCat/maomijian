@@ -529,6 +529,8 @@ struct Inspector: View {
         Writing(value: c.captionTranslation ?? "", title: L("译文")) { value in
           e.edit(c.id) { $0.captionTranslation = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : value }
         }.id(c.id)
+        Button(L("合并下一句")) { e.mergeCaptionWithNext(c.id) }.buttonStyle(QuietButton())
+          .disabled(e.timelineLayout.nextCaption[c.id] == nil)
       }
     }
     if c.kind == .text {

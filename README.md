@@ -10,10 +10,12 @@ MaoMiJian is a macOS video editor for screen recordings. Choose **毛咪剪 → 
 - 添加文字、箭头、形状、计时器、高亮和局部放大。文字和形状有 3D 样式，高亮可淡入淡出，局部放大可调整边框。
 - 将转场拖到素材首尾或接缝，拖动门形标记的边缘调整时长。预览可选择 1080p、720p、540p 或 360p。
 - 在同一个视频或图片上堆叠滤镜，单独调整强度和顺序。「去除背景」会从素材边缘自动采样颜色，可调敏感度去除绿幕、蓝幕等单色背景。
+- Apple 芯片版内置 RealPLKSR。素材库右键可离线高清化并生成保留透明度的新 PNG，时间线上右键可直接替换片段。小图最高放大 4 倍。
 - 导入 SRT、统一设置字幕样式并保存常用模板。可单独导出 M4A 音频、SRT 字幕，也可一次导出两个文件。
 - macOS 26 上可在本机生成自动字幕并查看预计剩余时间。支持批量校对、本机字幕翻译和双语字幕。编辑时自动保存恢复草稿。
-- 「字幕 → 配音」可用 Audio8-TTS 0.1B ONNX INT8 在 Apple 芯片 Mac 上朗读原文或译文，并按字幕时间放入音频轨。「即转」可直接把输入的文字导出为 WAV。
+- 「字幕 → 配音」可用 Audio8-TTS 0.1B ONNX INT8 在 Apple 芯片 Mac 上朗读原文或译文，并按字幕时间放入音频轨。「即转」可先试听输入文字生成的配音，再导出为 M4A 或 WAV。
 - MP4 默认用 HEVC（H.265）均衡档导出，Apple 芯片 Mac 可选「录屏压缩」。同时支持 H.264、文件大小估算和高码率近无损选项。
+- 「导出当前帧」可按画布比例以最高 4K 保存播放头处的 PNG，包含字幕和特效。
 
 ## 下载
 
@@ -34,8 +36,8 @@ MaoMiJian is a macOS video editor for screen recordings. Choose **毛咪剪 → 
 open "毛咪剪.app"
 ```
 
-构建脚本使用当前 Mac 的架构。Apple 芯片版构建时会联网打包 Python、ONNX Runtime 和 Audio8 推理组件，用户可直接使用。运行像素与时间线检查的命令见[使用说明](使用说明.md#从源码构建)。
+构建脚本使用当前 Mac 的架构。Apple 芯片版构建时会联网打包 Python、ONNX Runtime、Audio8 推理组件和 RealPLKSR 权重。运行像素与时间线检查的命令见[使用说明](使用说明.md#从源码构建)。
 
 ## 许可证
 
-本项目代码与自有资源以 [MIT 许可证](LICENSE) 发布。随包附有第三方运行组件的许可与声明。首次使用配音时单独下载的权重遵循 [Audio8 Community License v1.0](https://huggingface.co/Edge0/audio8-TTS-0.1B-ONNX-INT8/blob/4b04c49d6fd8155257e4aa8972df203af97173ba/LICENSE)。
+本项目代码与自有资源以 [MIT 许可证](LICENSE) 发布。M4A 配音导出使用 [FFmpeg](https://ffmpeg.org/)（LGPL 2.1 或更高版本）。构建包附有对应源码、构建脚本和许可。随包附有第三方运行组件的许可与声明。首次使用配音时单独下载的权重遵循 [Audio8 Community License v1.0](https://huggingface.co/Edge0/audio8-TTS-0.1B-ONNX-INT8/blob/4b04c49d6fd8155257e4aa8972df203af97173ba/LICENSE)。

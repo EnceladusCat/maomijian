@@ -34,6 +34,7 @@ final class PanelUpdates: ObservableObject {
       switch tab {
       case .captions:
         if next.captionStyle != previous.captionStyle || next.captionTerms != previous.captionTerms
+          || next.captionGlossary != previous.captionGlossary
           || next.clips != previous.clips || next.assets != previous.assets { changed() }
       case .filters:
         if previous.clips.filter({ $0.kind == .video }) != next.clips.filter({ $0.kind == .video })
@@ -133,23 +134,26 @@ final class Editor: ObservableObject {
   private var seekInFlight = false
   private var submittedScrubFrame: Int?
   private var scrubSources: [UUID: ScrubPreview.Source] = [:]
-  private var exactScrubSeek: UUID?
+  private var exactSeek: UUID?
   private var currentScrubFrame: Int?
   private var lastScrubTick: CFTimeInterval?
   private var scrubRefresh: DispatchWorkItem?
   private var scrubVelocity = 0.0
   @Published var selectedIDs: [UUID] = [] {
     didSet {
+      if let canvasSelection, selectedIDs != [canvasSelection] { self.canvasSelection = nil }
       if let pathDrawingID, selectedIDs != [pathDrawingID] { cancelPathDrawing() }
       if let pick = backgroundColorPick, selectedIDs != [pick.clipID] { cancelBackgroundColorPick() }
     }
   }
   @Published var libraryIDs: [UUID] = []
   var libraryFocus = false
+  private var canvasSelection: UUID?
   private var timelineAnchor: UUID?, libraryAnchor: UUID?
   var selected: UUID? {
     get { selectedIDs.last }
     set {
+      canvasSelection = nil
       deselectTransition()
       libraryFocus = false
       timelineAnchor = newValue
@@ -160,6 +164,13 @@ final class Editor: ObservableObject {
   var selectedClips: [Clip] {
     let ids = Set(selectedIDs)
     return p.clips.filter { ids.contains($0.id) }
+  }
+  func pickCanvasClip(_ id: UUID) {
+    deselectTransition()
+    libraryFocus = false
+    timelineAnchor = id
+    canvasSelection = id
+    if selectedIDs != [id] { selectedIDs = [id] }
   }
   var canCopyClips: Bool { !libraryFocus && selectedTransition == nil && !selectedIDs.isEmpty }
   var canPasteClips: Bool {
@@ -340,19 +351,23 @@ final class Editor: ObservableObject {
   @Published var progress: Double?
   @Published var exportShort = 1080
   private var exportSettings = ExportSettings()
+  private var frameExportSize: FrameExportSize?
   @Published var thumbnails = [UUID: NSImage]()
   let waveforms = WaveformStore()
   let automaticCaptions = AutomaticCaptions()
   let captionVoiceover = CaptionVoiceover()
+  let imageEnhancement = ImageEnhancement()
   let recentProjects = RecentProjects()
   let transport = Transport(), player = AVPlayer()
   let liveCanvas = LiveCanvasPreview()
   let scrubPreview = ScrubPreview()
   private var baseline = Project(), undoStack = [Project](), redoStack = [Project](),
     observer: Any?, itemObservation: NSKeyValueObservation?
+  private var playbackNotifications: [NSObjectProtocol] = []
+  private weak var failedPreviewItem: AVPlayerItem?
   private let recovery = ProjectRecovery()
   private var graphSnapshot: Project?, previewGraph: MediaGraph?
-  private var previewComposition: Composition?
+  @Published private(set) var previewComposition: Composition?
   private var buildTicket: Progress?
   private var playWhenReady = false
   private var revision = 0, generation = UUID(), pending: DispatchWorkItem?, job: ExportJob?
@@ -366,35 +381,94 @@ final class Editor: ObservableObject {
   var canRedo: Bool { !redoStack.isEmpty }
   init() {
     player.actionAtItemEnd = .pause
-    observer = player.addPeriodicTimeObserver(forInterval: time(2), queue: .main) { [weak self] t in
-      guard let self, self.transport.playing, !self.playWhenReady, t.seconds.isFinite else {
-        return
-      }
-      let f = Int((t.seconds * 30).rounded())
+    observer = player.addPeriodicTimeObserver(forInterval: time(1), queue: .main) { [weak self] _ in
+      guard let self, self.transport.playing, !self.playWhenReady, self.exactSeek == nil,
+        let f = playbackFrame(self.player.currentTime()) else { return }
       if let end = self.auditionEnd, f >= end {
         self.seek(end)
         return
       }
       let next = bound(f, 0, self.timelineDuration)
-      if self.transport.frame != next { self.transport.frame = next }
-      if self.player.rate == 0 && f >= self.timelineDuration - 2 { self.transport.playing = false }
+      if self.transport.frame != next {
+        self.transport.frame = next
+        if self.status == L("预览缓冲中…") { self.status = L("就绪") }
+      }
     }
-    NotificationCenter.default.addObserver(
+    let ended = NotificationCenter.default.addObserver(
       forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main
     ) { [weak self] note in
-      if let self, let item = note.object as? AVPlayerItem, item === self.player.currentItem {
-        self.transport.playing = false
-        self.transport.frame = self.timelineDuration
+      guard let self, let item = note.object as? AVPlayerItem, item === self.player.currentItem,
+        item !== self.failedPreviewItem else { return }
+      guard self.exactSeek == nil, self.transport.playing,
+        (playbackFrame(self.player.currentTime()) ?? self.timelineDuration) >= self.timelineDuration - 1
+      else { return }
+      self.pause()
+      self.transport.frame = self.timelineDuration
+    }
+    let failed = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemFailedToPlayToEndTime, object: nil, queue: .main
+    ) { [weak self] note in
+      guard let item = note.object as? AVPlayerItem else { return }
+      self?.previewFailed(item, error: note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)
+    }
+    let stalled = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemPlaybackStalled, object: nil, queue: .main
+    ) { [weak self] note in
+      guard let self, let item = note.object as? AVPlayerItem, item === self.player.currentItem,
+        self.transport.playing, self.exactSeek == nil, !self.busy else { return }
+      self.status = L("预览缓冲中…")
+    }
+    playbackNotifications = [ended, failed, stalled]
+  }
+
+  deinit {
+    if let observer { player.removeTimeObserver(observer) }
+    for token in playbackNotifications { NotificationCenter.default.removeObserver(token) }
+  }
+
+  private func previewFailed(_ item: AVPlayerItem, error: Error?) {
+    guard item === player.currentItem, item !== failedPreviewItem else { return }
+    failedPreviewItem = item
+    guard !busy else { return }
+    exactSeek = nil
+    pause()
+    status = L("预览失败")
+    let failure = error ?? item.error
+    let detail = failure?.localizedDescription ?? L("系统无法解码该媒体。")
+    if PreviewRenderFailure.matches(failure) {
+      self.error = L("预览在 \(tc(transport.frame)) 中断。\n\(detail)\n请重试播放，或重新打开工程。")
+    } else {
+      self.error = L("预览在 \(tc(transport.frame)) 中断。\n\(detail)\n请检查该位置的原素材。若有可正常播放的副本，可在素材列表中重新定位文件。")
+    }
+  }
+
+  private func replacePreviewItem(with composition: Composition) {
+    let item = composition.item()
+    player.replaceCurrentItem(with: item)
+    itemObservation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
+      guard item.status == .failed else { return }
+      DispatchQueue.main.async {
+        self?.previewFailed(item, error: item.error)
       }
     }
   }
+
+  @discardableResult
+  private func retryFailedPreview() -> Bool {
+    guard !busy, let item = player.currentItem,
+      item === failedPreviewItem || item.status == .failed,
+      let previewComposition else { return false }
+    replacePreviewItem(with: previewComposition)
+    status = L("就绪")
+    return true
+  }
+
   func pause() {
     stopTransport(keepScrubImage: false)
   }
 
   private func stopTransport(keepScrubImage: Bool) {
     playWhenReady = false
-    exactScrubSeek = nil
     if keepScrubImage { scrubPreview.stopKeepingImage() } else { scrubPreview.clear() }
     if scrubSession != nil { transport.playback.setScrubbing(false) }
     scrubSession = nil
@@ -410,40 +484,31 @@ final class Editor: ObservableObject {
     pendingAudition = nil
     if player.rate != 0 || transport.playing { player.pause() }
     if transport.playing { transport.playing = false }
+    if status == L("预览缓冲中…") { status = L("就绪") }
   }
   func seek(_ f: Int) {
     cancelBackgroundColorPick()
     liveCanvas.clear()
-    let keepPreview = scrubSession != nil && scrubPreview.frame != nil
+    let keepPreview = (scrubSession != nil || exactSeek != nil) && scrubPreview.frame != nil
+    exactSeek = nil
     stopTransport(keepScrubImage: keepPreview)
     let next = bound(f, 0, timelineDuration)
     if transport.frame != next { transport.frame = next }
-    if keepPreview {
-      let id = UUID()
-      exactScrubSeek = id
-      let frame = min(next, max(0, timelineDuration - 1))
-      player.seek(to: time(frame), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60) {
-          guard let self, self.exactScrubSeek == id else { return }
-          self.exactScrubSeek = nil
-          self.scrubPreview.clear()
-        }
-      }
-    } else {
-      position()
-    }
+    retryFailedPreview()
+    position()
   }
   // Keep a single decode in flight while dragging. A release or a transport
   // command invalidates its callback and seeks the exact requested frame.
   func scrub(_ frame: Int) {
     cancelBackgroundColorPick()
-    guard player.currentItem != nil else {
+    guard !busy, player.currentItem != nil else {
       seek(frame)
       return
     }
     if scrubSession == nil {
       liveCanvas.clear()
-      let keepPreview = exactScrubSeek != nil && scrubPreview.frame != nil
+      let keepPreview = exactSeek != nil && scrubPreview.frame != nil
+      exactSeek = nil
       stopTransport(keepScrubImage: keepPreview)
       player.currentItem?.cancelPendingSeeks()
       scrubSession = UUID()
@@ -468,7 +533,7 @@ final class Editor: ObservableObject {
         scrubFrame = nil
         updateScrubPreview(request, session: session, predictsMotion: true)
       }
-      if abs(scrubVelocity) * scrubPreview.decodeDelay > 3 {
+      if abs(scrubVelocity) * scrubPreview.decodeDelay > 2 {
         // A stopped pointer gets its original target back without waiting
         // for mouse-up, even if the last decoded request used motion lead.
         let refresh = DispatchWorkItem { [weak self] in
@@ -492,7 +557,7 @@ final class Editor: ObservableObject {
         return nil
       }
       // Compensate for decode time on sustained motion, within the current slice.
-      let lead = Int(bound(self.scrubVelocity * self.scrubPreview.decodeDelay, -900, 900).rounded())
+      let lead = Int(bound(self.scrubVelocity * self.scrubPreview.decodeDelay, -3, 3).rounded())
       let predicted = bound(frame + lead, request.bounds.lowerBound, request.bounds.upperBound - 1)
       return request.moving(to: predicted)
     }) { [weak self] rejected in
@@ -543,12 +608,44 @@ final class Editor: ObservableObject {
       }
     }
   }
-  private func position() {
-    player.seek(
-      to: time(min(transport.frame, max(0, timelineDuration - 1))), toleranceBefore: .zero,
-      toleranceAfter: .zero)
+  private func position(retrying: Bool = true) {
+    guard !busy, let item = player.currentItem else { return }
+    let id = UUID()
+    exactSeek = id
+    let target = min(transport.frame, max(0, timelineDuration - 1))
+    player.seek(to: time(target), toleranceBefore: .zero, toleranceAfter: .zero) {
+      [weak self, weak item] finished in
+      DispatchQueue.main.async {
+        guard let self, let item, self.player.currentItem === item, self.exactSeek == id else { return }
+        self.exactSeek = nil
+        guard finished else {
+          if item.status == .failed {
+            self.previewFailed(item, error: item.error)
+          } else if retrying {
+            self.position(retrying: false)
+          } else {
+            self.pause()
+            self.status = L("预览定位中断，请重试")
+          }
+          return
+        }
+        if self.status == L("预览定位中断，请重试") { self.status = L("就绪") }
+        if self.playWhenReady {
+          self.playWhenReady = false
+          self.scrubPreview.clear()
+          self.player.play()
+        } else if self.scrubPreview.frame != nil {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / Double(fps)) {
+            guard self.exactSeek == nil, self.scrubSession == nil, self.player.currentItem === item,
+              min(self.transport.frame, max(0, self.timelineDuration - 1)) == target else { return }
+            self.scrubPreview.clear()
+          }
+        }
+      }
+    }
   }
   func play() {
+    captionVoiceover.audition.stop()
     cancelBackgroundColorPick()
     cancelPathDrawing()
     liveCanvas.clear()
@@ -558,15 +655,16 @@ final class Editor: ObservableObject {
       return
     }
     guard p.duration > 0 else { return }
-    if busy {
-      playWhenReady = true
-      transport.playing = true
-      return
+    if transport.frame >= p.duration { seek(0) }
+    if !busy {
+      guard player.currentItem != nil else { return }
+      if retryFailedPreview() || (exactSeek == nil &&
+                  playbackFrame(player.currentTime()) != transport.frame) {
+        position()
+      }
     }
-    guard player.currentItem != nil else { return }
-    if transport.frame >= p.duration - 1 { seek(0) }
     transport.playing = true
-    player.play()
+    if busy || exactSeek != nil { playWhenReady = true } else { player.play() }
   }
   func change(keepingCanvasFrame: Bool = false, _ body: (inout Project) -> Void) {
     var next = p
@@ -582,10 +680,9 @@ final class Editor: ObservableObject {
     redoStack.removeAll()
     install(next, keepingCanvasFrame: keepingCanvasFrame)
   }
-  private func install(_ project: Project, keepingCanvasFrame: Bool = false) {
-    cancelBackgroundColorPick()
-    cancelPathDrawing()
-    pause()
+  private func install(
+    _ project: Project, keepingCanvasFrame: Bool = false, forcePreview: Bool = false
+  ) {
     let previousProjectWasDirty = dirty
     var next = project
     let previous = p.assets == next.assets ? [:] : Dictionary(
@@ -600,12 +697,21 @@ final class Editor: ObservableObject {
         }
       }
     }
+    let refreshPreview = forcePreview || next.clips != p.clips || next.canvas != p.canvas
+      || next.background != p.background || next.captionStyle != p.captionStyle
+      || next.trackOrder != p.trackOrder || !next.hasSameTimelineMedia(as: p)
+    if refreshPreview {
+      cancelBackgroundColorPick()
+      cancelPathDrawing()
+      pause()
+    }
     p = next
     if let target = selectedTransition, next.transitionEffect(target) == nil { deselectTransition() }
     let valid = Set(next.clips.map(\.id))
     let assets = Set(next.assets.map(\.id))
     if let cropID, !valid.contains(cropID) { self.cropID = nil }
-    let selection = next.expandingGroups(selectedIDs.filter(valid.contains))
+    let surviving = selectedIDs.filter(valid.contains)
+    let selection = canvasSelection == nil ? next.expandingGroups(surviving) : surviving
     if selectedIDs != selection { selectedIDs = selection }
     if !libraryIDs.allSatisfy(assets.contains) { libraryIDs.removeAll { !assets.contains($0) } }
     if transport.frame > p.duration { transport.frame = p.duration }
@@ -616,7 +722,7 @@ final class Editor: ObservableObject {
     } else if previousProjectWasDirty {
       recovery.discard()
     }
-    rebuild(keepingCanvasFrame: keepingCanvasFrame)
+    if refreshPreview { rebuild(keepingCanvasFrame: keepingCanvasFrame) }
     if !previous.isEmpty {
       for asset in next.assets where previous[asset.id] != asset { loadWaveform(asset) }
     }
@@ -635,6 +741,7 @@ final class Editor: ObservableObject {
     scrubSources.removeAll(keepingCapacity: true)
     if !keepingCanvasFrame { liveCanvas.clear() }
     pause()
+    exactSeek = nil
     pending?.cancel()
     buildTicket?.cancel()
     let ticket = Progress(totalUnitCount: 1)
@@ -654,10 +761,11 @@ final class Editor: ObservableObject {
       return
     }
     let reuse = graphSnapshot.flatMap { previous -> MediaGraph? in
-      guard previous.duration == snap.duration && previous.assets == snap.assets else { return nil }
+      guard previous.duration == snap.duration else { return nil }
       let before = previous.clips.filter { $0.kind.isMedia }
       let after = snap.clips.filter { $0.kind.isMedia }
       return before.count == after.count && zip(before, after).allSatisfy { $0.sameSource(as: $1) }
+        && snap.hasSameTimelineMedia(as: previous)
         ? previewGraph : nil
     }
     busy = true
@@ -670,9 +778,6 @@ final class Editor: ObservableObject {
           snap, short: short, preview: true, reusing: reuse, playback: playback,
           cancelled: { ticket.isCancelled })
       }
-      if let existingItem, case .success(let composition) = result, !ticket.isCancelled {
-        existingItem.videoComposition = composition.video
-      }
       DispatchQueue.main.async {
         guard let self, self.revision == n else { return }
         self.busy = false
@@ -681,23 +786,15 @@ final class Editor: ObservableObject {
           self.graphSnapshot = snap
           self.previewGraph = composition.graph
           self.previewComposition = composition
-          if let existingItem, existingItem === self.player.currentItem {
-            self.position()
+          self.liveCanvas.clearCommittedCaption()
+          if let existingItem, existingItem === self.player.currentItem,
+            existingItem !== self.failedPreviewItem, existingItem.status != .failed
+          {
+            existingItem.videoComposition = composition.video
             self.didPrepare()
             return
           }
-          let item = composition.item()
-          self.player.replaceCurrentItem(with: item)
-          self.itemObservation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            if item.status == .failed {
-              DispatchQueue.main.async {
-                guard let self, self.revision == n else { return }
-                self.status = L("预览失败")
-                self.error = item.error?.localizedDescription ?? L("系统无法解码该媒体。")
-              }
-            }
-          }
-          self.position()
+          self.replacePreviewItem(with: composition)
           self.status = L("就绪")
           self.didPrepare()
         case .failure(let e):
@@ -726,15 +823,22 @@ final class Editor: ObservableObject {
         let request = self.fastScrubRequest(self.transport.frame) else { return }
       self.scrubPreview.warm(request.source, at: request.clip.sourceFrame(at: request.frame))
     }
-    if playWhenReady {
-      playWhenReady = false
-      player.play()
-    } else if let range = pendingAudition {
+    if let range = pendingAudition {
       previewRange(range)
+    } else {
+      position()
     }
   }
   func edit(_ id: UUID, _ body: (inout Clip) -> Void) {
     change { p in if let i = p.clips.firstIndex(where: { $0.id == id }) { body(&p.clips[i]) } }
+  }
+
+  func mergeCaptionWithNext(_ id: UUID, body: String? = nil, translation: String? = nil) {
+    guard let next = timelineLayout.nextCaption[id],
+      let start = p.clips.first(where: { $0.id == id })?.start else { return }
+    change { $0.mergeCaptions(id, next, body: body, translation: translation) }
+    selected = id
+    seek(start)
   }
 
   func previewCanvas(_ draft: Clip) {
@@ -751,6 +855,7 @@ final class Editor: ObservableObject {
     let prior = revision
     change(keepingCanvasFrame: keep) { project in
       guard let index = project.clips.firstIndex(where: { $0.id == draft.id }) else { return }
+      if draft.kind.isRegion { project.clips[index].setRegion(draft.region); return }
       project.clips[index].x = draft.x
       project.clips[index].y = draft.y
       project.clips[index].angle = draft.angle
@@ -1167,6 +1272,14 @@ final class Editor: ObservableObject {
     }
     seek(first.start)
   }
+  func editTranscript(_ selection: [Range<Int>], action: TranscriptEdit) {
+    let cuts = action.intervals(selection, duration: timelineDuration)
+    guard let first = cuts.first else { return }
+    change { project in
+      for cut in cuts.reversed() { project.deleteInterval(cut.lowerBound, cut.upperBound) }
+    }
+    seek(first.lowerBound)
+  }
   func adjustMedia(_ ids: Set<UUID>, rate: Double? = nil, pitch: Double? = nil) {
     var next = p
     do {
@@ -1286,8 +1399,10 @@ final class Editor: ObservableObject {
       previewRange(max(0, range.lowerBound - 7)..<min(p.duration, range.upperBound + 9))
     }
   }
-  private func previewRange(_ range: Range<Int>) {
+  func previewRange(_ range: Range<Int>) {
+    guard !range.isEmpty else { return }
     if busy {
+      seek(range.lowerBound)
       pendingAudition = range
       return
     }
@@ -1368,7 +1483,7 @@ final class Editor: ObservableObject {
       let thumb: CGImage?
       if m.isStill {
         dimensions = StillImages.dimensions(url)
-        thumb = StillImages.image(url, limit: 140)
+        thumb = StillImages.image(url, limit: StillImages.thumbnailLimit)
       } else {
         let asset = AVURLAsset(url: url)
         dimensions = asset.tracks(withMediaType: .video).first.map { track in
@@ -1385,6 +1500,42 @@ final class Editor: ObservableObject {
           self.mediaSizes[m.id] = dimensions
         }
         if let thumb { self.thumbnails[m.id] = NSImage(cgImage: thumb, size: .zero) }
+      }
+    }
+  }
+
+  func enhanceImage(_ media: Media, replacing clipID: UUID? = nil) {
+    guard media.isStill, p.asset(media.id)?.path == media.path else { return }
+    let generation = generation
+    openTab(.media)
+    imageEnhancement.start(media) { [weak self] result in
+      guard let self, self.generation == generation, self.p.asset(media.id)?.path == media.path else {
+        return false
+      }
+      do {
+        let output = try result.get()
+        let enhanced = output.media
+        var replaced = false
+        self.change { project in
+          project.assets.append(enhanced)
+          if let clipID, let index = project.clips.firstIndex(where: {
+            $0.id == clipID && $0.asset == media.id
+          }) {
+            project.clips[index].asset = enhanced.id
+            replaced = true
+          }
+        }
+        guard self.p.asset(enhanced.id) != nil else { return false }
+        self.mediaSizes[enhanced.id] = CGSize(width: output.width, height: output.height)
+        self.thumbnails[enhanced.id] = NSImage(cgImage: output.thumbnail, size: .zero)
+        if !replaced { self.pickAsset(enhanced.id, modifiers: []) }
+        self.status = replaced
+          ? L("已替换为高清图片（\(output.width) × \(output.height)）")
+          : L("已添加高清图片（\(output.width) × \(output.height)）")
+        return true
+      } catch {
+        self.error = error.localizedDescription
+        return false
       }
     }
   }
@@ -1519,7 +1670,8 @@ final class Editor: ObservableObject {
     let terms = (p.captionTerms ?? "").split(whereSeparator: { ",，、;；\n".contains($0) })
       .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
     let generation = generation
-    automaticCaptions.start(project: audio, offset: offset, language: language, terms: Array(terms.prefix(100))) {
+    let recognition = terms + CaptionGlossary(p.captionGlossary).recognitionTerms
+    automaticCaptions.start(project: audio, offset: offset, language: language, terms: Array(recognition.prefix(100))) {
       [weak self] result in
       guard let self, self.generation == generation else { return }
       switch result {
@@ -1537,8 +1689,13 @@ final class Editor: ObservableObject {
         if replacing {
           existing.removeAll { $0.start >= offset && $0.end <= end }
         }
+        let glossary = CaptionGlossary(self.p.captionGlossary)
         let additions = captions.filter { caption in
           !existing.contains { $0.start < caption.end && caption.start < $0.end }
+        }.map { caption in
+          var corrected = caption
+          corrected.text = glossary.correct(caption.text)
+          return corrected
         }
         let removed = Set(self.p.clips.filter {
           replacing && $0.kind == .caption && $0.start >= offset && $0.end <= end
@@ -1555,31 +1712,41 @@ final class Editor: ObservableObject {
     }
   }
 
-  func exportVoiceover(_ text: String, voice: VoiceoverProfile?) {
-    let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !content.isEmpty, captionVoiceover.stage == nil, let window = exportWindow else { return }
-    chooseExportDestination(on: window, ext: "wav", type: .wav, suggestedName: L("即转配音")) {
+  func exportVoiceover(_ format: VoiceoverFormat) {
+    guard let instant = captionVoiceover.instant, captionVoiceover.stage == nil,
+      let window = exportWindow
+    else { return }
+    let type: UTType = format == .m4a ? .mpeg4Audio : .wav
+    chooseExportDestination(on: window, ext: format.rawValue, type: type, suggestedName: L("即转配音")) {
       [weak self] destination in
       guard let self else { return }
       do {
         try ExportJob.checkDestination(destination, project: self.p)
-        self.captionVoiceover.exportText(content, voice: voice, to: destination) { [weak self] in
+        self.captionVoiceover.export(instant, format: format, to: destination) { [weak self] in
           if let self { try ExportJob.checkDestination(destination, project: self.p) }
         }
       } catch { self.error = error.localizedDescription }
     }
   }
 
+  func auditionVoiceover() {
+    guard let instant = captionVoiceover.instant else { return }
+    pause()
+    captionVoiceover.audition.toggle(instant.file.url) { [weak self] in self?.error = $0 }
+  }
+
   func generateVoiceover(from captions: [Clip], source: VoiceoverText, voice: VoiceoverProfile?) {
-    let cues = captions.map { VoiceoverCue($0, source: source) }.filter { !$0.text.isEmpty }
+    let glossary = CaptionGlossary(p.captionGlossary)
+    let cues = captions.map { VoiceoverCue($0, source: source, glossary: glossary) }.filter { !$0.text.isEmpty }
     let generation = generation
     captionVoiceover.start(cues, voice: voice) { [weak self] output in
       guard let self, self.generation == generation else {
         output.discard()
         return ""
       }
+      let currentGlossary = CaptionGlossary(self.p.captionGlossary)
       let current = Dictionary(uniqueKeysWithValues: self.p.clips.lazy
-        .filter { $0.kind == .caption }.map { ($0.id, VoiceoverCue($0, source: source)) })
+        .filter { $0.kind == .caption }.map { ($0.id, VoiceoverCue($0, source: source, glossary: currentGlossary)) })
       guard cues.allSatisfy({ current[$0.id] == $0 }) else {
         output.discard()
         return L("字幕文字或时间已更改，请重新生成配音。")
@@ -1621,7 +1788,8 @@ final class Editor: ObservableObject {
     ) { [weak self] mode, text in
       guard let self, self.generation == generation,
         SubtitleTranslationLine.snapshot(in: self.p) == lines else { return false }
-      self.change { mode.apply(text, to: &$0) }
+      let glossary = CaptionGlossary(self.p.captionGlossary)
+      self.change { mode.apply(text.mapValues(glossary.correct), to: &$0) }
       close()
       return true
     }
@@ -1747,7 +1915,8 @@ final class Editor: ObservableObject {
   }
   private func reset(_ next: Project, _ file: URL?, saved: Project? = nil, frame: Int = 0) {
     automaticCaptions.cancel()
-    captionVoiceover.cancel()
+    captionVoiceover.reset()
+    imageEnhancement.cancel()
     timelineMarquee.cancel()
     libraryMarquee.cancel()
     graphSnapshot = nil
@@ -1772,7 +1941,7 @@ final class Editor: ObservableObject {
     url = file
     baseline = saved ?? next
     transport.frame = frame
-    install(next)
+    install(next, forcePreview: true)
     next.assets.forEach { loadThumb($0) }
   }
   func offerRecovery() -> Bool {
@@ -1874,8 +2043,39 @@ final class Editor: ObservableObject {
     }
   }
 
+  func exportFrame() {
+    guard p.duration > 0, let window = exportWindow else { return }
+    pause()
+    let frame = min(transport.frame, p.duration - 1)
+    let position = tc(frame).replacingOccurrences(of: ":", with: "-")
+    let canvas = p.canvas
+    let sizes = FrameExportSize.allCases
+    let picker = NSPopUpButton(frame: .zero, pullsDown: false)
+    picker.addItems(withTitles: sizes.map { $0.label(on: canvas) })
+    let savedSize = frameExportSize ?? FrameExportSize(rawValue: exportShort) ?? .hd
+    picker.selectItem(at: sizes.firstIndex(of: savedSize) ?? 0)
+    picker.setAccessibilityLabel(L("导出分辨率"))
+    let accessory = NSStackView(views: [NSTextField(labelWithString: L("导出分辨率")), picker])
+    accessory.spacing = 12
+    accessory.edgeInsets = NSEdgeInsets(top: 10, left: 16, bottom: 10, right: 16)
+    accessory.frame.size = accessory.fittingSize
+    chooseExportDestination(
+      on: window, ext: "png", type: .png, suggestedName: exportName + " - " + position,
+      configure: { $0.accessoryView = accessory }
+    ) { [weak self] destination in
+      guard let self, sizes.indices.contains(picker.indexOfSelectedItem) else { return }
+      let size = sizes[picker.indexOfSelectedItem]
+      self.frameExportSize = size
+      self.startExport { task, project, report in
+        try task.runFrame(project, at: frame, size: size, to: destination, progress: report)
+        return [destination]
+      }
+    }
+  }
+
   private func chooseExportDestination(
     on window: NSWindow, ext: String, type: UTType, suggestedName: String? = nil,
+    configure: (NSSavePanel) -> Void = { _ in },
     perform: @escaping (URL) -> Void
   ) {
     let panel = NSSavePanel()
@@ -1883,6 +2083,7 @@ final class Editor: ObservableObject {
     panel.appearance = NSAppearance(named: .darkAqua)
     panel.prompt = L("导出")
     panel.nameFieldStringValue = (suggestedName ?? exportName) + "." + ext
+    configure(panel)
     panel.beginSheetModal(for: window) { response in
       guard response == .OK, let dest = panel.url else { return }
       perform(dest)

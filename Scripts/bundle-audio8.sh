@@ -44,10 +44,20 @@ patch -s runtime/arktts_runtime/runtime.py < "$source_dir/Scripts/audio8-prefill
 download "$github/prompt.py" runtime/arktts_runtime/prompt.py 0d80aa9cb5553083aa52f6d973108881f6e320c369ffb661bdf4b9d5baa81ba2
 download "$github/voices.py" runtime/arktts_runtime/voices.py cba523c59f354ed48013f91fa8aec9b950cc067197336e649a1381075937b921
 
-"$python" -IB -c 'import numpy, onnxruntime; from tokenizers import Tokenizer; assert "CPUExecutionProvider" in onnxruntime.get_available_providers()'
+headers="https://cdn.jsdelivr.net/gh/microsoft/onnxruntime@v1.23.1/include/onnxruntime/core/session"
+download "$headers/onnxruntime_c_api.h" onnxruntime_c_api.h 71125e66180a991d65c9bdbad4aa20daaa1f7a48c7a5c0fa5f18f250ac839a02
+download "$headers/onnxruntime_ep_c_api.h" onnxruntime_ep_c_api.h b92778f50c36ecdf53d0344e0129a78b306afed653f81bba8a9597e3e6e9546f
+xcrun clang -O3 -dynamiclib -target arm64-apple-macos14.0 -I "$work" -framework Accelerate \
+  "$source_dir/Scripts/audio8-conv.c" -o runtime/audio8_conv.dylib
+codesign --force --sign - runtime/audio8_conv.dylib
+
 # The runtime is sealed into the app. The package manager is only needed here.
 rm -rf "$site"/pip "$site"/pip-*.dist-info "$work/python/lib/python3.12/ensurepip"
 find "$work/python" -type d -name __pycache__ -prune -exec rm -rf {} +
+bash "$source_dir/Scripts/prune-inference-runtime.sh" "$work/python"
+"$python" -IB -c 'import numpy, onnx, onnxruntime; from tokenizers import Tokenizer; from PIL import Image; assert "CPUExecutionProvider" in onnxruntime.get_available_providers()'
 mkdir -p "$destination"
+# Remove the previous runtime so reusing a destination also drops pruned files.
+rm -rf "$destination/python"
 ditto "$work/python" "$destination/python"
 ditto "$work/runtime" "$destination"

@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct CaptionVoiceoverPanel: View {
   let editor: Editor
   @ObservedObject var voiceover: CaptionVoiceover
+  @ObservedObject var audition: SoundAudition
   let captions: [Clip]
   @State private var selectedOnly = false
   @State private var source = VoiceoverText.original
@@ -19,6 +20,15 @@ struct CaptionVoiceoverPanel: View {
   private static let modelLicense = URL(string: "https://huggingface.co/Edge0/audio8-TTS-0.1B-ONNX-INT8/blob/4b04c49d6fd8155257e4aa8972df203af97173ba/LICENSE")!
 
   var body: some View {
+    panel
+      .onChange(of: source) { _, newSource in
+        if newSource != .instant { audition.stop() }
+      }
+      .onReceive(editor.shelf.tabs) { if $0 != .captions { audition.stop() } }
+      .onDisappear { audition.stop() }
+  }
+
+  @ViewBuilder private var panel: some View {
     let selected = Set(editor.selectedIDs)
     let candidates = selectedOnly ? captions.filter { selected.contains($0.id) } : captions
     let count = source == .instant ? 0 : candidates.lazy.filter { !source.text(in: $0).isEmpty }.count
@@ -69,18 +79,15 @@ struct CaptionVoiceoverPanel: View {
           case .synthesizing(let done, let total):
             Text(L("正在配音 \(done)/\(total)"))
             ProgressView(value: Double(done), total: Double(total)).controlSize(.small)
+          case .exporting(let format):
+            Text(L("正在导出 \(format.rawValue.uppercased())…"))
+            ProgressView().controlSize(.small)
           }
           Button(L("停止"), action: voiceover.cancel).buttonStyle(QuietButton())
         }.font(.caption)
       } else {
         if source == .instant {
-          Button {
-            editor.exportVoiceover(voiceover.instantText, voice: voice)
-          } label: {
-            Label(L("导出 WAV…"), systemImage: "arrow.down.to.line")
-              .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
-          }.buttonStyle(PrimaryButton(tint: UI.accent))
-            .disabled(voiceover.instantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+          instantActions
         } else {
           Button {
             editor.generateVoiceover(from: candidates, source: source, voice: voice)
@@ -101,6 +108,39 @@ struct CaptionVoiceoverPanel: View {
     } else {
       Text(L("Audio8 配音需要带本地运行组件的 Apple 芯片版毛咪剪。"))
         .font(.caption).foregroundStyle(UI.muted)
+    }
+  }
+
+  @ViewBuilder private var instantActions: some View {
+    let text = voiceover.instantText.trimmingCharacters(in: .whitespacesAndNewlines)
+    let glossary = CaptionGlossary(editor.p.captionGlossary)
+    Button {
+      voiceover.generateText(voice: voice, glossary: glossary)
+    } label: {
+      Label(L("生成配音"), systemImage: "waveform")
+        .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+    }.buttonStyle(PrimaryButton(tint: UI.accent)).disabled(text.isEmpty)
+
+    if let result = voiceover.instant {
+      let playing = audition.active == result.file.url
+      HStack(spacing: 6) {
+        Button(action: editor.auditionVoiceover) {
+          Label(playing ? L("停止试听") : L("试听"), systemImage: playing ? "stop.fill" : "play.fill")
+        }.buttonStyle(QuietButton())
+        Spacer(minLength: 2)
+        Menu {
+          Button(L("M4A（较小）…")) { editor.exportVoiceover(.m4a) }
+          Button(L("WAV…")) { editor.exportVoiceover(.wav) }
+        } label: {
+          Label(L("导出"), systemImage: "arrow.down.to.line")
+        }.fixedSize()
+      }
+      Text(Duration.seconds(Double(result.frames) / Double(fps)).formatted(.time(pattern: .minuteSecond)))
+        .font(.caption.monospacedDigit()).foregroundStyle(UI.muted)
+      if glossary.read(text) != result.text || voice?.id != result.voiceID {
+        Text(L("当前试听和导出使用上一次生成的音频。"))
+          .font(.caption).foregroundStyle(UI.muted).fixedSize(horizontal: false, vertical: true)
+      }
     }
   }
 

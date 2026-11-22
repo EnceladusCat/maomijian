@@ -138,6 +138,49 @@ struct PlayerSurface: NSViewRepresentable {
     nsView.layer?.backgroundColor = ink(background)
   }
 }
+private struct CaptionCanvasPreview: View {
+  let composition: Composition
+  @ObservedObject var transport: Transport
+  @ObservedObject var liveCanvas: LiveCanvasPreview
+
+  var body: some View {
+    if !transport.playing || composition.captionOnlyPreview,
+      let preview = composition.captionPreview(at: transport.frame)
+    {
+      CaptionCanvasFrame(slice: preview.slice, frame: preview.frame, draft: liveCanvas.captionDraft)
+        .equatable()
+    }
+  }
+}
+
+struct CaptionCanvasFrame: View, Equatable {
+  let slice: Slice
+  let frame: Int
+  var draft: Clip? = nil
+
+  static func == (lhs: Self, rhs: Self) -> Bool {
+    lhs.slice === rhs.slice && lhs.frame == rhs.frame && lhs.draft == rhs.draft
+  }
+
+  var body: some View {
+    let fillsBackground = slice.compositedClips.isEmpty
+    SwiftUI.Canvas(opaque: fillsBackground, rendersAsynchronously: true) { context, size in
+      let painter = slice.painter
+      context.withCGContext { target in
+        // SwiftUI starts top-down, while the compositor painter takes a bottom-up context.
+        target.translateBy(x: 0, y: size.height)
+        target.scaleBy(x: size.width / painter.size.width, y: -size.height / painter.size.height)
+        if fillsBackground {
+          target.setFillColor(ink(painter.project.background))
+          target.fill(CGRect(origin: .zero, size: painter.size))
+        }
+        let captions = draft.map { draft in slice.captions.map { $0.id == draft.id ? draft : $0 } }
+        painter.paintCaptions(target, frame: frame, active: captions ?? slice.captions)
+      }
+    }.allowsHitTesting(false)
+  }
+}
+
 struct Preview: View {
   @ObservedObject var e: Editor
   @State private var zoom = 1.0
@@ -181,6 +224,10 @@ struct Preview: View {
         let w = shape.width * factor * displayZoom
         let h = shape.height * factor * displayZoom
         let canvasSize = CGSize(width: w, height: h)
+        let visibleCanvas = CGRect(
+          x: (w - geo.size.width) / 2 - pan.width - panGesture.width,
+          y: (h - geo.size.height) / 2 - pan.height - panGesture.height,
+          width: geo.size.width, height: geo.size.height)
         let drawing = e.pathDrawingID
         let colorPick = e.backgroundColorPick
         let regionTool = e.regionTool
@@ -190,7 +237,15 @@ struct Preview: View {
             PlayerSurface(player: e.player, background: e.p.background).allowsHitTesting(false)
             ScrubPreviewOverlay(preview: e.scrubPreview)
             LiveCanvasOverlay(preview: e.liveCanvas)
+            if let composition = e.previewComposition {
+              CaptionCanvasPreview(composition: composition, transport: e.transport, liveCanvas: e.liveCanvas)
+            }
           }.frame(width: w, height: h).background(Color(cgColor: ink(e.p.background)))
+            .overlay {
+              if !hand && !e.p.clips.isEmpty {
+                CanvasPickSurface(editor: e, visible: visibleCanvas)
+              }
+            }
             .overlay {
               let selection = e.selectedIDs.count == 1 ? e.clip : nil
               if selection != nil || drawing != nil || colorPick != nil || regionTool != nil {
@@ -220,7 +275,10 @@ struct Preview: View {
                   pan.height += value.translation.height
                 })
           }
-        }.clipped().simultaneousGesture(
+        }.frame(width: geo.size.width, height: geo.size.height)
+          .clipped()
+          .contentShape(.interaction, Rectangle())
+          .simultaneousGesture(
           TapGesture().onEnded { if !e.p.clips.isEmpty { finishWorkspaceTextEditing() } }
         ).simultaneousGesture(
           MagnificationGesture().updating($pinch) { value, state, _ in
@@ -272,7 +330,10 @@ private struct CanvasControls: View {
   let drawing: UUID?
   let colorPick: BackgroundColorPick?
   let regionTool: Kind?
-  @State private var delta = CGSize.zero
+  @State private var draft: Clip?
+  @State private var move: CanvasMove?
+  @State private var xGuide: CanvasMove.Guide?
+  @State private var yGuide: CanvasMove.Guide?
 
   var body: some View {
     let w = size.width
@@ -303,43 +364,35 @@ private struct CanvasControls: View {
         aspect: source.width / source.height, frame: t.frame, cropping: cropID == c.id
       )
       .id(c.id)
-    } else if !hand, let c = selection, !c.kind.isMedia,
+    } else if !hand, !t.playing, let c = selection, !c.kind.isMedia,
       c.start <= t.frame,
       t.frame < c.end
     {
-      let placement = c.placement(at: t.frame, canvas: CGSize(width: w, height: h))
-      let bounds = c.kind == .caption ? artworkBounds(c, size: size, style: captionStyle)
-        : CGRect(x: -w * c.w / 2, y: -h * c.h / 2, width: w * c.w, height: h * c.h)
-      let ww = bounds.width * placement.scale
-      let hh = bounds.height * placement.scale
-      let angle = c.angle * .pi / 180
-      let lift = bounds.midY * placement.scale
-      RoundedRectangle(cornerRadius: 2).strokeBorder(
-        UI.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3])
-      )
-      .background(Color.white.opacity(0.002)).frame(width: ww, height: hh).rotationEffect(
-        .degrees(c.angle)
-      )
-      .position(x: placement.center.x + delta.width + sin(angle) * lift,
-                y: placement.center.y + delta.height - cos(angle) * lift)
+      let object = CanvasObject(clip: draft?.id == c.id ? draft ?? c : c, frame: t.frame, canvas: size,
+                                mediaSize: nil, style: captionStyle)
+      Path(object.path)
+      .applying(object.transform)
+      .stroke(UI.accent, style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+      .contentShape(Path(object.path).applying(object.transform))
       .gesture(
         DragGesture(minimumDistance: 1, coordinateSpace: .named("canvas")).onChanged { v in
-          delta = v.translation
-          var draft = c
-          draft.x = bound(c.x + v.translation.width / w, 0, 1)
-          draft.y = bound(c.y + v.translation.height / h, 0, 1)
-          e.previewCanvas(draft)
+          if move == nil {
+            move = CanvasMove(item: object, canvas: size, neighbors: e.canvasObjects(at: t.frame, size: size))
+          }
+          guard let result = move?.translated(by: v.translation) else { return }
+          draft = result.clip
+          xGuide = result.x
+          yGuide = result.y
+          e.previewCanvas(result.clip)
         }.onEnded { v in
-          var draft = c
-          draft.x = bound(c.x + v.translation.width / w, 0, 1)
-          draft.y = bound(c.y + v.translation.height / h, 0, 1)
-          e.commitCanvas(draft)
-          delta = .zero
+          if let result = move?.translated(by: v.translation) { e.commitCanvas(result.clip) }
+          clearGuides()
         })
       .onDisappear {
         if e.liveCanvas.activeID == c.id { e.liveCanvas.clear() }
-        delta = .zero
+        clearGuides()
       }
+      CanvasGuides(x: xGuide, y: yGuide, canvas: size, pixelsPerPoint: e.p.canvas.size(e.preview).width / w)
     }
     if drawing == nil, colorPick == nil, !hand, !t.playing, cropID == nil, regionTool == nil,
       let clip = selection, (clip.start..<clip.end).contains(t.frame),
@@ -347,6 +400,13 @@ private struct CanvasControls: View {
     {
       MotionPathGuide(path: path, clip: clip, canvas: size)
     }
+  }
+
+  private func clearGuides() {
+    draft = nil
+    move = nil
+    xGuide = nil
+    yGuide = nil
   }
 }
 
@@ -371,6 +431,7 @@ struct Library: View {
         Spacer()
         Tool(symbol: "plus", label: L("导入素材"), act: e.importPanel)
       }.padding(.horizontal, 14).frame(height: 40)
+      ImageEnhancementProgress(enhancement: e.imageEnhancement)
       if e.p.assets.isEmpty {
         Button(action: e.importPanel) {
           HStack {
@@ -433,6 +494,9 @@ struct Library: View {
         Spacer(minLength: 0)
       }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
         .onTapGesture { e.pickAsset(m.id, modifiers: NSEvent.modifierFlags) }
+      if m.isStill {
+        Tool(symbol: "sparkles", label: L("RealPLKSR 高清化")) { e.enhanceImage(m) }
+      }
       Tool(symbol: "plus.circle", label: L("在播放头插入")) { e.append(m, at: e.transport.frame) }
     }.padding(3).background(
       e.libraryIDs.contains(m.id) ? UI.accent.opacity(0.25) : .clear,
@@ -440,8 +504,24 @@ struct Library: View {
     )
     .contextMenu {
       Button(L("在播放头插入")) { e.append(m, at: e.transport.frame) }
+      if m.isStill { Button(L("RealPLKSR 高清化")) { e.enhanceImage(m) } }
       if m.soundID == nil { Button(L("重新定位文件…")) { e.relink(m) } }
     }.help(m.path)
+  }
+}
+
+private struct ImageEnhancementProgress: View {
+  @ObservedObject var enhancement: ImageEnhancement
+
+  var body: some View {
+    if let progress = enhancement.progress {
+      HStack(spacing: 8) {
+        Text(L("正在高清化图片")).font(.caption).foregroundStyle(UI.muted).lineLimit(1)
+        ProgressView(value: progress)
+          .accessibilityLabel(L("正在高清化图片"))
+        Tool(symbol: "xmark.circle", label: L("取消高清化")) { enhancement.cancel() }
+      }.padding(.horizontal, 14).padding(.bottom, 8)
+    }
   }
 }
 private struct HeaderCommand: View {

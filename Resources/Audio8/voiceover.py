@@ -1,6 +1,9 @@
 """Run the pinned Audio8 INT8 export with either its default or a saved voice."""
 
-from contextlib import ExitStack
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing
+from itertools import islice
 import json
 import os
 import re
@@ -59,7 +62,30 @@ def instant_chunks(text, normalize):
     return chunks
 
 
-def synthesize(model, request, progress, voice_folder, fallback="zh", *, instant=False):
+def render_in_order(entries, render, workers, stop):
+    indexed = enumerate(entries)
+    if workers == 1:
+        for index, entry in indexed:
+            yield render(index, entry)
+        return
+
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        # Limit buffered audio while keeping each worker busy across long batches.
+        pending = deque(pool.submit(render, *item) for item in islice(indexed, workers * 2))
+        while pending:
+            pcm = pending.popleft().result()
+            next_entry = next(indexed, None)
+            if next_entry is not None:
+                pending.append(pool.submit(render, *next_entry))
+            yield pcm
+    finally:
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def synthesize(model, request, progress, voice_folder, fallback="zh", decoder_graph="",
+               decoder_weights="", *, instant=False):
     import numpy as np
     from arktts_runtime import ArkTtsRuntime
     from arktts_runtime.prompt import clean_text
@@ -76,24 +102,52 @@ def synthesize(model, request, progress, voice_folder, fallback="zh", *, instant
         progress.write_text(f"0/{len(entries)}", encoding="ascii")
     else:
         entries = payload
-    runtime = ArkTtsRuntime(model, voice_folder.parent if voice_folder else model,
-                            precision="int8", threads=2)
-    if voice_folder:
-        voice = voice_folder.name
-    else:
-        voice = "default"
-        runtime.voices = PackagedVoice(model, runtime.manifest, np)
+    from accelerated_decoder import DeferredDecoder, LIBRARY, prepare_decoder
 
-    reference, metadata = runtime.voices.load(voice)
-    transcript = metadata["reference_text"]
-    prefilled = prefill_voice(runtime, reference, transcript, np) if len(entries) > 1 else None
-    sample_rate = runtime.manifest["sample_rate"]
-    params = (1, 2, sample_rate, 0, "NONE", "not compressed")
+    accelerated = bool(decoder_graph and decoder_weights and LIBRARY.is_file())
+    cores = os.cpu_count() or 4
+    if accelerated and len(entries) >= 8 and cores >= 10:
+        workers, threads = 6, 1
+    elif len(entries) >= 4 and cores >= 8:
+        workers, threads = 4, 1
+    else:
+        workers = 2 if len(entries) >= 2 and cores >= 6 else 1
+        threads = 2
     with ExitStack() as files:
-        joined = files.enter_context(wave.open(payload["path"], "wb")) if instant else None
-        if joined:
-            joined.setparams(params)
-        for index, entry in enumerate(entries):
+        decoder_factory = None
+        if accelerated:
+            preparation = files.enter_context(ThreadPoolExecutor(max_workers=1))
+
+            def decoder_factory(path, _threads):
+                future = preparation.submit(prepare_decoder, path, 2 if cores >= 8 and workers <= 4 else 1,
+                                            Path(decoder_graph), Path(decoder_weights))
+                return DeferredDecoder(future)
+
+        runtime = ArkTtsRuntime(model, voice_folder.parent if voice_folder else model,
+                                precision="int8", threads=threads, decoder_factory=decoder_factory)
+        if voice_folder:
+            voice = voice_folder.name
+        else:
+            voice = "default"
+            runtime.voices = PackagedVoice(model, runtime.manifest, np)
+
+        reference, metadata = runtime.voices.load(voice)
+        transcript = metadata["reference_text"]
+        prefilled = prefill_voice(runtime, reference, transcript, np) if len(entries) > 1 else None
+        sample_rate = runtime.manifest["sample_rate"]
+        params = (1, 2, sample_rate, 0, "NONE", "not compressed")
+        stop = threading.Event()
+        decoder_pool = files.enter_context(ThreadPoolExecutor(max_workers=min(workers, 2))) if accelerated else None
+
+        def decode(index, codes):
+            if stop.is_set():
+                raise RuntimeError("Voiceover batch stopped")
+            samples = runtime.decode_codes(codes)
+            if not np.isfinite(samples).all() or not np.any(samples):
+                raise ValueError(f"Entry {index + 1} produced invalid audio")
+            return np.rint(np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+
+        def render(index, entry):
             text = entry["text"] if instant else normalize(entry["text"])
             if not text:
                 raise ValueError(f"Entry {index + 1} has no speakable text")
@@ -102,16 +156,23 @@ def synthesize(model, request, progress, voice_folder, fallback="zh", *, instant
             if limit <= 0:
                 raise ValueError(f"Entry {index + 1} exceeds the model context")
             codes = list(runtime.iter_codes(text=text, voice=voice, max_new_tokens=limit,
-                                            prompt=prompt, prefilled=prefilled))
+                                            prompt=prompt, prefilled=prefilled, stop_event=stop))
+            if stop.is_set():
+                raise RuntimeError("Voiceover batch stopped")
             if not codes or len(codes) == limit:
                 raise ValueError(f"Entry {index + 1} did not generate a complete utterance")
-            samples = runtime.decode_codes(np.stack(codes, axis=1))
-            if not np.isfinite(samples).all() or not np.any(samples):
-                raise ValueError(f"Entry {index + 1} produced invalid audio")
-            pcm = np.rint(np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+            codes = np.stack(codes, axis=1)
+            return decoder_pool.submit(decode, index, codes) if decoder_pool else decode(index, codes)
+
+        joined = files.enter_context(wave.open(payload["path"], "wb")) if instant else None
+        if joined:
+            joined.setparams(params)
+        audio = files.enter_context(closing(render_in_order(entries, render, workers, stop)))
+        for index, (entry, result) in enumerate(zip(entries, audio)):
+            pcm = result.result() if decoder_pool else result
             if joined:
                 if index > 0:
-                    joined.writeframesraw(bytes(sample_rate * 2 // 8))
+                    joined.writeframesraw(bytes((sample_rate // 8) * 2))
                 joined.writeframesraw(pcm)
             else:
                 with wave.open(entry["path"], "wb") as audio:

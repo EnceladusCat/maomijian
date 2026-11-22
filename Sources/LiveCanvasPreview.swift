@@ -6,14 +6,18 @@ struct CanvasFrame {
   let painter: FramePainter
   let clips: [Clip]
   let pictures: [UUID: Picture]
+  var captions: [Clip] = []
 
   func image(with draft: Clip) -> CGImage? {
-    guard clips.contains(where: { $0.id == draft.id }),
+    guard clips.contains(where: { $0.id == draft.id }) || captions.contains(where: { $0.id == draft.id }),
       let context = bitmap(Int(painter.size.width), Int(painter.size.height))
     else { return nil }
     painter.paint(
       context, frame: number, active: clips.map { $0.id == draft.id ? draft : $0 }
     ) { pictures[$0] }
+    if !captions.isEmpty {
+      painter.paintCaptions(context, frame: number, active: captions.map { $0.id == draft.id ? draft : $0 })
+    }
     return context.makeImage()
   }
 }
@@ -44,6 +48,7 @@ final class LiveCanvasPreview: ObservableObject {
   }
 
   @Published private(set) var image: CGImage?
+  @Published private(set) var captionDraft: Clip?
   private(set) var activeID: UUID?
   private let queue = DispatchQueue(label: "framecut.canvas.draft", qos: .userInteractive)
   private var token = UUID()
@@ -55,7 +60,12 @@ final class LiveCanvasPreview: ObservableObject {
   func update(_ draft: Clip, frame: Int, composition: Composition) {
     if activeID != draft.id {
       resetRequests()
+      if captionDraft != nil { captionDraft = nil }
       activeID = draft.id
+    }
+    if draft.kind == .caption, composition.captionPreview(at: frame) != nil {
+      captionDraft = draft
+      return
     }
     latest = Request(draft: draft, frame: frame, composition: composition)
     renderLatest()
@@ -85,6 +95,10 @@ final class LiveCanvasPreview: ObservableObject {
 
   func end(with draft: Clip, frame: Int, composition: Composition) {
     activeID = nil
+    if draft.kind == .caption, composition.captionPreview(at: frame) != nil {
+      captionDraft = draft
+      return
+    }
     finalDraft = draft
     // Keep the committed still visible while paused. A seek completing at the
     // same timestamp does not guarantee the player layer has swapped images.
@@ -96,6 +110,11 @@ final class LiveCanvasPreview: ObservableObject {
     resetRequests()
     displayedDraft = nil
     if image != nil { image = nil }
+    if captionDraft != nil { captionDraft = nil }
+  }
+
+  func clearCommittedCaption() {
+    if activeID == nil, captionDraft != nil { captionDraft = nil }
   }
 
   private func resetRequests() {

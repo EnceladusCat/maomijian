@@ -1,7 +1,10 @@
 import Foundation
 import ImageIO
+import UniformTypeIdentifiers
 
 enum StillImages {
+  static let previewLimit = 2160
+  static let thumbnailLimit = 140
   private static let cache: NSCache<NSString, CGImage> = {
     let images = NSCache<NSString, CGImage>()
     images.totalCostLimit = 96 * 1024 * 1024
@@ -37,5 +40,27 @@ enum StillImages {
     }
     cache.setObject(image, forKey: key, cost: image.bytesPerRow * image.height)
     return image
+  }
+
+  static func thumbnail(from image: CGImage) -> CGImage? {
+    let longest = max(image.width, image.height)
+    guard longest > thumbnailLimit else { return image }
+    let scale = Double(thumbnailLimit) / Double(longest)
+    let width = max(1, Int((Double(image.width) * scale).rounded()))
+    let height = max(1, Int((Double(image.height) * scale).rounded()))
+    guard let context = bitmap(width, height) else { return nil }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return context.makeImage()
+  }
+
+  static func writePNG(_ image: CGImage, to url: URL) throws {
+    guard let encoder = CGImageDestinationCreateWithURL(
+      url as CFURL, UTType.png.identifier as CFString, 1, nil
+    ) else { throw EditError.message(L("无法写入 PNG 图片。")) }
+    CGImageDestinationAddImage(encoder, image, nil)
+    guard CGImageDestinationFinalize(encoder) else {
+      throw EditError.message(L("无法写入 PNG 图片。"))
+    }
   }
 }

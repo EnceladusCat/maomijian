@@ -10,6 +10,9 @@ struct RegionControls: View {
   @ObservedObject var e: Editor
   let c: Clip?, size: CGSize
   @State private var draft: CGRect?
+  @State private var move: CanvasMove?
+  @State private var xGuide: CanvasMove.Guide?
+  @State private var yGuide: CanvasMove.Guide?
   private var shape: RegionShape { e.regionTool == nil ? c?.shape ?? .rectangle : e.drawShape }
   private var displayed: CGRect? { (draft ?? c?.region).map { shape.fit($0, in: size) } }
   var body: some View {
@@ -51,12 +54,22 @@ struct RegionControls: View {
             .position(x: r.midX, y: r.midY)
             .gesture(
               DragGesture(minimumDistance: 1, coordinateSpace: .named("canvas")).onChanged { v in
-                let old = c.shape.fit(c.region, in: size)
-                draft = CGRect(
-                  x: bound(old.minX + v.translation.width / size.width, 0, 1 - old.width),
-                  y: bound(old.minY + v.translation.height / size.height, 0, 1 - old.height),
-                  width: old.width, height: old.height)
-              }.onEnded { _ in commit(c) })
+                if move == nil {
+                  let item = CanvasObject(clip: c, frame: e.transport.frame, canvas: size, mediaSize: nil, style: nil)
+                  move = CanvasMove(item: item, canvas: size, neighbors: e.canvasObjects(at: e.transport.frame, size: size))
+                }
+                guard let result = move?.translated(by: v.translation) else { return }
+                draft = result.clip.region
+                xGuide = result.x
+                yGuide = result.y
+                e.previewCanvas(result.clip)
+              }.onEnded { v in
+                if let result = move?.translated(by: v.translation) { e.commitCanvas(result.clip) }
+                draft = nil
+                move = nil
+                xGuide = nil
+                yGuide = nil
+              })
           ForEach(0..<4, id: \.self) { corner in
             let right = corner % 2 == 1
             let bottom = corner >= 2
@@ -78,6 +91,8 @@ struct RegionControls: View {
           }
         }
       }
+      CanvasGuides(x: xGuide, y: yGuide, canvas: size,
+                   pixelsPerPoint: e.p.canvas.size(e.preview).width / size.width)
     }.frame(width: size.width, height: size.height)
       .onChange(of: e.regionTool) { _ in draft = nil }
   }

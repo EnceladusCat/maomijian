@@ -1,9 +1,39 @@
 import AVFoundation
 import AppKit
-import UniformTypeIdentifiers
 import VideoToolbox
 
+func playbackFrame(_ timestamp: CMTime) -> Int? {
+  guard timestamp.isNumeric, timestamp >= .zero, timestamp <= time(maxFrames) else { return nil }
+  return Int(CMTimeConvertScale(timestamp, timescale: Int32(fps), method: .roundTowardZero).value)
+}
+
 func time(_ f: Int) -> CMTime { CMTime(value: Int64(f), timescale: 30) }
+
+enum PreviewRenderFailure: Int, LocalizedError, CustomNSError {
+  case instruction = 1, pixelBuffer, canvas
+
+  static let errorDomain = "local.framecut.preview.render"
+  var errorCode: Int { rawValue }
+  var errorUserInfo: [String: Any] { [NSLocalizedDescriptionKey: errorDescription ?? ""] }
+  var errorDescription: String? {
+    switch self {
+    case .instruction: return L("无法读取当前画面的预览指令。")
+    case .pixelBuffer: return L("无法分配预览画面。")
+    case .canvas: return L("无法创建画布。")
+    }
+  }
+
+  static func matches(_ error: Error?) -> Bool {
+    var underlying = error as NSError?
+    for _ in 0..<6 {
+      guard let current = underlying else { return false }
+      if current.domain == errorDomain { return true }
+      underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError
+    }
+    return false
+  }
+}
+
 struct SourceMap {
   let track: CMPersistentTrackID
   let transform: CGAffineTransform
@@ -31,6 +61,11 @@ final class Slice: NSObject, AVVideoCompositionInstructionProtocol {
   let stills: [UUID: URL]
   let painter: FramePainter, clips: [Clip], sources: [UUID: SourceMap]
   let plainVideo: Clip?
+  let captions: [Clip]
+  let compositedClips: [Clip]
+  let presentsCaptionsSeparately: Bool
+  let inlineCaptions: [Clip]
+  let animatedCaptions: Bool
   init(
     _ range: CMTimeRange, _ clips: [Clip], _ sources: [UUID: SourceMap],
     _ clock: CMPersistentTrackID, _ painter: FramePainter, preview: Bool,
@@ -42,9 +77,17 @@ final class Slice: NSObject, AVVideoCompositionInstructionProtocol {
     self.stills = stills
     timeRange = range
     self.clips = clips
+    let editing = preview && playback != nil
+    captions = clips.filter { $0.kind == .caption }
+    compositedClips = editing ? clips.filter { $0.kind != .caption } : clips
+    // Audio-only and empty intervals can show subtitles without a decoded frame.
+    // A visual interval publishes its picture and subtitles in one buffer.
+    presentsCaptionsSeparately = editing && compositedClips.isEmpty
+    inlineCaptions = editing ? captions : []
+    animatedCaptions = captions.contains { $0.motion != .none || $0.entranceFrames > 0 }
     self.sources = sources
     self.painter = painter
-    if preview, let clip = clips.first(where: { $0.kind == .video }),
+    if let clip = clips.first(where: { $0.kind == .video }),
       clips.allSatisfy({ $0.kind == .caption || $0.id == clip.id }),
       let source = sources[clip.id], source.opaque, source.transform.isIdentity,
       clip.x == 0.5, clip.y == 0.5, clip.angle == 0, clip.opacity == 1, clip.displayScale == 1,
@@ -162,7 +205,7 @@ final class Compositor: NSObject, AVVideoCompositing {
     previous.pending.wait()
   }
 
-  private func copyMatchingFrame(_ source: CVPixelBuffer, to destination: CVPixelBuffer, size: CGSize)
+  static func copyMatchingFrame(_ source: CVPixelBuffer, to destination: CVPixelBuffer, size: CGSize)
     -> Bool
   {
     let width = CVPixelBufferGetWidth(source)
@@ -201,22 +244,26 @@ final class Compositor: NSObject, AVVideoCompositing {
       var verificationTime = 0.0
       defer {
         RenderStatistics.record(
-          Int((request.compositionTime.seconds * 30).rounded()),
+          playbackFrame(request.compositionTime) ?? 0,
           1000 * (CFAbsoluteTimeGetCurrent() - start - verificationTime), direct: direct)
       }
     #endif
     autoreleasepool {
-      guard let s = request.videoCompositionInstruction as? Slice,
-        let out = request.renderContext.newPixelBuffer()
-      else {
-        request.finish(with: EditError.message(L("无法分配预览画面。")))
+      guard let s = request.videoCompositionInstruction as? Slice else {
+        request.finish(with: PreviewRenderFailure.instruction)
         return
       }
-      let frame = Int((request.compositionTime.seconds * 30).rounded())
+      guard let out = request.renderContext.newPixelBuffer() else {
+        request.finish(with: PreviewRenderFailure.pixelBuffer)
+        return
+      }
+      let frame = playbackFrame(request.compositionTime) ?? 0
       let captures = s.playback?.capturesPausedFrames == true ? s.canvasFrames : nil
       var pictures = [UUID: Picture]()
       func picture(_ id: UUID, canvas: CGSize) -> Picture? {
-        if let url = s.stills[id], let im = StillImages.image(url, limit: s.preview ? 2160 : 4096) {
+        if let url = s.stills[id],
+          let im = StillImages.image(url, limit: s.preview ? StillImages.previewLimit : 4096)
+        {
           return Picture(image: im, still: true)
         }
         guard let m = s.sources[id], let original = request.sourceFrame(byTrackID: m.track) else {
@@ -256,34 +303,39 @@ final class Compositor: NSObject, AVVideoCompositing {
       var copied = false
       if let clip = s.plainVideo, let source = s.sources[clip.id],
         let input = request.sourceFrame(byTrackID: source.track),
-        copyMatchingFrame(input, to: out, size: s.painter.size)
+        Self.copyMatchingFrame(input, to: out, size: s.painter.size)
       {
         copied = true
         if captures != nil { pictures[clip.id] = picture(clip.id, canvas: s.painter.size) }
       }
-      if !copied || s.clips.count > 1 {
-        CVPixelBufferLockBaseAddress(out, [])
-        guard let g = bitmap(
+      // In export, captions are normally rendered with the scene. The direct
+      // copy skips that draw, so paint those captions on top of the copied frame.
+      let captions = copied ? s.captions : s.inlineCaptions
+      if !copied || !captions.isEmpty {
+        guard CVPixelBufferLockBaseAddress(out, []) == kCVReturnSuccess else {
+          request.finish(with: PreviewRenderFailure.canvas)
+          return
+        }
+        guard let data = CVPixelBufferGetBaseAddress(out), let g = bitmap(
           CVPixelBufferGetWidth(out), CVPixelBufferGetHeight(out),
-          data: CVPixelBufferGetBaseAddress(out), row: CVPixelBufferGetBytesPerRow(out))
+          data: data, row: CVPixelBufferGetBytesPerRow(out))
         else {
           CVPixelBufferUnlockBaseAddress(out, [])
-          request.finish(with: EditError.message(L("无法创建画布。")))
+          request.finish(with: PreviewRenderFailure.canvas)
           return
         }
         // AVFoundation may change the backing size for a render context.
         g.scaleBy(
           x: CGFloat(CVPixelBufferGetWidth(out)) / s.painter.size.width,
           y: CGFloat(CVPixelBufferGetHeight(out)) / s.painter.size.height)
-        if copied {
-          s.painter.paintCaptions(g, frame: frame, active: s.clips)
-        } else {
-          s.painter.paint(g, frame: frame, active: s.clips) { id, canvas in
+        if !copied {
+          s.painter.paint(g, frame: frame, active: s.compositedClips) { id, canvas in
             let result = picture(id, canvas: canvas)
             if let result, captures != nil { pictures[id] = result }
             return result
           }
         }
+        if !captions.isEmpty { s.painter.paintCaptions(g, frame: frame, active: captions) }
         g.flush()
         CVPixelBufferUnlockBaseAddress(out, [])
       }
@@ -291,7 +343,8 @@ final class Compositor: NSObject, AVVideoCompositing {
         direct = copied
         if copied, frame % 211 == 0, let reference = bitmap(CVPixelBufferGetWidth(out), CVPixelBufferGetHeight(out)) {
           let began = CFAbsoluteTimeGetCurrent()
-          s.painter.paint(reference, frame: frame, active: s.clips, sourceForCanvas: picture)
+          s.painter.paint(reference, frame: frame, active: s.compositedClips, sourceForCanvas: picture)
+          if !s.inlineCaptions.isEmpty { s.painter.paintCaptions(reference, frame: frame, active: s.inlineCaptions) }
           reference.flush()
           CVPixelBufferLockBaseAddress(out, .readOnly)
           let actual = CVPixelBufferGetBaseAddress(out)!
@@ -307,7 +360,8 @@ final class Compositor: NSObject, AVVideoCompositing {
       #endif
       if cancellation.isCancelled { request.finishCancelledRequest() }
       else {
-        captures?.store(CanvasFrame(number: frame, painter: s.painter, clips: s.clips, pictures: pictures))
+        captures?.store(CanvasFrame(number: frame, painter: s.painter, clips: s.compositedClips,
+                                   pictures: pictures, captions: s.inlineCaptions))
         request.finish(withComposedVideoFrame: out)
       }
     }
@@ -330,6 +384,7 @@ struct Composition {
   let graph: MediaGraph, video: AVMutableVideoComposition
   var canvasFrames: CanvasFrames? = nil
   var scrubPainter: FramePainter? = nil
+  var captionOnlyPreview = false
   var asset: AVMutableComposition { graph.asset }
   var audio: AVMutableAudioMix { graph.audio }
   func item() -> AVPlayerItem {
@@ -366,6 +421,18 @@ struct Composition {
     return slices[low]
   }
 
+  func captionPreview(at frame: Int) -> (slice: Slice, frame: Int)? {
+    // Only intervals without visual media need an independent caption surface.
+    let end = video.instructions.last?.timeRange.end.seconds ?? 0
+    let last = max(0, Int((end * Double(fps)).rounded()) - 1)
+    let target = min(frame, last)
+    guard let slice = instruction(at: target) as? Slice, slice.presentsCaptionsSeparately,
+      !slice.captions.isEmpty || slice.compositedClips.isEmpty
+    else { return nil }
+    let start = Int((slice.timeRange.start.seconds * Double(fps)).rounded())
+    return (slice, slice.animatedCaptions ? target : start)
+  }
+
   func canvasFrame(at frame: Int) -> CanvasFrame? {
     guard let canvasFrames else { return nil }
     if let recent = canvasFrames.frame(frame) { return recent }
@@ -396,9 +463,7 @@ func clockURL() throws -> URL {
   return u
 }
 func inspect(_ u: URL) throws -> Media {
-  if (try? u.resourceValues(forKeys: [.contentTypeKey]).contentType?.conforms(to: .image)) == true,
-    StillImages.dimensions(u) != nil, StillImages.image(u, limit: 160) != nil
-  {
+  if StillImages.dimensions(u) != nil, StillImages.image(u, limit: 160) != nil {
     return Media(
       path: u.standardizedFileURL.path, frames: 150, video: true, audio: false, still: true)
   }
@@ -436,18 +501,26 @@ private func insertVideo(
   }
   let lead = CMTimeMultiplyByFloat64(core.start - wanted.start, multiplier: 1 / clip.effectiveRate)
   let coreDuration = CMTimeMultiplyByFloat64(core.duration, multiplier: 1 / clip.effectiveRate)
-  if visible.lowerBound < clip.start { try hold(from: available.start, at: start, duration: lead) }
+  // Container duration can exceed the picture track by a frame or two because of
+  // audio packet padding. Extend the nearby picture through that short gap.
+  if visible.lowerBound < clip.start || lead <= time(2) {
+    try hold(from: available.start, at: start, duration: lead)
+  }
   try lane.insertTimeRange(core, of: source, at: start + lead)
   if core.duration != coreDuration {
     lane.scaleTimeRange(
       CMTimeRange(start: start + lead, duration: core.duration), toDuration: coreDuration)
   }
-  if visible.upperBound > clip.end {
+  let tail = length - lead - coreDuration
+  if visible.upperBound > clip.end || tail <= time(2) {
     try hold(
-      from: available.end, at: start + lead + coreDuration, duration: length - lead - coreDuration)
+      from: available.end, at: start + lead + coreDuration, duration: tail)
   }
 }
-func buildMediaGraph(_ p: Project, includeVideo: Bool = true, cancelled: () -> Bool) throws -> MediaGraph {
+func buildMediaGraph(
+  _ p: Project, includeVideo: Bool = true, includeAudio: Bool = true,
+  videoIDs: Set<UUID>? = nil, cancelled: () -> Bool
+) throws -> MediaGraph {
   guard p.duration > 0 else { throw EditError.message(L("时间线上还没有片段。")) }
   let a = AVMutableComposition()
   var pitchFiles = [PitchedAudio]()
@@ -472,10 +545,13 @@ func buildMediaGraph(_ p: Project, includeVideo: Bool = true, cancelled: () -> B
   var volumes = [CMPersistentTrackID: AVMutableAudioMixInputParameters]()
   for c in p.clips.sorted(by: { $0.start < $1.start }) where c.kind.isMedia {
     if cancelled() { throw EditError.message(L("预览更新已替换。")) }
+    let needsVideo = includeVideo && c.kind == .video && (videoIDs?.contains(c.id) ?? true)
+    let needsAudio = includeAudio && c.volume > 0
+    guard needsVideo || needsAudio else { continue }
     guard let media = p.asset(c.asset) else {
       throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
     }
-    if !includeVideo, c.volume == 0 || media.isStill { continue }
+    if !needsVideo, media.isStill { continue }
     guard FileManager.default.fileExists(atPath: media.path) else {
       if !includeVideo, c.kind == .video, !media.audio { continue }
       throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
@@ -494,17 +570,17 @@ func buildMediaGraph(_ p: Project, includeVideo: Bool = true, cancelled: () -> B
         options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
       assets[media.id] = (
         asset, includeVideo ? asset.tracks(withMediaType: .video).first : nil,
-        asset.tracks(withMediaType: .audio).first)
+        includeAudio ? asset.tracks(withMediaType: .audio).first : nil)
     }
     guard let source = assets[media.id] else { continue }
     var tracks: [(AVMediaType, AVAssetTrack)] = []
-    if includeVideo && c.kind == .video {
+    if needsVideo {
       guard let video = source.video else {
         throw EditError.message(L("无法读取「\(media.name)」的轨道。"))
       }
       tracks.append((.video, video))
     }
-    if c.volume > 0 {
+    if needsAudio {
       if let audio = source.audio { tracks.append((.audio, audio)) }
       else if c.kind == .audio { throw EditError.message(L("无法读取「\(media.name)」的音轨。")) }
     }
@@ -589,7 +665,13 @@ func buildComposition(
   let size = p.canvas.size(short)
   let signals = audioSignals(in: p, cancelled: cancelled)
   if cancelled() { throw EditError.message(L("预览更新已替换。")) }
-  let painter = FramePainter(p, size, preview: preview, audioSignals: signals)
+  var pictureProject = p
+  if preview && playback != nil {
+    // The picture painter can borrow artwork from transition groups.
+    // Keep the separately drawn captions out of that lookup as well.
+    pictureProject.clips.removeAll { $0.kind == .caption }
+  }
+  let painter = FramePainter(pictureProject, size, preview: preview, audioSignals: signals)
   let canvasFrames = playback == nil ? nil : CanvasFrames()
   var begins = [Int: [Int]]()
   var ends = [Int: [Int]]()
@@ -618,9 +700,11 @@ func buildComposition(
   vc.frameDuration = time(1)
   vc.renderSize = size
   let scrubPainter = playback.map { _ in
-    FramePainter(p, p.canvas.size(min(480, short)), preview: true, audioSignals: signals)
+    FramePainter(pictureProject, p.canvas.size(min(480, short)), preview: true, audioSignals: signals)
   }
-  return Composition(graph: graph, video: vc, canvasFrames: canvasFrames, scrubPainter: scrubPainter)
+  let captionOnly = !pictureProject.clips.contains { $0.kind != .audio && $0.kind != .caption }
+  return Composition(graph: graph, video: vc, canvasFrames: canvasFrames, scrubPainter: scrubPainter,
+                     captionOnlyPreview: captionOnly)
 }
 
 func audioSignals(in project: Project, cancelled: () -> Bool) -> [UUID: AudioSignalTrack] {

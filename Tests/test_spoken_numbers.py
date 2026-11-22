@@ -2,12 +2,13 @@
 
 from pathlib import Path
 import sys
+import threading
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Resources" / "Audio8"))
 
 from spoken_numbers import spoken_financial_text
-from voiceover import instant_chunks
+from voiceover import instant_chunks, render_in_order
 
 
 class SpokenNumbersTests(unittest.TestCase):
@@ -77,6 +78,35 @@ class InstantTextTests(unittest.TestCase):
         self.assertLessEqual(max(map(len, chunks)), 90)
         self.assertEqual("".join(chunks).replace(" ", ""), text)
         self.assertEqual(instant_chunks("  \n  ", self.normalize), [])
+
+
+class ParallelVoiceoverTests(unittest.TestCase):
+    def test_preserves_order_when_second_clip_finishes_first(self):
+        second_finished = threading.Event()
+        stop = threading.Event()
+
+        def render(index, entry):
+            if index == 0:
+                self.assertTrue(second_finished.wait(timeout=2))
+            elif index == 1:
+                second_finished.set()
+            return entry
+
+        entries = list(range(12))
+        self.assertEqual(list(render_in_order(entries, render, 4, stop)), entries)
+
+    def test_failure_signals_other_workers(self):
+        stop = threading.Event()
+
+        def render(index, entry):
+            if index == 0:
+                raise ValueError("first clip failed")
+            stop.wait(timeout=2)
+            return entry
+
+        with self.assertRaisesRegex(ValueError, "first clip failed"):
+            list(render_in_order(list(range(12)), render, 4, stop))
+        self.assertTrue(stop.is_set())
 
 
 if __name__ == "__main__":

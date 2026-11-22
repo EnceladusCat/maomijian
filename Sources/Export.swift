@@ -60,6 +60,16 @@ struct ExportSettings: Equatable {
   }
 }
 
+enum FrameExportSize: Int, CaseIterable {
+  case hd = 1080, qhd = 1440, ultraHD = 2160
+
+  func label(on canvas: Canvas) -> String {
+    let dimensions = canvas.size(rawValue)
+    let title = self == .ultraHD ? "4K" : "\(rawValue)p"
+    return "\(title)  ·  \(Int(dimensions.width)) × \(Int(dimensions.height))"
+  }
+}
+
 final class ExportJob {
   fileprivate static let audioSampleRate: CMTimeScale = 48_000
   private let lock = NSLock()
@@ -112,6 +122,79 @@ final class ExportJob {
     try encodeAudio(p, to: staged.url, progress: progress)
     try finish { try Self.commit(staged.url, url) }
     progress(1)
+  }
+
+  func runFrame(
+    _ p: Project, at position: Int, size: FrameExportSize, to url: URL,
+    scratch: MediaScratch = .shared, progress: (Double) -> Void
+  ) throws {
+    try check()
+    guard p.duration > 0 else { throw EditError.message(L("时间线上还没有片段。")) }
+    try Self.checkDestination(url, project: p)
+    let staged = try scratch.make(.png, beside: url.deletingLastPathComponent())
+    defer { withExtendedLifetime(staged) {} }
+
+    let frame = bound(position, 0, p.duration - 1)
+    let visible = p.videoVisibility
+    let videoIDs = Set(p.clips.filter {
+      $0.kind == .video && (visible[$0.id] ?? ($0.start..<$0.end)).contains(frame)
+    }.map(\.id))
+    let graph = try buildMediaGraph(p, includeAudio: false, videoIDs: videoIDs, cancelled: { self.cancelled })
+    let built = try buildComposition(p, short: size.rawValue, reusing: graph, cancelled: { self.cancelled })
+    let image: CGImage
+    if graph.sources.isEmpty {
+      guard let slice = built.instruction(at: frame) as? Slice,
+        let context = bitmap(Int(built.video.renderSize.width), Int(built.video.renderSize.height))
+      else { throw EditError.message(L("无法导出当前帧。")) }
+      var unreadable: URL?
+      slice.painter.paint(context, frame: frame, active: slice.compositedClips) { id in
+        guard let still = graph.stills[id] else { return nil }
+        guard let image = StillImages.image(still, limit: 4096) else {
+          unreadable = still
+          return nil
+        }
+        return Picture(image: image, still: true)
+      }
+      if let unreadable { throw EditError.message(L("无法读取图片「\(unreadable.lastPathComponent)」。")) }
+      guard let painted = context.makeImage() else {
+        throw EditError.message(L("无法导出当前帧。"))
+      }
+      image = painted
+    } else {
+      image = try readFrame(built, at: frame)
+    }
+    try check()
+    progress(0.8)
+    try StillImages.writePNG(image, to: staged.url)
+    try finish { try Self.commit(staged.url, url) }
+    progress(1)
+  }
+
+  private func readFrame(_ built: Composition, at frame: Int) throws -> CGImage {
+    let reader = try AVAssetReader(asset: built.asset)
+    let output = AVAssetReaderVideoCompositionOutput(
+      videoTracks: built.asset.tracks(withMediaType: .video),
+      videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+    output.videoComposition = built.video
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else { throw EditError.message(L("无法读取合成后的画面。")) }
+    reader.add(output)
+    reader.timeRange = CMTimeRange(start: time(frame), duration: time(1))
+    let cancelRead = { if reader.status == .reading { reader.cancelReading() } }
+    lock.withLock { stopReading = cancelRead }
+    defer {
+      lock.withLock { stopReading = nil }
+      cancelRead()
+    }
+    try check()
+    guard reader.startReading(), let sample = output.copyNextSampleBuffer(),
+      playbackFrame(CMSampleBufferGetPresentationTimeStamp(sample)) == frame,
+      let pixels = CMSampleBufferGetImageBuffer(sample)
+    else { throw reader.error ?? EditError.message(L("无法导出当前帧。")) }
+    var image: CGImage?
+    guard VTCreateCGImageFromCVPixelBuffer(pixels, options: nil, imageOut: &image) == noErr,
+      let image else { throw EditError.message(L("无法导出当前帧。")) }
+    return image
   }
 
   func runAudioAndSubtitles(

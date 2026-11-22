@@ -3,6 +3,133 @@ import AppKit
 import CoreText
 import Foundation
 
+do {
+  let editor = Editor()
+  let current = AVPlayerItem(asset: AVMutableComposition())
+  let stale = AVPlayerItem(asset: AVMutableComposition())
+  let frame = 51 * 60 * fps
+  let failure = NSError(
+    domain: AVFoundationErrorDomain, code: AVError.Code.decodeFailed.rawValue,
+    userInfo: [NSLocalizedDescriptionKey: "Test decode failure"])
+  editor.player.replaceCurrentItem(with: current)
+  editor.transport.frame = frame
+  editor.transport.playing = true
+  for item in [stale, current] {
+    NotificationCenter.default.post(
+      name: .AVPlayerItemFailedToPlayToEndTime, object: item,
+      userInfo: [AVPlayerItemFailedToPlayToEndTimeErrorKey: failure])
+    precondition(editor.transport.frame == frame)
+    precondition(editor.transport.playing == (item === stale))
+  }
+  precondition(editor.status == L("预览失败"))
+  precondition(editor.error?.contains(tc(frame)) == true)
+  precondition(editor.error?.contains(failure.localizedDescription) == true)
+  NotificationCenter.default.post(name: .AVPlayerItemDidPlayToEndTime, object: current)
+  precondition(editor.transport.frame == frame)
+  editor.error = nil
+  editor.player.replaceCurrentItem(with: stale)
+  let rendering = NSError(domain: AVFoundationErrorDomain, code: -11800,
+    userInfo: [NSUnderlyingErrorKey: PreviewRenderFailure.pixelBuffer as NSError])
+  precondition(PreviewRenderFailure.matches(rendering))
+  NotificationCenter.default.post(name: .AVPlayerItemFailedToPlayToEndTime, object: stale,
+    userInfo: [AVPlayerItemFailedToPlayToEndTimeErrorKey: rendering])
+  precondition(editor.error?.contains(L("请重试播放，或重新打开工程。")) == true)
+}
+print("Passed long preview failure handling and stale item isolation.")
+
+do {
+  let cut = 50 * 60 * fps
+  let tick = CMTime(value: 1, timescale: 600_000)
+  precondition(playbackFrame(time(cut) - tick) == cut - 1)
+  precondition(playbackFrame(time(cut)) == cut)
+  precondition(playbackFrame(time(cut) + tick) == cut)
+  precondition(playbackFrame(.invalid) == nil)
+
+  var first = Clip(kind: .caption, start: 30, length: 12)
+  first.text = "嗯"
+  first.captionTranslation = "Um"
+  var second = Clip(kind: .caption, start: 48, length: 28)
+  second.text = "嗯"
+  var long = Clip(kind: .caption, start: 120, length: 60)
+  long.text = "，" + String(repeating: "测试", count: 16)
+  let rows = TranscriptRow.rows([long, second, first])
+  precondition(rows.map(\.span) == [30..<42, 48..<76, 76..<120, 120..<180])
+  precondition(rows[0].issues.contains(.fast) && rows[0].issues.contains(.filler))
+  precondition(rows[1].issues.contains(.missingTranslation) && rows[1].issues.contains(.repeatLine))
+  precondition(rows[2].caption == nil && rows[2].issues.isEmpty)
+  precondition(rows[3].issues.contains(.long) && rows[3].issues.contains(.breakPoint))
+  precondition(TranscriptEdit.cut.intervals([40..<90, 30..<60], duration: 180) == [30..<90])
+  let removal = TranscriptEdit.keep.intervals([30..<60, 120..<180], duration: 210)
+  precondition(removal == [0..<30, 60..<120, 180..<210])
+
+  let media = Media(path: "/fixture.mp4", frames: 210, video: true, audio: true)
+  var project = Project()
+  project.assets = [media]
+  let image = Clip(kind: .video, asset: media.id, start: 0, length: 210)
+  let sound = Clip(kind: .audio, asset: media.id, start: 0, length: 210)
+  project.clips = [image, sound, first, second, long]
+  for span in removal.reversed() { project.deleteInterval(span.lowerBound, span.upperBound) }
+  let checked = try project.checked()
+  precondition(checked == project)
+  let tracks = project.clips.filter { $0.kind.isMedia }
+  precondition(tracks.map(\.start) == [0, 30, 0, 30])
+  precondition(tracks.map(\.offset) == [30, 120, 30, 120])
+  precondition(tracks.map(\.length) == [30, 60, 30, 60])
+  let glossary = CaptionGlossary("Envidia → NVIDIA\nNVDA = 英伟达\n20% = 百分之二十")
+  let example = "envidia 上涨20%，NVDA 和 NVDAX"
+  precondition(glossary.correct(example) == "NVIDIA 上涨20%，NVDA 和 NVDAX")
+  precondition(glossary.read(example) == "NVIDIA 上涨百分之二十，英伟达 和 NVDAX")
+  print("Passed precise cut timestamps, transcript cues and gaps, multi-track edits and pronunciation rules.")
+}
+
+do {
+  var first = Clip(kind: .caption, start: 0, length: 14)
+  first.text = "第一句。"
+  first.captionTranslation = "First."
+  var exact = Clip(kind: .caption, start: 18, length: 15)
+  exact.text = "第二句。"
+  exact.captionTranslation = "Second."
+  var longText = Clip(kind: .caption, start: 35, length: 16)
+  longText.text = String(repeating: "测试", count: 16)
+  let audited = TranscriptRow.rows([first, exact, longText])
+  precondition(audited.map { $0.issues.contains(.fast) } == [true, false, false])
+  precondition(audited[2].issues.contains(.long))
+  var overlay = Clip(kind: .caption, start: 5, length: 45)
+  overlay.text = "不同轨道"
+  var subtitles = Project()
+  subtitles.clips = [exact, first, overlay, longText]
+  let layout = TimelineLayout(subtitles)
+  precondition(layout.nextCaption[first.id] == exact.id)
+  precondition(layout.nextCaption[exact.id] == longText.id)
+  precondition(layout.nextCaption[overlay.id] == nil)
+  subtitles.mergeCaptions(first.id, exact.id)
+  guard let merged = subtitles.clips.first(where: { $0.id == first.id }) else { fatalError("Missing merged caption") }
+  precondition(merged.start == first.start && merged.end == exact.end)
+  precondition(merged.text == "第一句。第二句。" && merged.captionTranslation == "First. Second.")
+  precondition(subtitles.clips == [merged, overlay, longText])
+  print("Passed the half-second threshold, same-lane caption merging, bilingual text and preserved timeline ranges.")
+}
+
+do {
+  let canvas = CGSize(width: 400, height: 300)
+  var clip = Clip(kind: .video, start: 0, length: 15)
+  clip.angle = 90
+  clip.visualScale = 0.5
+  clip.sourceCrop = SourceCrop(left: 0.5)
+  let object = CanvasObject(clip: clip, frame: 0, canvas: canvas, mediaSize: canvas, style: nil)
+  precondition(object.contains(CGPoint(x: 200, y: 195)))
+  precondition(!object.contains(CGPoint(x: 200, y: 125)))
+  precondition(abs(object.bounds.midY - 200) < 0.001)
+
+  var overlay = Clip(kind: .rectangle, start: 0, length: 15)
+  overlay.w = 0.2
+  overlay.x = 0.28
+  let art = CanvasObject(clip: overlay, frame: 0, canvas: canvas, mediaSize: nil, style: nil)
+  let adjustment = CanvasMove(item: art, canvas: canvas, neighbors: []).translated(by: CGSize(width: 85, height: 0))
+  precondition(adjustment.x?.coordinate == 200 && abs(adjustment.clip.x - 0.5) < 0.0001)
+  print("Passed rotated and cropped canvas hit regions and drag alignment.")
+}
+
 let recognitionProgress = CaptionProgress(startedAt: 10)
 recognitionProgress.update(.nan, at: 11)
 recognitionProgress.update(0.01, at: 11)
@@ -406,6 +533,47 @@ precondition(subtitlePixels(cue, style) != solid)
 print(
   "Passed global caption styling, border rendering, project persistence, legacy entrance and sustained animation checks."
 )
+
+do {
+  var caption = Clip.annotation(.caption, at: 358)
+  caption.length = 74
+  caption.text = "这就是 too young too simple"
+  var moving = Clip.annotation(.caption, at: 35_900)
+  moving.motion = .shake
+  let video = Clip(kind: .video, start: 35_900, length: 120)
+  let composition = AVMutableVideoComposition()
+  let graph = MediaGraph(asset: AVMutableComposition(), audio: AVMutableAudioMix(),
+    sources: [:], clock: 1, pitchFiles: [], stills: [:])
+  let painter = FramePainter(Project(), size, preview: true)
+  let playback = PreviewPlayback()
+  func slice(_ start: Int, _ end: Int, _ clips: [Clip], preview: Bool = true) -> Slice {
+    Slice(CMTimeRange(start: time(start), duration: time(end - start)), clips, [:], graph.clock,
+      painter, preview: preview, playback: playback, canvasFrames: nil, stills: [:])
+  }
+  let text = slice(358, 432, [caption])
+  let overVideo = slice(35_900, 35_990, [video, moving])
+  composition.instructions = [slice(0, 358, []), text, slice(432, 35_900, []),
+                              overVideo, slice(35_990, 36_020, [video])]
+  let preview = Composition(graph: graph, video: composition)
+  precondition(preview.captionPreview(at: 405)?.slice === text)
+  precondition(preview.captionPreview(at: 405)?.frame == 358)
+  precondition(preview.captionPreview(at: 432)?.slice.captions.isEmpty == true)
+  precondition(preview.captionPreview(at: 35_950) == nil)
+  precondition(overVideo.compositedClips == [video] && overVideo.inlineCaptions == [moving])
+  precondition(preview.captionPreview(at: 35_990) == nil)
+  precondition(slice(35_900, 35_990, [video, moving], preview: false).compositedClips == [video, moving])
+
+  let live = LiveCanvasPreview()
+  var draft = caption
+  draft.y = 0.5
+  live.update(draft, frame: 405, composition: preview)
+  precondition(live.captionDraft == draft)
+  live.end(with: draft, frame: 405, composition: preview)
+  precondition(live.captionDraft == draft)
+  live.clearCommittedCaption()
+  precondition(live.captionDraft == nil)
+  print("Passed shared caption/video frames, independent audio-only captions, and export routing.")
+}
 
 var edit = Project()
 let firstVideo = Clip(kind: .video, start: 0, length: 60)
@@ -1382,9 +1550,9 @@ var filteredImage = video
 fadingFilter.amount = 1
 filteredImage.filters = [fadingFilter]
 let photoPainter = FramePainter(Project(), size)
-func photoPixels(_ frame: Int) -> [UInt8] {
+func photoPixels(_ frame: Int, painter: FramePainter = photoPainter) -> [UInt8] {
   let g = bitmap(240, 160)!
-  photoPainter.paint(g, frame: frame, active: [filteredImage]) { _ in Picture(image: grid, still: true) }
+  painter.paint(g, frame: frame, active: [filteredImage]) { _ in Picture(image: grid, still: true) }
   return Array(UnsafeBufferPointer(
     start: g.data!.assumingMemoryBound(to: UInt8.self), count: 240 * 160 * 4))
 }
@@ -1398,9 +1566,55 @@ precondition(abs(Int(sharpGrid[edgePixel]) - Int(softEdge[edgePixel])) > 30)
 precondition(sharpGrid != halfBlur && softEdge != halfBlur)
 precondition(photoPixels(filteredImage.end - 1) == sharpGrid)
 precondition(photoPixels(20) == softEdge)
+precondition(photoPixels(20, painter: FramePainter(Project(), size, preview: true)) == softEdge)
+
+// A balanced black and white texture should settle near mid-grey, without bright edges.
+let edgeAverage = (0..<16).reduce(0) { sum, y in
+  sum + (0..<16).reduce(0) { $0 + Int(softEdge[(y * 240 + $1) * 4]) }
+} / 256
+precondition((118...137).contains(edgeAverage), "Unexpected edge brightness: \(edgeAverage)")
+
+let defocusFixture = bitmap(480, 320)!
+func defocusPixels(_ image: CGImage, amount: Double) -> [UInt8] {
+  let target = bitmap(image.width, image.height)!
+  target.draw(FootageLook.image(image, look: .edgeBlur, amount: amount),
+              in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+  return Array(UnsafeBufferPointer(
+    start: target.data!.assumingMemoryBound(to: UInt8.self), count: target.bytesPerRow * target.height))
+}
+defocusFixture.setFillColor(ink("#000000"))
+defocusFixture.fill(CGRect(x: 0, y: 0, width: 480, height: 320))
+defocusFixture.setFillColor(ink("#FFFFFF"))
+defocusFixture.fill(CGRect(x: 426, y: 26, width: 12, height: 30))
+let stripe = defocusFixture.makeImage()!
+func stripeCenter(_ pixels: [UInt8]) -> Double {
+  var total = 0
+  var moment = 0
+  for y in 0..<320 {
+    for x in 0..<480 {
+      let level = Int(pixels[(y * 480 + x) * 4])
+      total += level
+      moment += x * level
+    }
+  }
+  return Double(moment) / Double(total)
+}
+let unfilteredCenter = stripeCenter(defocusPixels(stripe, amount: 0))
+let softCenter = stripeCenter(defocusPixels(stripe, amount: 1))
+precondition((4...12).contains(softCenter - unfilteredCenter), "Unexpected outward stretch: \(softCenter - unfilteredCenter)")
+precondition((unfilteredCenter..<softCenter).contains(stripeCenter(defocusPixels(stripe, amount: 0.5))))
+
+defocusFixture.clear(CGRect(x: 0, y: 0, width: 480, height: 320))
+defocusFixture.setFillColor(ink("#888888", 0.5))
+defocusFixture.fill(CGRect(x: 32, y: 30, width: 416, height: 260))
+let transparentDefocus = defocusFixture.makeImage()!
+let originalMatte = defocusPixels(transparentDefocus, amount: 0)
+let filteredMatte = defocusPixels(transparentDefocus, amount: 1)
+precondition(zip(originalMatte, filteredMatte).allSatisfy { abs(Int($0) - Int($1)) <= 2 })
+
 let storedFilter = try JSONDecoder().decode(Clip.self, from: JSONEncoder().encode(filteredImage))
 precondition(storedFilter.filters == [fadingFilter])
-print("Passed per-filter easing, defocus center and edge pixels, and still-image cache behavior.")
+print("Passed edge defocus brightness, stretch, alpha, preview parity, filter fades and still-image caching.")
 
 func shapePixels(_ clip: Clip) -> (width: Int, height: Int, bytes: [UInt8]) {
   let image = artwork(clip, size: CGSize(width: 768, height: 432))!

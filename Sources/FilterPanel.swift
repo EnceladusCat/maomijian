@@ -185,14 +185,16 @@ private struct FilterSwatch: View {
       case .edgeBlur:
         let center = CGPoint(x: rect.midX, y: rect.midY)
         context.drawLayer { layer in
-          layer.addFilter(.blur(radius: 2.5))
-          for x in [rect.minX + 6, rect.maxX - 6] {
-            layer.fill(Path(ellipseIn: CGRect(x: x - 7, y: center.y - 10, width: 14, height: 20)),
-                       with: .color(UI.accent.opacity(0.82)))
+          layer.addFilter(.blur(radius: 1.9))
+          for x in [rect.minX - 2, rect.maxX - 11] {
+            for y in [-7.0, 0, 7] {
+              let stripe = CGRect(x: x, y: center.y + y - 1, width: 13, height: 2)
+              layer.fill(Path(stripe), with: .color(UI.muted))
+            }
           }
         }
         let focus = CGRect(x: center.x - 7, y: center.y - 8, width: 14, height: 16)
-        context.stroke(Path(roundedRect: focus, cornerRadius: 3), with: .color(UI.accent), lineWidth: 2)
+        context.stroke(Path(roundedRect: focus, cornerRadius: 3), with: .color(UI.muted), lineWidth: 1)
       case .backgroundKey:
         for row in 0..<5 {
           for column in 0..<7 where (row + column).isMultiple(of: 2) {

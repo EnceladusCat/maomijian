@@ -86,7 +86,8 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
   }
   func applicationWillTerminate(_ notification: Notification) {
     e.automaticCaptions.cancel()
-    e.captionVoiceover.cancel()
+    e.captionVoiceover.reset()
+    e.imageEnhancement.cancel()
     MediaScratch.shared.close()
   }
   func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -146,6 +147,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
     add(file, L("导入 SRT…"), #selector(subIn), target: self)
     file.addItem(.separator())
     add(file, L("导出 MP4…"), #selector(render), "e", target: self)
+    add(file, L("导出当前帧（PNG）…"), #selector(frameOut), target: self)
     add(file, L("仅导出音频（M4A）…"), #selector(audioOut), target: self)
     add(file, L("仅导出字幕（SRT）…"), #selector(subOut), target: self)
     add(file, L("导出音频和字幕…"), #selector(audioAndSubtitleOut), target: self)
@@ -204,6 +206,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
   @objc func audioOut() { e.audioExport() }
   @objc func audioAndSubtitleOut() { e.audioAndSubtitleExport() }
   @objc func render() { e.export() }
+  @objc func frameOut() { e.exportFrame() }
   @objc func changeLanguage(_ item: NSMenuItem) {
     guard let value = item.representedObject as? String, let choice = AppLanguage(rawValue: value),
       choice != AppLanguage.current, window.attachedSheet == nil else { return }
@@ -245,7 +248,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     switch item.action {
     case #selector(togglePlayback): return window.isKeyWindow && window.attachedSheet == nil && e.p.duration > 0
-    case #selector(render): return e.progress == nil && e.p.duration > 0
+    case #selector(render), #selector(frameOut): return e.progress == nil && e.p.duration > 0
     case #selector(audioOut): return e.progress == nil && e.canExportAudio
     case #selector(subOut): return e.progress == nil && e.canExportSubtitles
     case #selector(audioAndSubtitleOut): return e.progress == nil && e.canExportAudio && e.canExportSubtitles

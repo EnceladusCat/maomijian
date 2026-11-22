@@ -144,7 +144,9 @@ struct CaptionPanel: View {
           switch page {
           case .generate: generator
           case .review: review
-          case .voiceover: CaptionVoiceoverPanel(editor: e, voiceover: e.captionVoiceover, captions: captions)
+          case .voiceover:
+            CaptionVoiceoverPanel(editor: e, voiceover: e.captionVoiceover,
+                                 audition: e.captionVoiceover.audition, captions: captions)
           case .style: styling
           }
         }.padding(12).frame(maxWidth: .infinity, alignment: .leading)
@@ -242,25 +244,7 @@ struct CaptionPanel: View {
           .frame(maxWidth: .infinity, minHeight: 26, alignment: .leading)
       }.buttonStyle(QuietButton())
         .disabled(!captions.contains { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
-      LazyVStack(alignment: .leading, spacing: 0) {
-        ForEach(captions) { caption in
-          Button {
-            e.selected = caption.id
-            e.seek(caption.start)
-          } label: {
-            VStack(alignment: .leading, spacing: 3) {
-              Text(tc(caption.start)).font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(UI.color(.caption))
-              Text(caption.captionText).font(.system(size: 12)).lineLimit(3)
-                .foregroundStyle(.white)
-            }.padding(.vertical, 7).padding(.horizontal, 7)
-              .frame(maxWidth: .infinity, alignment: .leading)
-              .background(e.selected == caption.id ? UI.well : .clear, in: RoundedRectangle(cornerRadius: 4))
-              .contentShape(Rectangle())
-          }.buttonStyle(.plain)
-          Divider().opacity(0.55)
-        }
-      }
+      CaptionWorkflowPanel(editor: e, captions: captions)
     }
   }
 
