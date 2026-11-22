@@ -190,10 +190,18 @@ struct Preview: View {
             PlayerSurface(player: e.player, background: e.p.background).allowsHitTesting(false)
             ScrubPreviewOverlay(preview: e.scrubPreview)
             LiveCanvasOverlay(preview: e.liveCanvas)
-            if e.selectedIDs.count == 1 || drawing != nil || colorPick != nil || regionTool != nil {
-              CanvasControls(e: e, t: e.transport, size: canvasSize, hand: hand)
-            }
           }.frame(width: w, height: h).background(Color(cgColor: ink(e.p.background)))
+            .overlay {
+              let selection = e.selectedIDs.count == 1 ? e.clip : nil
+              if selection != nil || drawing != nil || colorPick != nil || regionTool != nil {
+                CanvasControls(
+                  e: e, t: e.transport, size: canvasSize, hand: hand,
+                  selection: selection, mediaSize: selection?.asset.flatMap { e.mediaSizes[$0] },
+                  cropID: e.cropID, captionStyle: e.p.captionStyle,
+                  drawing: drawing, colorPick: colorPick, regionTool: regionTool
+                ).frame(width: w, height: h)
+              }
+            }
             .coordinateSpace(name: "canvas")
             .position(
               x: geo.size.width / 2 + pan.width + panGesture.width,
@@ -255,17 +263,21 @@ private struct CanvasControls: View {
   @ObservedObject var t: Transport
   let size: CGSize
   let hand: Bool
+  // Project edits can leave the playhead unchanged. Pass their values so
+  // SwiftUI refreshes the handles even when Transport has nothing to publish.
+  let selection: Clip?
+  let mediaSize: CGSize?
+  let cropID: UUID?
+  let captionStyle: CaptionStyle?
+  let drawing: UUID?
+  let colorPick: BackgroundColorPick?
+  let regionTool: Kind?
   @State private var delta = CGSize.zero
 
   var body: some View {
     let w = size.width
     let h = size.height
-    let drawing = e.pathDrawingID
-    let colorPick = e.backgroundColorPick
-    let regionTool = e.regionTool
-    let canvasSize = size
-    let single = e.selectedIDs.count == 1 ? e.clip : nil
-    let selectedRegion = single.flatMap { c in
+    let selectedRegion = selection.flatMap { c in
       c.kind.isRegion && c.start <= t.frame && t.frame < c.end ? c : nil
     }
     if let colorPick {
@@ -281,22 +293,22 @@ private struct CanvasControls: View {
         .frame(width: w, height: h).id(id)
         .accessibilityLabel(L("绘制运动路径"))
     } else if regionTool != nil || (!hand && selectedRegion != nil) {
-      RegionControls(e: e, c: selectedRegion, size: canvasSize)
-    } else if !hand, !t.playing, let c = single, c.kind == .video,
-      let id = c.asset, let source = e.mediaSizes[id],
+      RegionControls(e: e, c: selectedRegion, size: size)
+    } else if !hand, !t.playing, let c = selection, c.kind == .video,
+      let source = mediaSize,
       c.start <= t.frame, t.frame < c.end
     {
       MediaHandles(
         editor: e, clip: c, canvas: CGSize(width: w, height: h),
-        aspect: source.width / source.height, frame: t.frame, cropping: e.cropID == c.id
+        aspect: source.width / source.height, frame: t.frame, cropping: cropID == c.id
       )
       .id(c.id)
-    } else if !hand, let c = single, !c.kind.isMedia,
+    } else if !hand, let c = selection, !c.kind.isMedia,
       c.start <= t.frame,
       t.frame < c.end
     {
       let placement = c.placement(at: t.frame, canvas: CGSize(width: w, height: h))
-      let bounds = c.kind == .caption ? artworkBounds(c, size: canvasSize, style: e.p.captionStyle)
+      let bounds = c.kind == .caption ? artworkBounds(c, size: size, style: captionStyle)
         : CGRect(x: -w * c.w / 2, y: -h * c.h / 2, width: w * c.w, height: h * c.h)
       let ww = bounds.width * placement.scale
       let hh = bounds.height * placement.scale
@@ -329,11 +341,11 @@ private struct CanvasControls: View {
         delta = .zero
       }
     }
-    if drawing == nil, colorPick == nil, !hand, !t.playing, e.cropID == nil, e.regionTool == nil,
-      let clip = single, (clip.start..<clip.end).contains(t.frame),
+    if drawing == nil, colorPick == nil, !hand, !t.playing, cropID == nil, regionTool == nil,
+      let clip = selection, (clip.start..<clip.end).contains(t.frame),
       let path = clip.motionPath
     {
-      MotionPathGuide(path: path, clip: clip, canvas: canvasSize)
+      MotionPathGuide(path: path, clip: clip, canvas: size)
     }
   }
 }

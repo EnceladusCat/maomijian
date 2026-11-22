@@ -502,6 +502,29 @@ precondition(roundTrip == sample)
 let geometry = VisualGeometry(clip: footage, canvas: size, aspect: 1.5)
 precondition(
   geometry.full.width == 120 && geometry.visible.width == 60 && geometry.visible.height == 80)
+var resizeClip = footage
+resizeClip.visualScale = 1
+resizeClip.angle = 33
+resizeClip.sourceCrop = SourceCrop(left: 0.15, top: 0.07, right: 0.25, bottom: 0.12)
+func handleCenters(_ clip: Clip) -> [CGPoint] {
+  let geometry = VisualGeometry(clip: clip, canvas: size, aspect: 1.5)
+  let pivot = clip.placement(at: 0, canvas: size, geometry: geometry).center
+  return VisualGeometry.corners(geometry.visible).map {
+    $0.applying(CGAffineTransform(rotationAngle: clip.angle * .pi / 180))
+      .applying(CGAffineTransform(translationX: pivot.x, y: pivot.y))
+  }
+}
+let originalHandles = handleCenters(resizeClip)
+for index in originalHandles.indices {
+  let fixed = originalHandles[3 - index]
+  let active = originalHandles[index]
+  let drag = CGSize(width: (fixed.x - active.x) / 2, height: (fixed.y - active.y) / 2)
+  let resized = resizeClip.resizedFromCorner(index, by: drag, canvas: size, aspect: 1.5, frame: 0)
+  let handles = handleCenters(resized)
+  precondition(abs(resized.displayScale - 0.5) < 1e-9)
+  precondition(hypot(handles[3 - index].x - fixed.x, handles[3 - index].y - fixed.y) < 1e-8)
+  precondition(hypot(handles[index].x - active.x - drag.width, handles[index].y - active.y - drag.height) < 1e-8)
+}
 func paintFixture(_ clips: [Clip], at frame: Int) -> [UInt8] {
   let context = bitmap(240, 160)!
   FramePainter(sample, size).paint(context, frame: frame, active: clips) { _ in

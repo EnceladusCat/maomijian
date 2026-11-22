@@ -39,9 +39,41 @@ extension Clip {
                       y: pivot.y + (position.y - pivot.y) * scale + offset.y),
       scale: scale, anchorsToCanvas: minimum != nil)
   }
+
+  func resizedFromCorner(
+    _ index: Int, by translation: CGSize, canvas: CGSize, aspect: Double, frame: Int
+  ) -> Clip {
+    let geometry = VisualGeometry(clip: self, canvas: canvas, aspect: aspect)
+    let scaleAtFrame = placement(at: frame, canvas: canvas, geometry: geometry).scale
+    let corners = VisualGeometry.corners(geometry.visible)
+    let point = corners[index]
+    let fixed = corners[3 - index]
+    let rotation = angle * .pi / 180
+    let move = CGPoint(x: translation.width, y: translation.height)
+      .applying(CGAffineTransform(rotationAngle: -rotation))
+    let dx = point.x - fixed.x
+    let dy = point.y - fixed.y
+    let projection = 1 + (move.x * dx + move.y * dy) / (max(1, dx * dx + dy * dy) * scaleAtFrame)
+    let scale = bound(displayScale * projection, 0.05, 8)
+    let ratio = scale / displayScale
+    let shift = CGPoint(x: fixed.x * (1 - ratio), y: fixed.y * (1 - ratio))
+      .applying(CGAffineTransform(rotationAngle: rotation))
+    var updated = self
+    updated.visualScale = scale
+    updated.x = bound(x + shift.x / canvas.width, -4, 5)
+    updated.y = bound(y + shift.y / canvas.height, -4, 5)
+    return updated
+  }
 }
 
 extension VisualGeometry {
+  static func corners(_ r: CGRect) -> [CGPoint] {
+    [
+      CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
+      CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY),
+    ]
+  }
+
   // Project all four canvas corners onto the rotated source axes. Scale around
   // the canvas center so an off-center crop can still cover the same corners.
   fileprivate func minimumCoverScale(

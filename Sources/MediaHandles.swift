@@ -23,7 +23,7 @@ struct MediaHandles: View {
     ZStack(alignment: .topLeading) {
       if cropping {
         Path { path in
-          let vertices = corners(geometry.full)
+          let vertices = VisualGeometry.corners(geometry.full)
           path.addLines([0, 1, 3, 2].map { placed(vertices[$0], pivot: pivot, angle: degrees, scale: scale) })
           path.closeSubpath()
         }.stroke(.white.opacity(0.38), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
@@ -48,7 +48,7 @@ struct MediaHandles: View {
               update(updated)
             }.onEnded { _ in commit() })
       ForEach(0..<(cropping ? 8 : 4), id: \.self) { index in
-        let point = index < 4 ? corners(box)[index] : edgePoints(box)[index - 4]
+        let point = index < 4 ? VisualGeometry.corners(box)[index] : edgePoints(box)[index - 4]
         Rectangle().fill(cropping ? .white : UI.accent)
           .overlay(Rectangle().strokeBorder(UI.deep, lineWidth: 1))
           .frame(width: 9, height: 9)
@@ -57,12 +57,11 @@ struct MediaHandles: View {
           .gesture(
             DragGesture(minimumDistance: 1, coordinateSpace: coordinate)
               .onChanged { value in
-                if cropping {
-                  resizeCrop(index: index, translation: value.translation)
-                } else {
-                  resizeMedia(index: index, translation: value.translation)
-                }
-              }.onEnded { _ in commit() }
+                update(resized(index: index, translation: value.translation))
+              }.onEnded { value in
+                editor.commitCanvas(resized(index: index, translation: value.translation))
+                draft = nil
+              }
           )
           .accessibilityLabel(cropping ? L("裁剪手柄") : L("素材缩放手柄"))
       }
@@ -90,12 +89,6 @@ struct MediaHandles: View {
       .onDisappear(perform: clearDraft)
   }
 
-  private func corners(_ r: CGRect) -> [CGPoint] {
-    [
-      CGPoint(x: r.minX, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
-      CGPoint(x: r.minX, y: r.maxY), CGPoint(x: r.maxX, y: r.maxY),
-    ]
-  }
   private func edgePoints(_ r: CGRect) -> [CGPoint] {
     [
       CGPoint(x: r.minX, y: r.midY), CGPoint(x: r.maxX, y: r.midY),
@@ -109,28 +102,11 @@ struct MediaHandles: View {
     let local = rotate(p, degrees: angle)
     return CGPoint(x: pivot.x + local.x * scale, y: pivot.y + local.y * scale)
   }
-  private func resizeMedia(index: Int, translation: CGSize) {
-    let geometry = VisualGeometry(clip: clip, canvas: canvas, aspect: aspect)
-    let scaleAtFrame = clip.placement(at: frame, canvas: canvas, geometry: geometry).scale
-    let corners = corners(geometry.visible)
-    let point = corners[index]
-    let fixed = corners[3 - index]
-    let move = rotate(CGPoint(x: translation.width, y: translation.height), degrees: -clip.angle)
-    let x = point.x - fixed.x
-    let y = point.y - fixed.y
-    let projection = 1 + (move.x * x + move.y * y) / (max(1, x * x + y * y) * scaleAtFrame)
-    let scale = bound(clip.displayScale * projection, 0.05, 8)
-    let ratio = scale / clip.displayScale
-    let shift = rotate(
-      CGPoint(x: fixed.x * (1 - ratio), y: fixed.y * (1 - ratio)),
-      degrees: clip.angle)
-    var updated = clip
-    updated.visualScale = scale
-    updated.x = bound(clip.x + shift.x / canvas.width, -4, 5)
-    updated.y = bound(clip.y + shift.y / canvas.height, -4, 5)
-    update(updated)
+  private func resized(index: Int, translation: CGSize) -> Clip {
+    if cropping { return resizedCrop(index: index, translation: translation) }
+    return clip.resizedFromCorner(index, by: translation, canvas: canvas, aspect: aspect, frame: frame)
   }
-  private func resizeCrop(index: Int, translation: CGSize) {
+  private func resizedCrop(index: Int, translation: CGSize) -> Clip {
     let geometry = VisualGeometry(clip: clip, canvas: canvas, aspect: aspect)
     let scaleAtFrame = clip.placement(at: frame, canvas: canvas, geometry: geometry).scale
     let move = rotate(CGPoint(x: translation.width, y: translation.height), degrees: -clip.angle)
@@ -148,7 +124,7 @@ struct MediaHandles: View {
     }
     var updated = clip
     updated.sourceCrop = crop
-    update(updated)
+    return updated
   }
   private func update(_ clip: Clip) {
     draft = clip
