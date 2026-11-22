@@ -7,6 +7,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "Resources" / "Audio8"))
 
 from spoken_numbers import spoken_financial_text
+from voiceover import instant_chunks
 
 
 class SpokenNumbersTests(unittest.TestCase):
@@ -56,6 +57,26 @@ class SpokenNumbersTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(spoken_financial_text(text), text)
+
+
+class InstantTextTests(unittest.TestCase):
+    @staticmethod
+    def normalize(text):
+        return spoken_financial_text(" ".join(text.split()))
+
+    def test_amounts_in_mixed_text(self):
+        text = "The price is $50.25. Will it go up 20%?\n这笔费用是$50。"
+        self.assertEqual(instant_chunks(text, self.normalize), [
+            "The price is fifty point two five dollars. Will it go up twenty percent? 这笔费用是五十美元。"
+        ])
+
+    def test_long_text_retains_every_sentence(self):
+        text = "今天我们讨论市场数据和公司的营收。" * 20
+        chunks = instant_chunks(text, self.normalize)
+        self.assertGreater(len(chunks), 1)
+        self.assertLessEqual(max(map(len, chunks)), 90)
+        self.assertEqual("".join(chunks).replace(" ", ""), text)
+        self.assertEqual(instant_chunks("  \n  ", self.normalize), [])
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 """Run the pinned Audio8 INT8 export with either its default or a saved voice."""
 
+from contextlib import ExitStack
 import json
 import os
+import re
 from pathlib import Path
 import sys
+import textwrap
 import threading
 import time
 import wave
@@ -39,13 +42,40 @@ def prefill_voice(runtime, reference, transcript, numpy):
     return columns, state
 
 
-def synthesize(model, request, progress, voice_folder, fallback="zh"):
+def instant_chunks(text, normalize):
+    chunks = []
+    pending = ""
+    for sentence in re.split(r"(?<=[。！？!?；;\n])|(?<=\.)(?=\s|$)", text):
+        sentence = normalize(sentence)
+        # Spoken Chinese uses more codec frames per written character.
+        limit = 90 if re.search(r"[㐀-鿿]", sentence) else 260
+        for line in textwrap.wrap(sentence, width=limit, break_on_hyphens=False):
+            if pending and len(pending) + len(line) + 1 > limit:
+                chunks.append(pending)
+                pending = ""
+            pending = pending + " " + line if pending else line
+    if pending:
+        chunks.append(pending)
+    return chunks
+
+
+def synthesize(model, request, progress, voice_folder, fallback="zh", *, instant=False):
     import numpy as np
     from arktts_runtime import ArkTtsRuntime
     from arktts_runtime.prompt import clean_text
     from spoken_numbers import spoken_financial_text
 
-    entries = json.loads(request.read_text(encoding="utf-8"))
+    def normalize(value):
+        return spoken_financial_text(clean_text(value), fallback)
+
+    payload = json.loads(request.read_text(encoding="utf-8"))
+    if instant:
+        entries = [{"text": line, "path": payload["path"]} for line in instant_chunks(payload["text"], normalize)]
+        if not entries:
+            raise ValueError("Enter text to read aloud")
+        progress.write_text(f"0/{len(entries)}", encoding="ascii")
+    else:
+        entries = payload
     runtime = ArkTtsRuntime(model, voice_folder.parent if voice_folder else model,
                             precision="int8", threads=2)
     if voice_folder:
@@ -57,26 +87,38 @@ def synthesize(model, request, progress, voice_folder, fallback="zh"):
     reference, metadata = runtime.voices.load(voice)
     transcript = metadata["reference_text"]
     prefilled = prefill_voice(runtime, reference, transcript, np) if len(entries) > 1 else None
-    for index, entry in enumerate(entries):
-        text = spoken_financial_text(clean_text(entry["text"]), fallback)
-        if not text:
-            raise ValueError(f"Caption {index + 1} has no speakable text")
-        prompt = runtime.prompt_builder.build(text, transcript, reference)
-        limit = min(1024, runtime.manifest["max_seq_len"] - prompt.shape[2])
-        if limit <= 0:
-            raise ValueError(f"Caption {index + 1} exceeds the model context")
-        codes = list(runtime.iter_codes(text=text, voice=voice, max_new_tokens=limit,
-                                        prompt=prompt, prefilled=prefilled))
-        if not codes or len(codes) == limit:
-            raise ValueError(f"Caption {index + 1} did not generate a complete utterance")
-        samples = runtime.decode_codes(np.stack(codes, axis=1))
-        if not np.isfinite(samples).all() or not np.any(samples):
-            raise ValueError(f"Caption {index + 1} produced invalid audio")
-        pcm = np.rint(np.clip(samples, -1, 1) * 32767).astype("<i2")
-        with wave.open(entry["path"], "wb") as audio:
-            audio.setparams((1, 2, runtime.manifest["sample_rate"], 0, "NONE", "not compressed"))
-            audio.writeframes(pcm.tobytes())
-        progress.write_text(str(index + 1), encoding="ascii")
+    sample_rate = runtime.manifest["sample_rate"]
+    params = (1, 2, sample_rate, 0, "NONE", "not compressed")
+    with ExitStack() as files:
+        joined = files.enter_context(wave.open(payload["path"], "wb")) if instant else None
+        if joined:
+            joined.setparams(params)
+        for index, entry in enumerate(entries):
+            text = entry["text"] if instant else normalize(entry["text"])
+            if not text:
+                raise ValueError(f"Entry {index + 1} has no speakable text")
+            prompt = runtime.prompt_builder.build(text, transcript, reference)
+            limit = min(1024, runtime.manifest["max_seq_len"] - prompt.shape[2])
+            if limit <= 0:
+                raise ValueError(f"Entry {index + 1} exceeds the model context")
+            codes = list(runtime.iter_codes(text=text, voice=voice, max_new_tokens=limit,
+                                            prompt=prompt, prefilled=prefilled))
+            if not codes or len(codes) == limit:
+                raise ValueError(f"Entry {index + 1} did not generate a complete utterance")
+            samples = runtime.decode_codes(np.stack(codes, axis=1))
+            if not np.isfinite(samples).all() or not np.any(samples):
+                raise ValueError(f"Entry {index + 1} produced invalid audio")
+            pcm = np.rint(np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+            if joined:
+                if index > 0:
+                    joined.writeframesraw(bytes(sample_rate * 2 // 8))
+                joined.writeframesraw(pcm)
+            else:
+                with wave.open(entry["path"], "wb") as audio:
+                    audio.setparams(params)
+                    audio.writeframes(pcm)
+            done = f"{index + 1}/{len(entries)}" if instant else str(index + 1)
+            progress.write_text(done, encoding="ascii")
 
 
 def register(model, recording, output):
@@ -133,9 +175,10 @@ def main():
 
     threading.Thread(target=watch_parent, daemon=True).start()
     operation, *args = sys.argv[1:]
-    if operation == "synthesize":
+    if operation in ("synthesize", "instant"):
         model, request, progress, voice, *fallback = args
-        synthesize(Path(model), Path(request), Path(progress), Path(voice) if voice else None, *fallback)
+        synthesize(Path(model), Path(request), Path(progress), Path(voice) if voice else None,
+                   *fallback, instant=operation == "instant")
     elif operation == "register":
         register(*map(Path, args))
     else:

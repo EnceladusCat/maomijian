@@ -100,7 +100,7 @@ final class ExportJob {
     try encode(
       built, to: staged.url, canvas: p.canvas, settings: settings,
       frames: 0..<p.duration, progress: progress)
-    try finish { try commit(staged.url, url) }
+    try finish { try Self.commit(staged.url, url) }
     progress(1)
   }
 
@@ -110,7 +110,7 @@ final class ExportJob {
     let staged = try MediaScratch.shared.make(.audio, beside: url.deletingLastPathComponent())
     defer { withExtendedLifetime(staged) {} }
     try encodeAudio(p, to: staged.url, progress: progress)
-    try finish { try commit(staged.url, url) }
+    try finish { try Self.commit(staged.url, url) }
     progress(1)
   }
 
@@ -153,7 +153,7 @@ final class ExportJob {
     try subtitles.write(to: url, atomically: true, encoding: .utf8)
   }
 
-  private static func checkDestination(_ url: URL, project: Project) throws {
+  static func checkDestination(_ url: URL, project: Project) throws {
     let destination = url.resolvingSymlinksInPath().standardizedFileURL
     guard !project.assets.contains(where: {
       URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL == destination
@@ -375,7 +375,7 @@ final class ExportJob {
     }
   }
 
-  private func commit(_ temp: URL, _ url: URL) throws {
+  static func commit(_ temp: URL, _ url: URL) throws {
     if FileManager.default.fileExists(atPath: url.path) {
       _ = try FileManager.default.replaceItemAt(url, withItemAt: temp)
     } else {

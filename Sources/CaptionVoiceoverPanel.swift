@@ -21,7 +21,7 @@ struct CaptionVoiceoverPanel: View {
   var body: some View {
     let selected = Set(editor.selectedIDs)
     let candidates = selectedOnly ? captions.filter { selected.contains($0.id) } : captions
-    let count = candidates.lazy.filter { !source.text(in: $0).isEmpty }.count
+    let count = source == .instant ? 0 : candidates.lazy.filter { !source.text(in: $0).isEmpty }.count
     if CaptionVoiceover.available {
       VStack(alignment: .leading, spacing: 5) {
         Text("Audio8-TTS 0.1B · INT8")
@@ -38,14 +38,22 @@ struct CaptionVoiceoverPanel: View {
             Text(profile.name).tag(profile.id.uuidString)
           }
         }
-        Picker(L("范围"), selection: $selectedOnly) {
-          Text(L("全部字幕")).tag(false)
-          Text(L("所选字幕")).tag(true)
-        }
         Picker(L("朗读内容"), selection: $source) {
           ForEach(VoiceoverText.allCases, id: \.self) { Text(LKey($0.rawValue)).tag($0) }
         }
+        if source != .instant {
+          Picker(L("范围"), selection: $selectedOnly) {
+            Text(L("全部字幕")).tag(false)
+            Text(L("所选字幕")).tag(true)
+          }
+        }
       }.font(.caption).disabled(voiceover.stage != nil)
+      if source == .instant {
+        TextField(L("输入要朗读的文字"), text: $voiceover.instantText, axis: .vertical)
+          .lineLimit(4...10)
+          .font(.system(size: 12))
+          .disabled(voiceover.stage != nil)
+      }
       if let stage = voiceover.stage {
         VStack(alignment: .leading, spacing: 5) {
           switch stage {
@@ -65,14 +73,24 @@ struct CaptionVoiceoverPanel: View {
           Button(L("停止"), action: voiceover.cancel).buttonStyle(QuietButton())
         }.font(.caption)
       } else {
-        Button {
-          editor.generateVoiceover(from: candidates, source: source, voice: voice)
-        } label: {
-          Label(L("生成配音"), systemImage: "waveform")
-            .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
-        }.buttonStyle(PrimaryButton(tint: UI.accent)).disabled(count == 0)
-        Text(count == 0 ? L("这组选项没有可朗读的字幕。") : L("将从字幕起点添加 \(count) 段音频。"))
-          .font(.caption).foregroundStyle(UI.muted)
+        if source == .instant {
+          Button {
+            editor.exportVoiceover(voiceover.instantText, voice: voice)
+          } label: {
+            Label(L("导出 WAV…"), systemImage: "arrow.down.to.line")
+              .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+          }.buttonStyle(PrimaryButton(tint: UI.accent))
+            .disabled(voiceover.instantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } else {
+          Button {
+            editor.generateVoiceover(from: candidates, source: source, voice: voice)
+          } label: {
+            Label(L("生成配音"), systemImage: "waveform")
+              .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+          }.buttonStyle(PrimaryButton(tint: UI.accent)).disabled(count == 0)
+          Text(count == 0 ? L("这组选项没有可朗读的字幕。") : L("将从字幕起点添加 \(count) 段音频。"))
+            .font(.caption).foregroundStyle(UI.muted)
+        }
         if !voiceover.notice.isEmpty {
           Text(voiceover.notice).font(.caption).foregroundStyle(UI.muted)
             .textSelection(.enabled)

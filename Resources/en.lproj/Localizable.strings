@@ -847,3 +847,9 @@
 "已停止配音任务" = "Voiceover task stopped";
 "请选择 0.5 至 30 秒的音频录音。" = "Choose an audio recording between 0.5 and 30 seconds long.";
 "无法建立自定义音色，请换一段清晰的人声录音。" = "Could not create a custom voice. Try a clear voice recording.";
+
+"即转" = "Quick TTS";
+"即转配音" = "Quick Voiceover";
+"输入要朗读的文字" = "Enter text to read aloud";
+"导出 WAV…" = "Export WAV…";
+"无法朗读这段文字。请检查内容，或拆成较短的段落。" = "Could not read this text aloud. Check the text or split it into shorter paragraphs.";

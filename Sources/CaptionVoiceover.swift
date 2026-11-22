@@ -4,10 +4,16 @@ import SwiftUI
 enum VoiceoverText: String, CaseIterable {
   case original = "字幕原文"
   case translation = "译文"
+  case instant = "即转"
 
   func text(in clip: Clip) -> String {
-    (self == .original ? clip.text : clip.captionTranslation ?? "")
-      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let value: String
+    switch self {
+    case .original: value = clip.text
+    case .translation: value = clip.captionTranslation ?? ""
+    case .instant: return ""
+    }
+    return value.trimmingCharacters(in: .whitespacesAndNewlines)
   }
 }
 
@@ -55,6 +61,7 @@ final class CaptionVoiceover: ObservableObject {
   }
 
   typealias Report = (Stage) async -> Void
+  @Published var instantText = ""
   @Published private(set) var stage: Stage?
   @Published private(set) var notice = ""
   @Published private(set) var profiles = VoiceoverProfile.load(in: support)
@@ -88,6 +95,24 @@ final class CaptionVoiceover: ObservableObject {
     perform(discard: { $0.discard() }, work: { report in
       try await Self.render(cues, voice: voice, resources: resources, support: support, report: report)
     }, accept: accept)
+  }
+
+  func exportText(
+    _ text: String, voice: VoiceoverProfile?, to destination: URL,
+    validate: @escaping () throws -> Void
+  ) {
+    guard let resources = Self.resources else { return }
+    let support = Self.support
+    perform(discard: { _ in }, work: { report in
+      try await Self.renderText(text, voice: voice, to: destination,
+                                resources: resources, support: support, report: report)
+    }, accept: { file in
+      do {
+        try validate()
+        try ExportJob.commit(file.url, destination)
+        return L("已导出 ") + destination.lastPathComponent
+      } catch { return error.localizedDescription }
+    })
   }
 
   func register(name: String, transcript: String, recording: URL, saved: @escaping (VoiceoverProfile) -> Void) {
@@ -162,18 +187,23 @@ final class CaptionVoiceover: ObservableObject {
     let path: String
   }
 
+  static func renderText(
+    _ text: String, voice: VoiceoverProfile?, to destination: URL, resources: URL, support: URL,
+    scratch: MediaScratch = .shared, report: Report
+  ) async throws -> MediaScratch.File {
+    let staged = try scratch.make(.wav, beside: destination.deletingLastPathComponent())
+    let request = Request(text: text, path: staged.url.path)
+    try await synthesize(request, total: nil, voice: voice, resources: resources, support: support,
+                         scratch: scratch, report: report)
+    let audio = try inspect(staged.url)
+    guard audio.audio, !audio.video else { throw CocoaError(.fileReadCorruptFile) }
+    return staged
+  }
+
   static func render(
     _ cues: [VoiceoverCue], voice: VoiceoverProfile? = nil, resources: URL, support: URL,
     scratch: MediaScratch = .shared, report: Report
   ) async throws -> Output {
-    let model = try Audio8Model(resources: resources)
-    let folder = try await model.prepare(in: support.appendingPathComponent("Audio8Models")) {
-      await report(.downloading($0))
-    }
-    try Task.checkCancellation()
-
-    let request = try scratch.make(.json)
-    let progress = try scratch.make(.log)
     var audio: [MediaScratch.File] = []
     var entries: [Request] = []
     var byText: [String: Int] = [:]
@@ -183,25 +213,8 @@ final class CaptionVoiceover: ObservableObject {
       entries.append(Request(text: cue.text, path: file.url.path))
       audio.append(file)
     }
-    try JSONEncoder().encode(entries).write(to: request.url, options: .atomic)
-    let voiceFolder = voice?.folder(in: support).path ?? ""
-    let fallback = AppLanguage.current == .english ? "en" : "zh"
-    await report(.synthesizing(0, entries.count))
-    var completed = 0
-    let status = try await run(interpreter(in: resources), arguments: [
-      "-IB", resources.appendingPathComponent("voiceover.py").path, "synthesize",
-      folder.path, request.url.path, progress.url.path, voiceFolder, fallback
-    ], scratch: scratch) {
-      if let value = try? String(contentsOf: progress.url, encoding: .ascii),
-        let count = Int(value), count > completed
-      {
-        completed = count
-        await report(.synthesizing(count, entries.count))
-      }
-    }
-    guard status == 0 else {
-      throw EditError.message(L("无法合成这批字幕。请检查字幕文字，或分批生成。"))
-    }
+    try await synthesize(entries, total: entries.count, voice: voice, resources: resources,
+                         support: support, scratch: scratch, report: report)
 
     let fm = FileManager.default
     let destination = support.appendingPathComponent("Voiceovers").appendingPathComponent(UUID().uuidString)
@@ -222,6 +235,42 @@ final class CaptionVoiceover: ObservableObject {
     } catch {
       try? fm.removeItem(at: destination)
       throw error
+    }
+  }
+
+  private static func synthesize<Payload: Encodable>(
+    _ payload: Payload, total: Int?, voice: VoiceoverProfile?, resources: URL,
+    support: URL, scratch: MediaScratch, report: Report
+  ) async throws {
+    let model = try Audio8Model(resources: resources)
+    let folder = try await model.prepare(in: support.appendingPathComponent("Audio8Models")) {
+      await report(.downloading($0))
+    }
+    try Task.checkCancellation()
+    let request = try scratch.make(.json)
+    let progress = try scratch.make(.log)
+    try JSONEncoder().encode(payload).write(to: request.url, options: .atomic)
+    let voiceFolder = voice?.folder(in: support).path ?? ""
+    let fallback = AppLanguage.current == .english ? "en" : "zh"
+    await report(total.map { .synthesizing(0, $0) } ?? .preparing)
+    var previous = ""
+    let status = try await run(interpreter(in: resources), arguments: [
+      "-IB", resources.appendingPathComponent("voiceover.py").path,
+      total == nil ? "instant" : "synthesize", folder.path, request.url.path,
+      progress.url.path, voiceFolder, fallback
+    ], scratch: scratch) {
+      guard let value = try? String(contentsOf: progress.url, encoding: .ascii), value != previous
+      else { return }
+      let counts = value.split(separator: "/").compactMap { Int($0) }
+      if let done = counts.first, let length = total ?? (counts.count == 2 ? counts[1] : nil), length > 0, (0...length).contains(done) {
+        previous = value
+        await report(.synthesizing(done, length))
+      }
+    }
+    guard status == 0 else {
+      throw EditError.message(total == nil
+        ? L("无法朗读这段文字。请检查内容，或拆成较短的段落。")
+        : L("无法合成这批字幕。请检查字幕文字，或分批生成。"))
     }
   }
 

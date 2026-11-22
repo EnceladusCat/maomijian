@@ -1555,6 +1555,21 @@ final class Editor: ObservableObject {
     }
   }
 
+  func exportVoiceover(_ text: String, voice: VoiceoverProfile?) {
+    let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !content.isEmpty, captionVoiceover.stage == nil, let window = exportWindow else { return }
+    chooseExportDestination(on: window, ext: "wav", type: .wav, suggestedName: L("即转配音")) {
+      [weak self] destination in
+      guard let self else { return }
+      do {
+        try ExportJob.checkDestination(destination, project: self.p)
+        self.captionVoiceover.exportText(content, voice: voice, to: destination) { [weak self] in
+          if let self { try ExportJob.checkDestination(destination, project: self.p) }
+        }
+      } catch { self.error = error.localizedDescription }
+    }
+  }
+
   func generateVoiceover(from captions: [Clip], source: VoiceoverText, voice: VoiceoverProfile?) {
     let cues = captions.map { VoiceoverCue($0, source: source) }.filter { !$0.text.isEmpty }
     let generation = generation
@@ -1860,13 +1875,14 @@ final class Editor: ObservableObject {
   }
 
   private func chooseExportDestination(
-    on window: NSWindow, ext: String, type: UTType, perform: @escaping (URL) -> Void
+    on window: NSWindow, ext: String, type: UTType, suggestedName: String? = nil,
+    perform: @escaping (URL) -> Void
   ) {
     let panel = NSSavePanel()
     panel.allowedContentTypes = [type]
     panel.appearance = NSAppearance(named: .darkAqua)
     panel.prompt = L("导出")
-    panel.nameFieldStringValue = exportName + "." + ext
+    panel.nameFieldStringValue = (suggestedName ?? exportName) + "." + ext
     panel.beginSheetModal(for: window) { response in
       guard response == .OK, let dest = panel.url else { return }
       perform(dest)
