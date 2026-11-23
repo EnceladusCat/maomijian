@@ -76,6 +76,20 @@ struct TimelineLayout {
           ? piece : nil
       }
     }
+
+    func marqueeHits(_ box: CGRect, in lane: CGRect, first: Double, per: Double) -> [UUID] {
+      let selection = box.intersection(lane)
+      guard !selection.isEmpty else { return [] }
+      // The clip box has a minimum width of two points even when zoomed out.
+      // Widen the frame query before testing the exact drawn rectangles.
+      let lower = first + (selection.minX - lane.minX - 2) / per - 1
+      let upper = first + (selection.maxX - lane.minX) / per + 1
+      return visible(in: lower...upper, selected: [], shift: 0).compactMap { piece in
+        let rect = ClipLane.clipBox(piece.clip, first: first, per: per)
+          .offsetBy(dx: lane.minX, dy: lane.minY).intersection(lane)
+        return rect.intersection(box).isEmpty ? nil : piece.clip.id
+      }
+    }
   }
 
   let lanes: [Lane]
@@ -86,7 +100,7 @@ struct TimelineLayout {
   init(_ project: Project) {
     let joins = project.joins
     let tracks = project.timelineTracks(joins: joins)
-    let media = Dictionary(uniqueKeysWithValues: project.assets.map { ($0.id, $0) })
+    let media = project.mediaByID
     var laneByClip = [UUID: Int]()
     for (index, track) in tracks.enumerated() {
       for clip in track.clips { laneByClip[clip.id] = index }

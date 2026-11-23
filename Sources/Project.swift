@@ -804,6 +804,9 @@ struct Project: Codable, Equatable {
   var clips: [Clip] = []
   var duration: Int { clips.lazy.map(\.end).max() ?? 0 }
   func asset(_ id: UUID?) -> Media? { assets.first { $0.id == id } }
+  var mediaByID: [UUID: Media] {
+    Dictionary(assets.lazy.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+  }
   func hasSameTimelineMedia(as previous: Project) -> Bool {
     guard assets != previous.assets else { return true }
     let used = Set(clips.compactMap { $0.kind.isMedia ? $0.asset : nil })
@@ -838,7 +841,8 @@ struct Project: Codable, Equatable {
     for i in clips.indices where clips[i].groupID.map(shared.contains) == false { clips[i].groupID = nil }
   }
   func checked() throws -> Project {
-    guard version == 1, Set(assets.map(\.id)).count == assets.count,
+    let media = mediaByID
+    guard version == 1, media.count == assets.count,
       Set(clips.map(\.id)).count == clips.count
     else { throw EditError.message(L("工程版本或素材编号无效。")) }
     if let style = captionStyle, !style.valid { throw EditError.message(L("字幕样式超出范围。")) }
@@ -876,7 +880,7 @@ struct Project: Codable, Equatable {
         throw EditError.message(L("工程图表数据无效。"))
       }
       if c.kind.isMedia {
-        guard let a = asset(c.asset), (0.25...4).contains(c.rate), (-12...12).contains(c.pitch),
+        guard let a = c.asset.flatMap({ media[$0] }), (0.25...4).contains(c.rate), (-12...12).contains(c.pitch),
           (0..<1.0).contains(c.sourceFraction ?? 0), c.sourceLength > 0,
           a.isStill || c.sourceEnd <= Double(a.frames) + 1e-7,
           c.kind == .video ? a.video : a.audio

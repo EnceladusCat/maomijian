@@ -543,18 +543,23 @@ func buildMediaGraph(
   var assets = [UUID: (asset: AVURLAsset, video: AVAssetTrack?, audio: AVAssetTrack?)]()
   var pools = [AVMediaType: [(AVMutableCompositionTrack, Int)]]()
   var volumes = [CMPersistentTrackID: AVMutableAudioMixInputParameters]()
+  let mediaByID = p.mediaByID
+  var availablePaths = Set<String>()
   for c in p.clips.sorted(by: { $0.start < $1.start }) where c.kind.isMedia {
     if cancelled() { throw EditError.message(L("预览更新已替换。")) }
     let needsVideo = includeVideo && c.kind == .video && (videoIDs?.contains(c.id) ?? true)
     let needsAudio = includeAudio && c.volume > 0
     guard needsVideo || needsAudio else { continue }
-    guard let media = p.asset(c.asset) else {
+    guard let media = c.asset.flatMap({ mediaByID[$0] }) else {
       throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
     }
     if !needsVideo, media.isStill { continue }
-    guard FileManager.default.fileExists(atPath: media.path) else {
-      if !includeVideo, c.kind == .video, !media.audio { continue }
-      throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
+    if !availablePaths.contains(media.path) {
+      guard FileManager.default.fileExists(atPath: media.path) else {
+        if !includeVideo, c.kind == .video, !media.audio { continue }
+        throw EditError.message(L("找不到「\(p.name(c))」。请在素材列表中重新定位文件。"))
+      }
+      availablePaths.insert(media.path)
     }
     if media.isStill {
       let url = URL(fileURLWithPath: media.path)

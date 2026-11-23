@@ -4,6 +4,27 @@ import CoreText
 import Foundation
 
 do {
+  var project = Project()
+  project.clips = [Clip(kind: .caption, start: 0, length: 60 * fps)]
+  for short in [720, 1080] {
+    for codec in ExportCodec.allCases {
+      for canvas in Canvas.allCases {
+        project.canvas = canvas
+        var settings = ExportSettings(short: short, codec: codec)
+        precondition(settings.videoMbps(canvas: canvas) == 2)
+        precondition(settings.estimatedBytes(for: project) == 15_182_768)
+        settings.quality = .high
+        precondition(settings.videoMbps(canvas: canvas) == 6)
+        precondition(settings.estimatedBytes(for: project) == 45_482_768)
+        settings.customMbps = 8
+        precondition(settings.videoMbps(canvas: canvas) == 8)
+      }
+    }
+  }
+}
+print("Passed MP4 bitrate presets, size estimates, and custom overrides.")
+
+do {
   let editor = Editor()
   let current = AVPlayerItem(asset: AVMutableComposition())
   let stale = AVPlayerItem(asset: AVMutableComposition())
@@ -1314,6 +1335,20 @@ for (lane, track) in zip(viewportLayout.lanes, viewportTracks) {
   precondition(lane.joins.map(\.id) == viewportJoins.filter {
     ids.contains($0.before.id) && ids.contains($0.after.id)
   }.map(\.id))
+  let laneFrame = CGRect(x: 90, y: 80, width: 180, height: ClipLane.rowHeight(track.kind))
+  for scale in [0.0001, 0.05, 0.7, 4.0] {
+    for left in [0.0, 64.5, 80.0] {
+      for x in stride(from: 85.0, through: 272, by: 1.5) {
+        let box = CGRect(x: x, y: 84, width: 3, height: 18)
+        let expected = track.clips.compactMap { clip -> UUID? in
+          let rect = ClipLane.clipBox(clip, first: left, per: scale)
+            .offsetBy(dx: laneFrame.minX, dy: laneFrame.minY).intersection(laneFrame)
+          return rect.intersection(box).isEmpty ? nil : clip.id
+        }
+        precondition(lane.marqueeHits(box, in: laneFrame, first: left, per: scale) == expected)
+      }
+    }
+  }
   for shift in [-180.0, -31, 0, 3.5, 40, 185] {
     let selected = Set([viewportLead.id, viewportThird.id, viewportCaption.id])
     for start in stride(from: 0.0, through: 260, by: 7.5) {

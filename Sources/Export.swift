@@ -19,14 +19,6 @@ enum ExportQuality: String, CaseIterable {
     #endif
     return [.balanced, .high, .near]
   }
-
-  var bitsPerPixel: Double {
-    switch self {
-    case .balanced, .screen: return 0.12
-    case .high: return 0.24
-    case .near: return 0.76
-    }
-  }
 }
 struct ExportSettings: Equatable {
   var short = 1080
@@ -43,9 +35,16 @@ struct ExportSettings: Equatable {
     if let customMbps {
       return bound(customMbps, Self.bitrateRange.lowerBound, Self.bitrateRange.upperBound)
     }
+    let bitsPerPixel: Double
+    switch quality {
+    case .balanced: return 2
+    case .high: return 6
+    case .screen: bitsPerPixel = 0.12
+    case .near: bitsPerPixel = 0.76
+    }
     let size = canvas.size(short)
     let efficiency = codec == .hevc ? 0.78 : 1.0
-    let target = size.width * size.height * Double(fps) * quality.bitsPerPixel * efficiency
+    let target = size.width * size.height * Double(fps) * bitsPerPixel * efficiency
     return max(0.5, (target / 100_000).rounded() / 10)
   }
   func estimatedBytes(for project: Project) -> Int64 {

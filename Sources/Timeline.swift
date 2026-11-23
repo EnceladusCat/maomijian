@@ -230,12 +230,8 @@ struct Timeline: View {
             MarqueeOverlay(selection: e.timelineMarquee, leftInset: head, rightInset: 12) {
               box, flags in
               let hits = lanes.flatMap { lane -> [UUID] in
-                guard let frame = laneFrames[lane.id], frame.intersects(box) else { return [] }
-                return lane.track.clips.compactMap { clip in
-                  let rect = ClipLane.clipBox(clip, first: left, per: per)
-                    .offsetBy(dx: frame.minX, dy: frame.minY).intersection(frame)
-                  return rect.intersection(box).isEmpty ? nil : clip.id
-                }
+                guard let frame = laneFrames[lane.id] else { return [] }
+                return lane.marqueeHits(box, in: frame, first: left, per: per)
               }
               e.pickMarquee(hits, modifiers: flags, inLibrary: false)
             }.allowsHitTesting(false)
