@@ -25,6 +25,47 @@ do {
 print("Passed MP4 bitrate presets, size estimates, and custom overrides.")
 
 do {
+  func clock(_ seconds: Int64) -> CMTime { CMTime(value: seconds, timescale: 1) }
+  var timeline = RecordingTimeline()
+  timeline.setPaused(true, at: clock(7))
+  precondition(!timeline.accepts(clock(8)))
+  timeline.setPaused(false, at: clock(20))
+  precondition(!timeline.accepts(clock(19)))
+  timeline.begin(at: clock(20))
+  precondition(timeline.position(of: clock(21)) == clock(1))
+  timeline.setPaused(true, at: clock(22))
+  precondition(timeline.elapsed(at: clock(25)) == clock(2))
+  precondition(timeline.position(of: clock(26)) == nil)
+  timeline.setPaused(false, at: clock(28))
+  precondition(timeline.position(of: clock(27)) == nil)
+  precondition(timeline.position(of: clock(28)) == clock(2))
+  timeline.setPaused(true, at: clock(31))
+  timeline.setPaused(false, at: clock(43))
+  precondition(timeline.position(of: clock(45)) == clock(7))
+  timeline.setPaused(true, at: clock(46))
+  precondition(timeline.elapsed(at: clock(77)) == clock(8))
+
+  var region = RecordingRegion(size: CGSize(width: 1000, height: 800))
+  region.begin(at: CGPoint(x: 20, y: 30))
+  region.update(to: CGPoint(x: 320, y: 230))
+  region.end()
+  precondition(region.rect == CGRect(x: 20, y: 30, width: 300, height: 200))
+  region.begin(at: CGPoint(x: 320, y: 230))
+  region.update(to: CGPoint(x: 500, y: 330))
+  region.end()
+  precondition(region.rect.size == CGSize(width: 480, height: 300))
+  region.begin(at: CGPoint(x: 100, y: 100))
+  region.update(to: CGPoint(x: 1300, y: 900))
+  precondition(region.rect.maxX == 1000 && region.rect.maxY == 800)
+
+  let retina = ScreenRecordingSize(points: CGSize(width: 3008, height: 1692), scale: 2)
+  precondition(retina.width == 3840 && retina.height == 2160)
+  let crop = ScreenRecordingSize(points: CGSize(width: 501, height: 321), scale: 1)
+  precondition(crop.width == 500 && crop.height == 320)
+  print("Passed recording pause and resume, stale sample rejection, stop while paused, crop editing and capture size.")
+}
+
+do {
   let editor = Editor()
   let current = AVPlayerItem(asset: AVMutableComposition())
   let stale = AVPlayerItem(asset: AVMutableComposition())

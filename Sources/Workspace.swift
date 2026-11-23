@@ -181,8 +181,42 @@ struct CaptionCanvasFrame: View, Equatable {
   }
 }
 
+private struct PreviewScrollSurface: NSViewRepresentable {
+  let zoom: (Double) -> Void
+
+  func makeNSView(context: Context) -> Surface { Surface() }
+  func updateNSView(_ view: Surface, context: Context) { view.zoom = zoom }
+
+  final class Surface: NSView {
+    var zoom: ((Double) -> Void)?
+    private var monitor: Any?
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      if let monitor { NSEvent.removeMonitor(monitor) }
+      monitor = nil
+      guard window != nil else { return }
+      monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+        guard let self, let window = self.window, event.window === window,
+          window.attachedSheet == nil, NSApp.modalWindow == nil, !self.isHiddenOrHasHiddenAncestor,
+          self.bounds.intersection(self.visibleRect).contains(self.convert(event.locationInWindow, from: nil)),
+          event.momentumPhase.isEmpty, abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX)
+        else { return event }
+        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY * 0.004 : event.deltaY * 0.12
+        self.zoom?(exp(bound(delta, -0.4, 0.4)))
+        return nil
+      }
+    }
+
+    deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
+  }
+}
+
 struct Preview: View {
   @ObservedObject var e: Editor
+  private let zoomRange = 0.25...4.0
   @State private var zoom = 1.0
   @GestureState private var pinch = 1.0
   @State private var pan = CGSize.zero
@@ -220,7 +254,7 @@ struct Preview: View {
         let shape = e.p.canvas.size(540)
         let factor = min(
           max(1, geo.size.width - 32) / shape.width, max(1, geo.size.height - 24) / shape.height)
-        let displayZoom = bound(zoom * pinch, 0.25, 4)
+        let displayZoom = bound(zoom * pinch, zoomRange.lowerBound, zoomRange.upperBound)
         let w = shape.width * factor * displayZoom
         let h = shape.height * factor * displayZoom
         let canvasSize = CGSize(width: w, height: h)
@@ -277,13 +311,17 @@ struct Preview: View {
           }
         }.frame(width: geo.size.width, height: geo.size.height)
           .clipped()
+          .background {
+            PreviewScrollSurface { factor in adjustZoom(by: factor) }
+              .accessibilityHidden(true)
+          }
           .contentShape(.interaction, Rectangle())
           .simultaneousGesture(
           TapGesture().onEnded { if !e.p.clips.isEmpty { finishWorkspaceTextEditing() } }
         ).simultaneousGesture(
           MagnificationGesture().updating($pinch) { value, state, _ in
             state = value
-          }.onEnded { value in zoom = bound(zoom * value, 0.25, 4) })
+          }.onEnded { value in adjustZoom(by: value) })
       }
       HStack(spacing: 6) {
         Tool(symbol: hand ? "hand.raised.fill" : "hand.raised", label: L("拖动画布视图")) {
@@ -291,9 +329,9 @@ struct Preview: View {
         }.foregroundStyle(hand && e.pathDrawingID == nil && e.backgroundColorPick == nil && e.regionTool == nil
           ? UI.accent : UI.muted)
           .disabled(e.pathDrawingID != nil || e.backgroundColorPick != nil || e.regionTool != nil)
-        Slider(value: $zoom, in: 0.25...4)
+        Slider(value: $zoom, in: zoomRange)
           .controlSize(.small).frame(width: 88).accessibilityLabel(L("预览缩放"))
-        Text("\(Int((bound(zoom * pinch, 0.25, 4) * 100).rounded()))%")
+        Text("\(Int((bound(zoom * pinch, zoomRange.lowerBound, zoomRange.upperBound) * 100).rounded()))%")
           .font(.system(size: 11, design: .monospaced)).frame(width: 34, alignment: .trailing)
         Button(L("适应")) {
           zoom = 1
@@ -314,6 +352,11 @@ struct Preview: View {
       }.padding(.horizontal, 12).frame(height: 31).background(UI.deep)
       TransportBar(t: e.transport, e: e, duration: e.timelineDuration)
     }.background(UI.panel)
+  }
+
+  private func adjustZoom(by factor: Double) {
+    let next = bound(zoom * factor, zoomRange.lowerBound, zoomRange.upperBound)
+    if next != zoom { zoom = next }
   }
 }
 private struct CanvasControls: View {
@@ -554,6 +597,7 @@ private struct HeaderCommand: View {
 
 struct Workspace: View {
   @ObservedObject var e: Editor
+  let recordScreen: () -> Void
   @State private var over = false
   @State private var showsExportFormats = false
   var body: some View {
@@ -583,6 +627,7 @@ struct Workspace: View {
           HeaderCommand(symbol: "arrow.uturn.forward", label: L("重做（⇧⌘Z）"), action: e.redo).disabled(!e.canRedo)
           HeaderCommand(symbol: "square.and.arrow.down", label: L("保存工程（⌘S）")) { e.save() }
           Divider().frame(height: 17)
+          HeaderCommand(symbol: "record.circle", label: L("录制屏幕…"), action: recordScreen)
           if let v = e.progress {
             ProgressView(value: v).frame(width: 68)
             Text("\(Int(v*100))%").monospacedDigit()

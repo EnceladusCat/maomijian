@@ -1,13 +1,19 @@
 import AppKit
 import SwiftUI
 
+@MainActor
 final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation, NSMenuDelegate {
   let e = Editor()
   var window: NSWindow!, monitor: Any?
   var deferredURL: URL?
   private var recentMenu: NSMenu?
+  private lazy var screenRecorder = ScreenRecorder(saved: { [weak self] url in
+    guard let self else { return }
+    self.e.importURLs([url])
+    self.e.status = L("录屏已保存至 \(url.lastPathComponent)")
+  }, failed: { [weak self] error in self?.e.error = error })
   func applicationDidFinishLaunching(_ notification: Notification) {
-    let view = Workspace(e: e)
+    let view = Workspace(e: e, recordScreen: recordScreen)
     window = NSWindow(
       contentRect: NSRect(x: 0, y: 0, width: 1190, height: 770),
       styleMask: [.titled, .resizable, .closable, .miniaturizable], backing: .buffered, defer: false
@@ -82,7 +88,11 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
     if window == nil { deferredURL = u } else { e.open(u) }
   }
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-    e.mayLeave() ? .terminateNow : .terminateCancel
+    if screenRecorder.isCapturing {
+      e.error = L("请先停止录屏并等待文件保存。")
+      return .terminateCancel
+    }
+    return e.mayLeave() ? .terminateNow : .terminateCancel
   }
   func applicationWillTerminate(_ notification: Notification) {
     e.automaticCaptions.cancel()
@@ -144,6 +154,9 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
     add(file, L("另存为…"), #selector(saveAs), "s", shift: true, target: self)
     file.addItem(.separator())
     add(file, L("导入图片和音视频…"), #selector(media), "i", target: self)
+    add(file, L("录制屏幕…"), #selector(recordScreen), "r", shift: true, target: self)
+    add(file, L("暂停或继续录屏"), #selector(pauseScreenRecording), target: self)
+    add(file, L("停止录屏"), #selector(stopScreenRecording), target: self)
     add(file, L("导入 SRT…"), #selector(subIn), target: self)
     file.addItem(.separator())
     add(file, L("导出 MP4…"), #selector(render), "e", target: self)
@@ -201,6 +214,9 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
   @objc func saveFile() { e.save() }
   @objc func saveAs() { e.save(as: true) }
   @objc func media() { e.importPanel() }
+  @objc func recordScreen() { screenRecorder.open(from: window) }
+  @objc func pauseScreenRecording() { screenRecorder.togglePause() }
+  @objc func stopScreenRecording() { screenRecorder.stopRecording() }
   @objc func subIn() { e.subtitleImport() }
   @objc func subOut() { e.subtitleExport() }
   @objc func audioOut() { e.audioExport() }
@@ -214,7 +230,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
     choice.select()
     if wasReady { e.status = L("就绪") }
     window.title = AppLanguage.appName
-    window.contentView = NSHostingView(rootView: Workspace(e: e))
+    window.contentView = NSHostingView(rootView: Workspace(e: e, recordScreen: recordScreen))
     menus()
   }
   @objc func cachePanel() {
@@ -247,6 +263,7 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuI
   }
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     switch item.action {
+    case #selector(pauseScreenRecording), #selector(stopScreenRecording): return screenRecorder.canPause
     case #selector(togglePlayback): return window.isKeyWindow && window.attachedSheet == nil && e.p.duration > 0
     case #selector(render), #selector(frameOut): return e.progress == nil && e.p.duration > 0
     case #selector(audioOut): return e.progress == nil && e.canExportAudio
@@ -297,11 +314,13 @@ do {
     MediaScratch.shared.close()
     exit(0)
   }
-  let app = NSApplication.shared
-  let delegate = Delegate()
-  app.setActivationPolicy(.regular)
-  app.delegate = delegate
-  app.run()
+  MainActor.assumeIsolated {
+    let app = NSApplication.shared
+    let delegate = Delegate()
+    app.setActivationPolicy(.regular)
+    app.delegate = delegate
+    app.run()
+  }
 } catch {
   MediaScratch.shared.close()
   FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
